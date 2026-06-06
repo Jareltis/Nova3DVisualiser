@@ -4,7 +4,7 @@
 
 A minimalist 3D engine written in C# that runs entirely inside the system console. This project was built from scratch without any external graphical libraries or modern graphics APIs (like OpenGL or DirectX). Everything—from custom vector mathematics to ray casting/tracing and the TCP network stack—is computed entirely on the CPU.
 
-This project was designed for educational and demonstration purposes for a YouTube video.
+This project was designed for educational and demonstration purposes for a [YouTube video](https://youtu.be/vhYE882B9dE).
 
 ---
 
