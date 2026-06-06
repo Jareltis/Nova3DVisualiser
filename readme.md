@@ -1,5 +1,7 @@
 ﻿# 💻 3D Console Engine (C#)
 
+<img width="2070" height="1085" alt="Image" src="https://github.com/user-attachments/assets/06934758-90d4-4b63-9f40-8bb44ca2831e" />
+
 A minimalist 3D engine written in C# that runs entirely inside the system console. This project was built from scratch without any external graphical libraries or modern graphics APIs (like OpenGL or DirectX). Everything—from custom vector mathematics to ray casting/tracing and the TCP network stack—is computed entirely on the CPU.
 
 This project was designed for educational and demonstration purposes for a YouTube video.
