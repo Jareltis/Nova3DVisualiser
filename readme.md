@@ -1,4 +1,4 @@
-﻿# 💻 3D Console Engine (C#)
+# 💻 Neo 3D Console (C#)
 
 <img width="2070" height="1085" alt="Image" src="https://github.com/user-attachments/assets/06934758-90d4-4b63-9f40-8bb44ca2831e" />
 
