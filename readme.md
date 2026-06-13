@@ -1,8 +1,10 @@
-﻿# 💻 3D Console Engine (C#)
+# 💻 Neo 3D Console (C#)
+
+<img width="2070" height="1085" alt="Image" src="https://github.com/user-attachments/assets/06934758-90d4-4b63-9f40-8bb44ca2831e" />
 
 A minimalist 3D engine written in C# that runs entirely inside the system console. This project was built from scratch without any external graphical libraries or modern graphics APIs (like OpenGL or DirectX). Everything—from custom vector mathematics to ray casting/tracing and the TCP network stack—is computed entirely on the CPU.
 
-This project was designed for educational and demonstration purposes for a YouTube video.
+This project was designed for educational and demonstration purposes for a [YouTube video](https://youtu.be/vhYE882B9dE).
 
 ---
 
@@ -76,6 +78,32 @@ Every frame is rendered using the following steps:
 
 ---
 
+## ⌨️ Cross-Platform Input Architecture
+
+The engine uses a decoupled **Strategy Pattern** to handle asynchronous, non-blocking input with native OS focus checks. This prevents "background input leakage" (ensuring the game only processes keypresses when your terminal window is actively focused).
+
+```
+[Input (Facade)] ---> [IInputProvider]
+                            |
+    +-----------------------+-----------------------+
+    |                       |                       |                       
+[User32 (Windows)]   [LibX11 (Linux)]        [DotNet (Fallback)]
+```
+
+*   **Windows (`User32InputProvider`)**:
+    *   Direct hardware polling via `GetAsyncKeyState`.
+    *   Active window verification: `GetForegroundWindow() == GetActualConsoleWindow()`. It natively resolves parent-owner relationships (`GetWindow` with `GW_OWNER`), supporting both legacy `conhost.exe` and modern tabbed **Windows Terminal** on Windows 11.
+*   **Linux (`LibX11InputProvider`)**:
+    *   Direct hardware polling using `XQueryKeymap` (fetching the full 256-bit keyboard state once per frame).
+    *   Dynamic, layout-independent mapping: Translates standard `.NET` `ConsoleKey` values to X11 KeySyms, resolving them to the user's active layout (QWERTY, AZERTY, Cyrillic, etc.) at startup via `XKeysymToKeycode`.
+    *   Focus detection via tree-climbing window ID checks, matching the active window against the console's environment `WINDOWID` or parent terminal names.
+*   **Universal Fallback (`DotNetInputProvider`)**:
+    *   An asynchronous, thread-safe input queue wrapping `.NET`'s native `Console.ReadKey(true)`.
+    *   Implements a **timeout-based key-release emulator** to simulate smooth real-time KeyUp events and multi-key combinations inside standard command-line pipes.
+    *   Automatically activated in headless servers (SSH), pure Wayland sessions, or sandboxed containers.
+
+---
+
 ## 🌐 Custom TCP Network Protocol
 
 The networking module is written on raw sockets (`TcpListener`/`TcpClient`) with zero third-party dependencies.
@@ -118,6 +146,31 @@ When the console starts, choose your network role:
 * **`Ctrl` + `W, A, S, D, Space, Shift`** — Move the active light source.
 * **`+` / `-`** — Increase / Decrease light intensity.
 * **`T`** — Open multiplayer chat (Type message -> `Enter` to send, `Esc` to cancel).
+
+---
+
+## 🐧 Running Native High-Performance Input on Linux
+
+To enable hardware-level polling with zero input stuttering and smooth multi-key registration (e.g., strafing with `W+A`), the engine will automatically try to spin up native polling (`LibX11`). 
+
+Follow these steps to ensure native performance on Unix-based systems:
+
+### On Linux (Wayland vs. X11 Bypass)
+Modern Linux distributions (like Ubuntu 22.04+ or Fedora) run on **Wayland** by default. Wayland isolates window sessions for security, blocking global X11 polling. The engine automatically detects Wayland and falls back to safe console-buffering (`DotNetInputProvider`).
+
+To force the high-performance `LibX11` polling on a Wayland system:
+1. **The Terminal Server Trap**: GNOME Terminal operates via a background server-daemon. Standard commands to bypass Wayland are ignored by the background server, which stays in Wayland.
+2. **The Solution**: Use a standalone terminal emulator (like `xterm`) forced to run via XWayland [1.2.2]:
+   ```bash
+   sudo apt install xterm
+   WAYLAND_DISPLAY= xterm
+   ```
+3. Inside the newly opened `xterm` window, navigate to your project directory and run `dotnet run`. The engine will successfully bind to `LibX11InputProvider`.
+
+*Note on Containers/Root:* If you run the game inside a Docker container or via `sudo`, you must authorize X11 access on your host machine before launching:
+```bash
+xhost +local:root
+```
 
 ---
 
