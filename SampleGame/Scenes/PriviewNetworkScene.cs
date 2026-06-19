@@ -1,11 +1,11 @@
-﻿using _3dEngine;
-using _3dEngine.AbstractClass;
-using _3dEngine.Implementation;
-using _3dEngine.Inputs;
-using _3dEngine.Interfaces;
-using _3dEngine.Network;
-using _3dEngine.Shape;
-using _3dEngine.StaticClass;
+﻿using Nova3DVisualiser;
+using Nova3DVisualiser.AbstractClass;
+using Nova3DVisualiser.Implementation;
+using Nova3DVisualiser.Interfaces;
+using Nova3DVisualiser.Logging;
+using Nova3DVisualiser.Network;
+using Nova3DVisualiser.Shape;
+using Nova3DVisualiser.StaticClass;
 using SampleGame.NetworkPackets;
 
 namespace SampleGame.Scenes;
@@ -19,22 +19,43 @@ public class PriviewNetworkScene : Scene
     readonly Camera _myCamera;
     readonly Light _mainLight;
     readonly Object3d _floorPlane;
-    
+
+    readonly Sphere _demoSphere;
+    readonly Object3d _demoCube;
+    private List<Object3d> _models = new();
+
+    private readonly bool _ownLightEnabled;
+    private readonly Light? _extraLight;
+
     private bool _isChatting = false;
     private string _currentInput = "";
     private readonly List<string> _chatHistory = new();
     private const int MaxHistory = 5;
 
 
-    public PriviewNetworkScene(IDisplaysManagerAsync manager, bool isServer, string targetIp, int port) : base(manager)
+    public PriviewNetworkScene(IDisplaysManagerAsync manager, bool isServer, string targetIp, int port, bool addExtraLight, bool disableOwnLight) : base(manager)
     {
-        _myCamera = new Camera(new Vector3(0, 2, -2), Vector3.Zero);
+        Exposure = 0.05f;
+        Ambient = 0.1f;
+
+        _ownLightEnabled = !disableOwnLight;
+        if (addExtraLight)
+            _extraLight = new Light(new Vector3(2, 6, 0), 600f);
+
+        // Tunable starting framing: lower and nearly level so models sit near vertical center.
+        _myCamera = new Camera(new Vector3(-5.5f, 1.5f, 0), new Vector3(0, 0, -0.05f));
         _mainLight = new Light(new Vector3(0, 2, -2), 500);
 
         _floorPlane = CreatePlane();
         _floorPlane.Position = new Vector3(0, 0, 0);
         _floorPlane.Color = ConsoleColor.Yellow;
-        
+
+        _demoSphere = new Sphere(new Vector3(1, 1, -2), Vector3.Zero, r: 1f) { Color = ConsoleColor.Red };
+
+        _demoCube = CreateCube();
+        _demoCube.Position = new Vector3(2, 1, 2);
+        _demoCube.Color = ConsoleColor.Cyan;
+
         _netManager = new NetworkManager();
         _myNetId = isServer ? 1 : Random.Shared.Next(2, 10000);
 
@@ -47,12 +68,14 @@ public class PriviewNetworkScene : Scene
         if (isServer) 
         {
             _netManager.StartServer(port);
-            Frame.Title = $"SERVER (Port: {port}) | ID: {_myNetId}";
+            Logger.Info($"Server listening on port {port}");
+            Console.Title = $"SERVER (Port: {port}) | ID: {_myNetId}";
         }
         else 
         {
             _netManager.Connect(targetIp, port);
-            Frame.Title = $"CLIENT (ID: {_myNetId}) -> {targetIp}:{port}";
+            Logger.Info($"Connecting to {targetIp}:{port}");
+            Console.Title = $"CLIENT (ID: {_myNetId}) -> {targetIp}:{port}";
         }
 
         
@@ -61,16 +84,32 @@ public class PriviewNetworkScene : Scene
     public override void Start()
     {
         AddDisplaysObject(_floorPlane);
-        AddLight(_mainLight);
-        
+        AddDisplaysObject(_demoSphere);
+
+        _demoCube.UpdateGeometry();
+        AddDisplaysObject(_demoCube);
+
+        if (_ownLightEnabled) AddLight(_mainLight);
+        if (_extraLight != null) AddLight(_extraLight);
+
         SetMainCamera(_myCamera);
+
+        _models = ModelLoader.LoadFolder(AppPaths.ModelsFolder);
+        foreach (var m in _models) AddDisplaysObject(m);
     }
 
     public override void Update()
     {
         UI.Clear();
         _netManager.ProcessEvents();
-        
+
+        foreach (var m in _models)
+            if (m.RotateSpeed != 0f)
+            {
+                m.LocalRotate.Y += m.RotateSpeed * GameTime.GetDeltaTime();
+                m.UpdateGeometry();
+            }
+
         if (_isChatting)
         {
             HandleChatInput();
@@ -83,7 +122,6 @@ public class PriviewNetworkScene : Scene
             {
                 _isChatting = true;
                 _currentInput = "";
-                Input.IsPollingEnabled = false; 
                 while (Console.KeyAvailable) Console.ReadKey(true);
             }
         }
@@ -93,7 +131,7 @@ public class PriviewNetworkScene : Scene
             var packet = new TransformPacket(_myCamera.Position, _myCamera.LocalRotate);
             _netManager.SendPacket(packet, _myNetId);
         }
-        _mainLight.Position = _myCamera.Position;
+        if (_ownLightEnabled) _mainLight.Position = _myCamera.Position;
         DrawChatInterface();
     }
     
@@ -110,15 +148,16 @@ public class PriviewNetworkScene : Scene
         _myCamera.LocalRotate.Z = Math.Clamp(_myCamera.LocalRotate.Z, -1.5f, 1.5f);
         _myCamera.LocalRotate.X = 0;
 
-        Vector3 forward = new Vector3(1, 0, 0).Rotate(_myCamera.LocalRotate);
-        Vector3 right = new Vector3(0, 0, 1).Rotate(_myCamera.LocalRotate);
+        Vector3 yawRotation = new Vector3(0, _myCamera.LocalRotate.Y, 0);
+        Vector3 forward = new Vector3(1, 0, 0).Rotate(yawRotation);
+        Vector3 right   = new Vector3(0, 0, 1).Rotate(yawRotation);
 
         if (Input.IsGetKey(ConsoleKey.W)) _myCamera.Position += forward * moveSpeed * dt;
         if (Input.IsGetKey(ConsoleKey.S)) _myCamera.Position -= forward * moveSpeed * dt;
         if (Input.IsGetKey(ConsoleKey.D)) _myCamera.Position += right * moveSpeed * dt;
         if (Input.IsGetKey(ConsoleKey.A)) _myCamera.Position -= right * moveSpeed * dt;
         if (Input.IsGetKey(ConsoleKey.Spacebar)) _myCamera.Position.Y += moveSpeed * dt;
-        if (Input.IsShift) _myCamera.Position.Y -= moveSpeed * dt;
+        if (Input.IsGetKey(ConsoleKey.C))        _myCamera.Position.Y -= moveSpeed * dt;
         
         if (Input.IsGetKey(ConsoleKey.OemPlus)) _mainLight.LightPower += moveSpeed * 50 * dt;
         if (Input.IsGetKey(ConsoleKey.OemMinus)) _mainLight.LightPower -= moveSpeed* 50  * dt;
@@ -166,14 +205,11 @@ public class PriviewNetworkScene : Scene
                 }
                 _isChatting = false;
                 _currentInput = "";
-                
-                Input.IsPollingEnabled = true; 
             }
             else if (keyInfo.Key == ConsoleKey.Escape)
             {
                 _isChatting = false;
                 _currentInput = "";
-                Input.IsPollingEnabled = true; 
             }
             else if (keyInfo.Key == ConsoleKey.Backspace)
             {
@@ -265,10 +301,10 @@ public class PriviewNetworkScene : Scene
         return new Object3d(
             new Vector3[]
             {
-                new Vector3(-5f, 0f, 5f),   
-                new Vector3(5f, 0f, 5f),
-                new Vector3(-5f, 0f, -5),
-                new Vector3(5f, 0f, -5f)
+                new Vector3(-10f, 0f, 10f),
+                new Vector3(10f, 0f, 10f),
+                new Vector3(-10f, 0f, -10f),
+                new Vector3(10f, 0f, -10f)
             },
             new Vector3[]
             {

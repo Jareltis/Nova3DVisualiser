@@ -1,13 +1,15 @@
-**/bin/
-**/obj/
+# Build output
+bin/
+obj/
 
+# Visual Studio / IDE
 .vs/
-*.user
-*.userosscache
-*.sln.docstates
-
 .idea/
-*.sln.DotSettings.user
+*.user
+*.suo
 
-.DS_Store
-Thumbs.db
+# Runtime logs (recreated at run time)
+SampleGame/logs/
+
+# License-uncertain asset, excluded from the repository
+SampleGame/models/buddha.*

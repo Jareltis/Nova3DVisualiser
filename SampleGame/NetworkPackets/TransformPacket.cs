@@ -1,5 +1,5 @@
-﻿using _3dEngine;
-using _3dEngine.Network;
+﻿using Nova3DVisualiser;
+using Nova3DVisualiser.Network;
 
 namespace SampleGame.NetworkPackets;
 

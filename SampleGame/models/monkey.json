@@ -1,0 +1,8 @@
+{
+  "name": "Suzanne",
+  "position": { "x": -8.0, "y": 0.0, "z": -5.5 },
+  "rotation": { "x": 0.0, "y": 0.0, "z": 0.0 },
+  "scale": 1.0,
+  "color": "Yellow",
+  "rotateSpeed": 1.0
+}

@@ -1,10 +1,10 @@
-﻿using _3dEngine;
-using _3dEngine.AbstractClass;
-using _3dEngine.Implementation;
-using _3dEngine.Inputs;
-using _3dEngine.Interfaces;
-using _3dEngine.Shape;
-using _3dEngine.StaticClass;
+﻿using Nova3DVisualiser;
+using Nova3DVisualiser.AbstractClass;
+using Nova3DVisualiser.Implementation;
+using Nova3DVisualiser.Interfaces;
+using Nova3DVisualiser.Logging;
+using Nova3DVisualiser.Shape;
+using Nova3DVisualiser.StaticClass;
 
 namespace SampleGame.Scenes;
 
@@ -16,7 +16,7 @@ public class PreviewScene (IDisplaysManagerAsync iDisplaysManager) : Scene(iDisp
     
     private Vector3 cameraPos = Vector3.Zero;
 
-    private Object3d _importedModel;
+    private List<Object3d> _models = new();
 
     private readonly Sphere _sphere = new Sphere(new Vector3(0,0,0), Vector3.Zero);
 
@@ -78,19 +78,8 @@ public class PreviewScene (IDisplaysManagerAsync iDisplaysManager) : Scene(iDisp
 
     public override void Start()
     {
-        string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "monkey.obj");
-        try
-        {
-            _importedModel = ObjLoader.Load(path);
-
-            _importedModel.Position = new Vector3(2, 0, 0);
-
-            AddDisplaysObject(_importedModel);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("Ошибка загрузки OBJ: " + ex.Message);
-        }
+        Exposure = 1.0f;
+        Ambient = 0.1f;
 
         _cube.Position = new Vector3(0,0,2);
         
@@ -102,18 +91,19 @@ public class PreviewScene (IDisplaysManagerAsync iDisplaysManager) : Scene(iDisp
 
         _cube.UpdateGeometry();
         _plane.UpdateGeometry();
-        if (_importedModel != null) _importedModel.UpdateGeometry();
 
         _light.Position = new Vector3(0, 0, 0);
         _sphere.Color = ConsoleColor.Red;
         _plane.Color = ConsoleColor.DarkGreen;
         _cube.Color = ConsoleColor.Cyan;
-        _importedModel.Color = ConsoleColor.Yellow;
         AddDisplaysObject(_cube);
         AddDisplaysObject(_sphere);
         AddDisplaysObject(_plane);
         AddLight(_light);
         SetMainCamera(_camera);
+
+        _models = ModelLoader.LoadFolder(AppPaths.ModelsFolder);
+        foreach (var m in _models) AddDisplaysObject(m);
     }
 
     public override void Update()
@@ -121,8 +111,12 @@ public class PreviewScene (IDisplaysManagerAsync iDisplaysManager) : Scene(iDisp
         float rotateSpeed = 1.5f;
         float dt = GameTime.GetDeltaTime();
 
-        _importedModel.LocalRotate.Y += 1f * dt;
-        if (_importedModel != null) _importedModel.UpdateGeometry();
+        foreach (var m in _models)
+            if (m.RotateSpeed != 0f)
+            {
+                m.LocalRotate.Y += m.RotateSpeed * dt;
+                m.UpdateGeometry();
+            }
 
         if (Input.IsGetKey(ConsoleKey.LeftArrow))
             _camera.LocalRotate.Y += rotateSpeed * dt;
