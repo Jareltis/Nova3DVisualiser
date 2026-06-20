@@ -7,6 +7,7 @@ using Nova3DVisualiser.Network;
 using Nova3DVisualiser.Shape;
 using Nova3DVisualiser.StaticClass;
 using SampleGame.NetworkPackets;
+using SampleGame.Worlds;
 
 namespace SampleGame.Scenes;
 
@@ -19,11 +20,9 @@ public class PriviewNetworkScene : Scene
     
     readonly Camera _myCamera;
     readonly Light _mainLight;
-    readonly Object3d _floorPlane;
 
-    readonly Sphere _demoSphere;
-    readonly Object3d _demoCube;
-    private List<Object3d> _models = new();
+    private readonly WorldConfig _world;
+    private readonly List<Object3d> _models = new();   // spinnable Object3d objects (meshes + cubes)
 
     private readonly bool _ownLightEnabled;
     private readonly Light? _extraLight;
@@ -34,29 +33,20 @@ public class PriviewNetworkScene : Scene
     private const int MaxHistory = 5;
 
 
-    public PriviewNetworkScene(IDisplaysManagerAsync manager, bool isServer, string targetIp, int port, bool addExtraLight, bool disableOwnLight, bool online = true) : base(manager)
+    public PriviewNetworkScene(IDisplaysManagerAsync manager, WorldConfig world, bool isServer, string targetIp, int port, bool online = true) : base(manager)
     {
         _online = online;
         Exposure = 0.05f;
         Ambient = 0.1f;
 
-        _ownLightEnabled = !disableOwnLight;
-        if (addExtraLight)
+        _world = world;
+        _ownLightEnabled = !world.Graphics.DisableCameraLight;
+        if (world.Graphics.ExtraLight)
             _extraLight = new Light(new Vector3(2, 6, 0), 600f);
 
         // Tunable starting framing: lower and nearly level so models sit near vertical center.
         _myCamera = new Camera(new Vector3(-5.5f, 1.5f, 0), new Vector3(0, 0, -0.05f));
         _mainLight = new Light(new Vector3(0, 2, -2), 500);
-
-        _floorPlane = CreatePlane();
-        _floorPlane.Position = new Vector3(0, 0, 0);
-        _floorPlane.Color = ConsoleColor.Yellow;
-
-        _demoSphere = new Sphere(new Vector3(1, 1, -2), Vector3.Zero, r: 1f) { Color = ConsoleColor.Red };
-
-        _demoCube = CreateCube();
-        _demoCube.Position = new Vector3(2, 1, 2);
-        _demoCube.Color = ConsoleColor.Cyan;
 
         _myNetId = isServer ? 1 : Random.Shared.Next(2, 10000);
 
@@ -93,20 +83,100 @@ public class PriviewNetworkScene : Scene
 
     public override void Start()
     {
-        AddDisplaysObject(_floorPlane);
-        AddDisplaysObject(_demoSphere);
-
-        _demoCube.UpdateGeometry();
-        AddDisplaysObject(_demoCube);
+        if (_world.Platform.Enabled)
+        {
+            Object3d floor = CreatePlane(_world.Platform.Size);
+            floor.Position = new Vector3(0, 0, 0);
+            floor.Color = ParseColor(_world.Platform.Color, ConsoleColor.Yellow);
+            AddDisplaysObject(floor);
+        }
 
         if (_ownLightEnabled) AddLight(_mainLight);
         if (_extraLight != null) AddLight(_extraLight);
 
         SetMainCamera(_myCamera);
 
-        _models = ModelLoader.LoadFolder(AppPaths.ModelsFolder);
-        foreach (var m in _models) AddDisplaysObject(m);
+        foreach (var obj in _world.Objects)
+            BuildWorldObject(obj);
     }
+
+    // Builds one world object (mesh / cube / sphere) and adds it to the display.
+    private void BuildWorldObject(WorldObject o)
+    {
+        switch (o.Type?.Trim().ToLowerInvariant())
+        {
+            case "mesh":
+            {
+                if (string.IsNullOrWhiteSpace(o.Mesh))
+                {
+                    Logger.Warning("World mesh object has no Mesh name; skipping.");
+                    return;
+                }
+
+                Object3d? mesh = ModelLoader.LoadRawMesh(AppPaths.ModelsFolder, o.Mesh);
+                if (mesh == null)
+                {
+                    Logger.Warning($"World mesh '{o.Mesh}' did not resolve; skipping.");
+                    return;
+                }
+
+                // Same order the old per-model loader used.
+                mesh.Position = ToVec(o.Position);
+                mesh.LocalRotate = ToVec(o.Rotation);
+                mesh.Scale = o.Scale;
+                mesh.Color = ParseColor(o.Color, ConsoleColor.White);
+                mesh.RotateSpeed = o.RotateSpeed;
+                mesh.ApplyAnchor(ParseAnchor(o.Anchor));
+                mesh.BuildAcceleration();
+                mesh.UpdateGeometry();
+
+                _models.Add(mesh);
+                AddDisplaysObject(mesh);
+                break;
+            }
+
+            case "cube":
+            {
+                Object3d cube = CreateCube();
+                cube.Position = ToVec(o.Position);
+                cube.LocalRotate = ToVec(o.Rotation);
+                cube.Scale = o.Scale;
+                cube.Color = ParseColor(o.Color, ConsoleColor.White);
+                cube.RotateSpeed = o.RotateSpeed;
+                cube.UpdateGeometry();
+
+                _models.Add(cube);
+                AddDisplaysObject(cube);
+                break;
+            }
+
+            case "sphere":
+            {
+                var sphere = new Sphere(ToVec(o.Position), ToVec(o.Rotation), o.Radius)
+                {
+                    Color = ParseColor(o.Color, ConsoleColor.White)
+                };
+                AddDisplaysObject(sphere);
+                break;
+            }
+
+            default:
+                Logger.Warning($"Unknown world object type '{o.Type}'; skipping.");
+                break;
+        }
+    }
+
+    private static Vector3 ToVec(Vec3Config v) => new Vector3(v.X, v.Y, v.Z);
+
+    private static AnchorMode ParseAnchor(string? s) => s?.Trim().ToLowerInvariant() switch
+    {
+        "center" => AnchorMode.Center,
+        "origin" => AnchorMode.Origin,
+        _ => AnchorMode.Bottom
+    };
+
+    private static ConsoleColor ParseColor(string? s, ConsoleColor fallback) =>
+        Enum.TryParse<ConsoleColor>(s, true, out var c) ? c : fallback;
 
     public override void Update()
     {
@@ -306,15 +376,15 @@ public class PriviewNetworkScene : Scene
             });
     }
 
-    private Object3d CreatePlane()
+    private Object3d CreatePlane(float size)
     {
         return new Object3d(
             new Vector3[]
             {
-                new Vector3(-10f, 0f, 10f),
-                new Vector3(10f, 0f, 10f),
-                new Vector3(-10f, 0f, -10f),
-                new Vector3(10f, 0f, -10f)
+                new Vector3(-size, 0f, size),
+                new Vector3(size, 0f, size),
+                new Vector3(-size, 0f, -size),
+                new Vector3(size, 0f, -size)
             },
             new Vector3[]
             {

@@ -1,0 +1,15 @@
+{
+  "Name": "default",
+  "Graphics": {
+    "Shadows": true,
+    "Bvh": true,
+    "ExtraLight": false,
+    "DisableCameraLight": false
+  },
+  "Platform": {
+    "Enabled": true,
+    "Size": 10,
+    "Color": "Yellow"
+  },
+  "Objects": []
+}

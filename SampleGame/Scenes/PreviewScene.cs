@@ -5,6 +5,7 @@ using Nova3DVisualiser.Interfaces;
 using Nova3DVisualiser.Logging;
 using Nova3DVisualiser.Shape;
 using Nova3DVisualiser.StaticClass;
+using SampleGame.Worlds;
 
 namespace SampleGame.Scenes;
 
@@ -102,8 +103,16 @@ public class PreviewScene (IDisplaysManagerAsync iDisplaysManager) : Scene(iDisp
         AddLight(_light);
         SetMainCamera(_camera);
 
-        _models = ModelLoader.LoadFolder(AppPaths.ModelsFolder);
-        foreach (var m in _models) AddDisplaysObject(m);
+        foreach (var name in WorldManager.ListAvailableMeshes())
+        {
+            var m = ModelLoader.LoadRawMesh(AppPaths.ModelsFolder, name);
+            if (m == null) continue;
+            m.ApplyAnchor(AnchorMode.Bottom);
+            m.BuildAcceleration();
+            m.UpdateGeometry();
+            _models.Add(m);
+            AddDisplaysObject(m);
+        }
     }
 
     public override void Update()

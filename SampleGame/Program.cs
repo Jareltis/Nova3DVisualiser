@@ -7,33 +7,35 @@ using Nova3DVisualiser.Network;
 using Nova3DVisualiser.Shape;
 using Nova3DVisualiser.StaticClass;
 using SampleGame.Scenes;
+using SampleGame.Worlds;
 using Terminal.Gui;
 
 namespace SampleGame;
 
 class Program
 {
-    // Outcome of a single setup dialog.
-    enum Step { Mode, Role, Network, Graphics }
+    // Setup wizard step and per-dialog outcome.
+    enum Step { Mode, Role, World, Create, Load, Network }
     enum DlgResult { Ok, Back, Quit }
 
     static void Main(string[] args)
     {
         if (args.Length > 0 && args[0] == "bvhtest") { BvhSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "worldtest") { WorldSelfTest(); return; }
 
         Logger.Init(AppPaths.LogsFolder);
         Logger.Info("Application started");
 
-        // ---- Setup choices (defaults match the previous flow) ----
+        // ---- Setup choices ----
         bool online = false;
         bool isServer = false;
         string ip = "127.0.0.1";
         int port = 7777;
-        bool enableShadows = true;
-        bool useBvh = true;
-        bool addExtraLight = false;
-        bool disableOwnLight = false;
+        WorldConfig? chosenWorld = null;
         bool quit = false;
+
+        // There is always at least the default world to load.
+        WorldManager.EnsureDefault();
 
         // ---- Terminal.Gui modal setup wizard ----
         Application.Init();
@@ -60,20 +62,31 @@ class Program
                 {
                     case Step.Mode:
                         if (ShowModeDialog(ref online) == DlgResult.Quit) { quit = true; done = true; }
-                        else step = online ? Step.Role : Step.Graphics;
+                        else step = online ? Step.Role : Step.World;
                         break;
 
                     case Step.Role:
-                        step = ShowRoleDialog(ref isServer) == DlgResult.Back ? Step.Mode : Step.Network;
+                        step = ShowRoleDialog(ref isServer) == DlgResult.Back ? Step.Mode : Step.World;
+                        break;
+
+                    case Step.World:
+                        var menu = ShowWorldMenuDialog(out bool create);
+                        if (menu == DlgResult.Back) step = online ? Step.Role : Step.Mode;
+                        else step = create ? Step.Create : Step.Load;
+                        break;
+
+                    case Step.Create:
+                        if (ShowCreateDialog(out WorldConfig? created) == DlgResult.Back) step = Step.World;
+                        else { chosenWorld = created; step = online ? Step.Network : Step.Mode; if (!online) done = true; }
+                        break;
+
+                    case Step.Load:
+                        if (ShowLoadDialog(out WorldConfig? loaded) == DlgResult.Back) step = Step.World;
+                        else { chosenWorld = loaded; step = online ? Step.Network : Step.Mode; if (!online) done = true; }
                         break;
 
                     case Step.Network:
-                        step = ShowNetworkDialog(isServer, ref ip, ref port) == DlgResult.Back ? Step.Role : Step.Graphics;
-                        break;
-
-                    case Step.Graphics:
-                        if (ShowGraphicsDialog(ref enableShadows, ref useBvh, ref addExtraLight, ref disableOwnLight) == DlgResult.Back)
-                            step = online ? Step.Network : Step.Mode;
+                        if (ShowNetworkDialog(isServer, ref ip, ref port) == DlgResult.Back) step = Step.World;
                         else done = true; // Start
                         break;
                 }
@@ -88,23 +101,23 @@ class Program
         Console.ResetColor();
         Console.Clear();
 
-        if (quit)
+        if (quit || chosenWorld == null)
         {
             Logger.Info("Setup cancelled by user");
             return;
         }
 
-        Object3d.UseBvh = useBvh;
-        Logger.Info($"Mode={(online ? (isServer ? "Server" : "Client") : "Local")}; Network {ip}:{port}; extraLight={addExtraLight}; ownLight={!disableOwnLight}; shadows={enableShadows}; bvh={useBvh}");
+        Object3d.UseBvh = chosenWorld.Graphics.Bvh;
+        Logger.Info($"World='{chosenWorld.Name}'; Mode={(online ? (isServer ? "Server" : "Client") : "Local")}; Network {ip}:{port}; platform={chosenWorld.Platform.Enabled}; objects={chosenWorld.Objects.Count}; extraLight={chosenWorld.Graphics.ExtraLight}; ownLight={!chosenWorld.Graphics.DisableCameraLight}; shadows={chosenWorld.Graphics.Shadows}; bvh={chosenWorld.Graphics.Bvh}");
 
         Console.WriteLine(online
-            ? $"Starting {(isServer ? "Server" : "Client")} on {ip}:{port}..."
-            : "Starting local (offline) session...");
+            ? $"Starting {(isServer ? "Server" : "Client")} on {ip}:{port} [world: {chosenWorld.Name}]..."
+            : $"Starting local (offline) session [world: {chosenWorld.Name}]...");
         Thread.Sleep(500);
         Console.Clear();
 
-        var scene = new PriviewNetworkScene(new DisplayManagerAsync(), isServer, ip, port, addExtraLight, disableOwnLight, online);
-        scene.EnableShadows = enableShadows;
+        var scene = new PriviewNetworkScene(new DisplayManagerAsync(), chosenWorld, isServer, ip, port, online);
+        scene.EnableShadows = chosenWorld.Graphics.Shadows;
 
         Logger.Info("Scene constructed, entering render loop");
         try
@@ -227,33 +240,132 @@ class Program
         return result;
     }
 
-    // ---- Dialog 4: graphics options as checkboxes. ----
-    static DlgResult ShowGraphicsDialog(ref bool shadows, ref bool bvh, ref bool extraLight, ref bool disableOwnLight)
+    // ---- Dialog 4: world menu (Create new / Load existing). ----
+    static DlgResult ShowWorldMenuDialog(out bool create)
     {
         var result = DlgResult.Back;
-        var cbShadows = new CheckBox("Shadows", shadows) { X = 1, Y = 1 };
-        var cbBvh = new CheckBox("BVH acceleration", bvh) { X = 1, Y = 2 };
-        var cbExtra = new CheckBox("Extra fixed light", extraLight) { X = 1, Y = 3 };
-        var cbDisableOwn = new CheckBox("Disable camera light", disableOwnLight) { X = 1, Y = 4 };
+        var radio = new RadioGroup(new ustring[] { "Create new world", "Load world" }, 0) { X = 1, Y = 1 };
 
-        var start = new Button("Start", is_default: true);
+        var ok = new Button("Ok", is_default: true);
         var back = new Button("Back");
-        start.Clicked += () => { result = DlgResult.Ok; Application.RequestStop(); };
+        ok.Clicked += () => { result = DlgResult.Ok; Application.RequestStop(); };
         back.Clicked += () => { result = DlgResult.Back; Application.RequestStop(); };
 
-        var dialog = new Dialog("Graphics options", 50, 11, start, back);
-        dialog.Add(new Label("Toggle with Space; Tab to the buttons.") { X = 1, Y = 0 },
-            cbShadows, cbBvh, cbExtra, cbDisableOwn);
+        var dialog = new Dialog("World", 50, 9, ok, back);
+        dialog.Add(new Label("Create a new world or load a saved one?") { X = 1, Y = 0 }, radio);
         Application.Run(dialog);
 
-        if (result == DlgResult.Ok)
-        {
-            shadows = cbShadows.Checked;
-            bvh = cbBvh.Checked;
-            extraLight = cbExtra.Checked;
-            disableOwnLight = cbDisableOwn.Checked;
-        }
+        create = radio.SelectedItem == 0;
         return result;
+    }
+
+    // ---- Dialog 5: create a world (name + graphics + platform toggle). ----
+    // A new world starts with no objects; scene objects are added by hand-editing
+    // the world JSON for now (the in-scene editor is a later step).
+    static DlgResult ShowCreateDialog(out WorldConfig? world)
+    {
+        world = null;
+        var result = DlgResult.Back;
+        WorldConfig? built = null;
+
+        var nameField = new TextField("myworld") { X = 13, Y = 0, Width = Dim.Fill() - 2 };
+
+        var cbShadows = new CheckBox("Shadows", true) { X = 1, Y = 3 };
+        var cbBvh = new CheckBox("BVH acceleration", true) { X = 1, Y = 4 };
+        var cbExtra = new CheckBox("Extra fixed light", false) { X = 1, Y = 5 };
+        var cbDisableOwn = new CheckBox("Disable camera light", false) { X = 1, Y = 6 };
+        var cbPlatform = new CheckBox("Include platform", true) { X = 1, Y = 8 };
+
+        var create = new Button("Create", is_default: true);
+        var back = new Button("Back");
+        back.Clicked += () => { result = DlgResult.Back; Application.RequestStop(); };
+        create.Clicked += () =>
+        {
+            string safe = SanitizeWorldName(nameField.Text.ToString() ?? "");
+            if (string.IsNullOrEmpty(safe))
+            {
+                MessageBox.ErrorQuery("Invalid name", "Enter a non-empty world name (letters, digits, - or _).", "Ok");
+                return;
+            }
+
+            var w = new WorldConfig
+            {
+                Name = safe,
+                Graphics = new GraphicsConfig
+                {
+                    Shadows = cbShadows.Checked,
+                    Bvh = cbBvh.Checked,
+                    ExtraLight = cbExtra.Checked,
+                    DisableCameraLight = cbDisableOwn.Checked,
+                },
+                Platform = new PlatformConfig { Enabled = cbPlatform.Checked, Size = 10f, Color = "Yellow" },
+                Objects = new List<WorldObject>(),
+            };
+            WorldManager.Save(w);
+            built = w;
+            result = DlgResult.Ok;
+            Application.RequestStop();
+        };
+
+        var dialog = new Dialog("Create world", 56, 13, create, back);
+        dialog.Add(
+            new Label("World name:") { X = 1, Y = 0 }, nameField,
+            new Label("Graphics (Space toggles):") { X = 1, Y = 2 },
+            cbShadows, cbBvh, cbExtra, cbDisableOwn,
+            cbPlatform);
+        Application.Run(dialog);
+
+        world = built;
+        return result;
+    }
+
+    // ---- Dialog 6: load a saved world. ----
+    static DlgResult ShowLoadDialog(out WorldConfig? world)
+    {
+        world = null;
+        var result = DlgResult.Back;
+        WorldConfig? loaded = null;
+
+        var names = WorldManager.ListWorlds();
+        var labels = names.Select(n => (ustring)n).ToArray();
+        var radio = new RadioGroup(labels, 0) { X = 1, Y = 1 };
+
+        var load = new Button("Load", is_default: true);
+        var back = new Button("Back");
+        back.Clicked += () => { result = DlgResult.Back; Application.RequestStop(); };
+        load.Clicked += () =>
+        {
+            if (names.Count == 0) { result = DlgResult.Back; Application.RequestStop(); return; }
+
+            string name = names[radio.SelectedItem];
+            var w = WorldManager.Load(name);
+            if (w == null)
+            {
+                MessageBox.ErrorQuery("Load failed", $"Could not load world '{name}' (see log).", "Ok");
+                return;
+            }
+            loaded = w;
+            result = DlgResult.Ok;
+            Application.RequestStop();
+        };
+
+        int height = Math.Min(20, 7 + Math.Max(1, names.Count));
+        var dialog = new Dialog("Load world", 50, height, load, back);
+        dialog.Add(new Label("Select a saved world:") { X = 1, Y = 0 }, radio);
+        Application.Run(dialog);
+
+        world = loaded;
+        return result;
+    }
+
+    static string SanitizeWorldName(string raw)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (char c in raw.Trim())
+        {
+            if (char.IsLetterOrDigit(c) || c == '-' || c == '_') sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     static void BvhSelfTest()
@@ -261,7 +373,18 @@ class Program
         Logger.Init(AppPaths.LogsFolder);
         Console.WriteLine("=== BVH SELF-TEST ===");
 
-        var models = ModelLoader.LoadFolder(AppPaths.ModelsFolder);
+        // models/ is a pure mesh library now: load each .obj raw and build its acceleration here.
+        var models = new List<Object3d>();
+        if (Directory.Exists(AppPaths.ModelsFolder))
+        {
+            foreach (string objPath in Directory.GetFiles(AppPaths.ModelsFolder, "*.obj"))
+            {
+                var m = ModelLoader.LoadRawMesh(AppPaths.ModelsFolder, Path.GetFileNameWithoutExtension(objPath));
+                if (m == null) continue;
+                m.BuildAcceleration();
+                models.Add(m);
+            }
+        }
         if (models.Count == 0) { Console.WriteLine("No models found - cannot run self-test."); return; }
 
         // Pick the highest-triangle model (the monkey/Suzanne; it has a BVH).
@@ -333,5 +456,51 @@ class Program
         Console.WriteLine($"Rays: {rays}, Hits: {hits}, Mismatches: {mismatches}");
         Console.WriteLine(mismatches == 0 ? "BVH SELF-TEST PASSED" : "BVH SELF-TEST FAILED");
         Object3d.UseBvh = true;
+    }
+
+    // Non-interactive check that the worlds engine resolves the platform-only default
+    // world and that the mesh/primitive build paths work.
+    static void WorldSelfTest()
+    {
+        Logger.Init(AppPaths.LogsFolder);
+        Console.WriteLine("=== WORLD SELF-TEST ===");
+
+        WorldManager.EnsureDefault();
+
+        var worlds = WorldManager.ListWorlds();
+        Console.WriteLine($"Worlds found: {string.Join(", ", worlds)}");
+
+        var world = WorldManager.Load("default");
+        if (world == null) { Console.WriteLine("WORLD TEST FAILED: could not load 'default'."); return; }
+
+        Console.WriteLine($"World '{world.Name}': shadows={world.Graphics.Shadows}, bvh={world.Graphics.Bvh}, " +
+                          $"extraLight={world.Graphics.ExtraLight}, disableCameraLight={world.Graphics.DisableCameraLight}");
+        Console.WriteLine($"Platform: enabled={world.Platform.Enabled}, size={world.Platform.Size}, color={world.Platform.Color}");
+        Console.WriteLine($"Objects: {world.Objects.Count}");
+
+        if (!world.Platform.Enabled) { Console.WriteLine("WORLD TEST FAILED: default platform not enabled."); return; }
+        if (world.Objects.Count != 0) { Console.WriteLine("WORLD TEST FAILED: default world should have 0 objects."); return; }
+
+        // Verify the mesh build path: pick the highest-tri available mesh, load raw + build BVH.
+        var meshes = WorldManager.ListAvailableMeshes();
+        if (meshes.Count == 0) { Console.WriteLine("WORLD TEST FAILED: no meshes available to verify build path."); return; }
+
+        string best = "";
+        Object3d? bestMesh = null;
+        foreach (var name in meshes)
+        {
+            var m = ModelLoader.LoadRawMesh(AppPaths.ModelsFolder, name);
+            if (m == null) continue;
+            m.BuildAcceleration();
+            if (bestMesh == null || m.FaceCount > bestMesh.FaceCount) { best = name; bestMesh = m; }
+        }
+        if (bestMesh == null) { Console.WriteLine("WORLD TEST FAILED: no mesh resolved."); return; }
+        Console.WriteLine($"Mesh build OK: '{best}' -> {bestMesh.FaceCount} triangles, bvh={bestMesh.HasBvh}");
+
+        // Confirm a primitive builds.
+        var sphere = new Sphere(new Vector3(0, 0, 0), Vector3.Zero, 1f);
+        Console.WriteLine($"Sphere build OK: r={sphere.R}");
+
+        Console.WriteLine("WORLD TEST PASSED");
     }
 }

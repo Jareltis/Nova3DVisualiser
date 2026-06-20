@@ -11,4 +11,5 @@ public static class AppPaths
 
     public static readonly string ModelsFolder = Path.Combine(ProjectRoot, "models");
     public static readonly string LogsFolder = Path.Combine(ProjectRoot, "logs");
+    public static readonly string WorldsFolder = Path.Combine(ProjectRoot, "worlds");
 }
