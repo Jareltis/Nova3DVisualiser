@@ -22,6 +22,7 @@ class Program
     {
         if (args.Length > 0 && args[0] == "bvhtest") { BvhSelfTest(); return; }
         if (args.Length > 0 && args[0] == "worldtest") { WorldSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "editortest") { EditorSelfTest(); return; }
 
         Logger.Init(AppPaths.LogsFolder);
         Logger.Info("Application started");
@@ -502,5 +503,45 @@ class Program
         Console.WriteLine($"Sphere build OK: r={sphere.R}");
 
         Console.WriteLine("WORLD TEST PASSED");
+    }
+
+    // Non-interactive round-trip of the editor's save-back conversion (FromInstance):
+    // build a cube object from a descriptor, mutate its live Position, convert back, and
+    // assert the result reflects the move while preserving Type/Color/Scale.
+    static void EditorSelfTest()
+    {
+        Logger.Init(AppPaths.LogsFolder);
+        Console.WriteLine("=== EDITOR SELF-TEST ===");
+
+        var descriptor = new WorldObject
+        {
+            Type = "cube",
+            Position = new Vec3Config { X = 1f, Y = 2f, Z = 3f },
+            Scale = 2f,
+            Color = "Magenta",
+        };
+
+        // Build the live instance the same way the scene does.
+        Object3d cube = PriviewNetworkScene.CreateCube();
+        cube.Position = new Vector3(descriptor.Position.X, descriptor.Position.Y, descriptor.Position.Z);
+        cube.Scale = descriptor.Scale;
+        if (Enum.TryParse<ConsoleColor>(descriptor.Color, true, out var col)) cube.Color = col;
+
+        // Mutate the instance (as the move keys would).
+        cube.Position += new Vector3(5f, 0f, 0f);
+
+        WorldObject back = PriviewNetworkScene.FromInstance(descriptor, cube);
+
+        Console.WriteLine($"Back: type={back.Type}, pos=({back.Position.X},{back.Position.Y},{back.Position.Z}), scale={back.Scale}, color={back.Color}");
+
+        bool ok =
+            back.Type == "cube" &&
+            Math.Abs(back.Position.X - 6f) < 1e-4f &&
+            Math.Abs(back.Position.Y - 2f) < 1e-4f &&
+            Math.Abs(back.Position.Z - 3f) < 1e-4f &&
+            Math.Abs(back.Scale - 2f) < 1e-4f &&
+            back.Color == "Magenta";
+
+        Console.WriteLine(ok ? "EDITOR TEST PASSED" : "EDITOR TEST FAILED");
     }
 }

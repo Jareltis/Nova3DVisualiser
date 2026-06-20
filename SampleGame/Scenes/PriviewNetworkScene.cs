@@ -32,6 +32,25 @@ public class PriviewNetworkScene : Scene
     private readonly List<string> _chatHistory = new();
     private const int MaxHistory = 5;
 
+    // ---- In-scene editor (3b-i: toggle, spawn, select, move, save) ----
+    // Pairs a saved WorldObject descriptor (Type/Mesh/Anchor/Radius metadata) with its
+    // live scene instance (Object3d for mesh/cube, Sphere for sphere — both GameObjects).
+    private sealed class EditEntry
+    {
+        public required WorldObject Descriptor;
+        public required GameObject Instance;
+    }
+
+    private bool _editMode = false;
+    private readonly List<EditEntry> _editables = new();
+    private int _selected = -1;
+    private readonly List<string> _spawnTypes = new();   // "cube", "sphere", then each library mesh
+    private int _spawnIndex = 0;
+    private const float MoveStep = 0.5f;
+    private readonly HashSet<ConsoleKey> _prevDown = new();
+    private int _saveFlash = 0;
+    private string _saveMsg = "";
+
 
     public PriviewNetworkScene(IDisplaysManagerAsync manager, WorldConfig world, bool isServer, string targetIp, int port, bool online = true) : base(manager)
     {
@@ -96,13 +115,22 @@ public class PriviewNetworkScene : Scene
 
         SetMainCamera(_myCamera);
 
+        // Spawn palette for the editor: the two primitives, then every library mesh.
+        _spawnTypes.Add("cube");
+        _spawnTypes.Add("sphere");
+        _spawnTypes.AddRange(WorldManager.ListAvailableMeshes());
+
         foreach (var obj in _world.Objects)
             BuildWorldObject(obj);
     }
 
-    // Builds one world object (mesh / cube / sphere) and adds it to the display.
-    private void BuildWorldObject(WorldObject o)
+    // Builds one world object (mesh / cube / sphere), adds it to the display, and records
+    // an editable entry pairing the descriptor with its live instance. Returns the entry
+    // (null if it did not resolve). The platform, lights and remote players are NOT recorded.
+    private EditEntry? BuildWorldObject(WorldObject o)
     {
+        GameObject? instance = null;
+
         switch (o.Type?.Trim().ToLowerInvariant())
         {
             case "mesh":
@@ -110,14 +138,14 @@ public class PriviewNetworkScene : Scene
                 if (string.IsNullOrWhiteSpace(o.Mesh))
                 {
                     Logger.Warning("World mesh object has no Mesh name; skipping.");
-                    return;
+                    return null;
                 }
 
                 Object3d? mesh = ModelLoader.LoadRawMesh(AppPaths.ModelsFolder, o.Mesh);
                 if (mesh == null)
                 {
                     Logger.Warning($"World mesh '{o.Mesh}' did not resolve; skipping.");
-                    return;
+                    return null;
                 }
 
                 // Same order the old per-model loader used.
@@ -132,6 +160,7 @@ public class PriviewNetworkScene : Scene
 
                 _models.Add(mesh);
                 AddDisplaysObject(mesh);
+                instance = mesh;
                 break;
             }
 
@@ -147,6 +176,7 @@ public class PriviewNetworkScene : Scene
 
                 _models.Add(cube);
                 AddDisplaysObject(cube);
+                instance = cube;
                 break;
             }
 
@@ -157,13 +187,42 @@ public class PriviewNetworkScene : Scene
                     Color = ParseColor(o.Color, ConsoleColor.White)
                 };
                 AddDisplaysObject(sphere);
+                instance = sphere;
                 break;
             }
 
             default:
                 Logger.Warning($"Unknown world object type '{o.Type}'; skipping.");
-                break;
+                return null;
         }
+
+        var entry = new EditEntry { Descriptor = o, Instance = instance };
+        _editables.Add(entry);
+        return entry;
+    }
+
+    private static Vec3Config FromVec(Vector3 v) => new Vec3Config { X = v.X, Y = v.Y, Z = v.Z };
+
+    /// <summary>
+    /// Save-back conversion: reads the live instance's Position/Rotation/Scale/Color into a
+    /// fresh WorldObject, keeping Type/Mesh/Anchor/Radius from the descriptor. Takes a
+    /// GameObject so it covers both Object3d (mesh/cube) and Sphere instances.
+    /// </summary>
+    public static WorldObject FromInstance(WorldObject descriptor, GameObject instance)
+    {
+        var o3d = instance as Object3d;
+        return new WorldObject
+        {
+            Type = descriptor.Type,
+            Mesh = descriptor.Mesh,
+            Anchor = descriptor.Anchor,
+            Radius = descriptor.Radius,
+            Position = FromVec(instance.Position),
+            Rotation = FromVec(instance.LocalRotate),
+            Scale = o3d?.Scale ?? descriptor.Scale,
+            Color = instance.Color.ToString(),
+            RotateSpeed = o3d?.RotateSpeed ?? descriptor.RotateSpeed,
+        };
     }
 
     private static Vector3 ToVec(Vec3Config v) => new Vector3(v.X, v.Y, v.Z);
@@ -196,8 +255,13 @@ public class PriviewNetworkScene : Scene
         }
         else
         {
+            // Tab toggles the editor; camera fly stays active in edit mode.
+            if (Pressed(ConsoleKey.Tab)) _editMode = !_editMode;
+
             HandleGameInput(GameTime.GetDeltaTime());
-            
+
+            if (_editMode) HandleEditorInput();
+
             if (Input.IsGetKey(ConsoleKey.T))
             {
                 _isChatting = true;
@@ -205,15 +269,131 @@ public class PriviewNetworkScene : Scene
                 while (Console.KeyAvailable) Console.ReadKey(true);
             }
         }
-        
+
         if (!_isChatting && _netManager != null)
         {
             var packet = new TransformPacket(_myCamera.Position, _myCamera.LocalRotate);
             _netManager.SendPacket(packet, _myNetId);
         }
         if (_ownLightEnabled) _mainLight.Position = _myCamera.Position;
+        if (_saveFlash > 0) _saveFlash--;
         DrawChatInterface();
+        DrawEditorOverlay();
     }
+
+    // ---- Editor input (only called in edit mode, never while chatting) ----
+    private void HandleEditorInput()
+    {
+        // Cycle the spawn type.
+        if (Pressed(ConsoleKey.G) && _spawnTypes.Count > 0)
+            _spawnIndex = (_spawnIndex + 1) % _spawnTypes.Count;
+
+        // Spawn the current type a couple of units in front of the camera, at ground level.
+        if (Pressed(ConsoleKey.Enter))
+            SpawnCurrent();
+
+        // Cycle the selection (wrap around).
+        if (_editables.Count > 0)
+        {
+            if (Pressed(ConsoleKey.Oem4)) // '['
+                _selected = (_selected <= 0 ? _editables.Count : _selected) - 1;
+            if (Pressed(ConsoleKey.Oem6)) // ']'
+                _selected = (_selected + 1) % _editables.Count;
+        }
+
+        // Move the selected object by a fixed step per press (world axes).
+        if (_selected >= 0 && _selected < _editables.Count)
+        {
+            var delta = Vector3.Zero;
+            if (Pressed(ConsoleKey.L)) delta.X += MoveStep;
+            if (Pressed(ConsoleKey.J)) delta.X -= MoveStep;
+            if (Pressed(ConsoleKey.I)) delta.Z += MoveStep;
+            if (Pressed(ConsoleKey.K)) delta.Z -= MoveStep;
+            if (Pressed(ConsoleKey.U)) delta.Y += MoveStep;
+            if (Pressed(ConsoleKey.O)) delta.Y -= MoveStep;
+
+            if (delta.X != 0f || delta.Y != 0f || delta.Z != 0f)
+            {
+                var inst = _editables[_selected].Instance;
+                inst.Position += delta;
+                if (inst is Object3d o) o.UpdateGeometry();
+            }
+        }
+
+        // Save the arrangement back into the world JSON.
+        if (Pressed(ConsoleKey.F5))
+            SaveWorld();
+    }
+
+    private void SpawnCurrent()
+    {
+        if (_spawnTypes.Count == 0) return;
+
+        Vector3 yaw = new Vector3(0, _myCamera.LocalRotate.Y, 0);
+        Vector3 forward = new Vector3(1, 0, 0).Rotate(yaw);
+        Vector3 spawnPos = _myCamera.Position + forward * 3f;
+        spawnPos.Y = 0f; // ground level
+
+        string label = _spawnTypes[_spawnIndex];
+        var descriptor = new WorldObject
+        {
+            Type = label is "cube" or "sphere" ? label : "mesh",
+            Mesh = label is "cube" or "sphere" ? null : label,
+            Position = FromVec(spawnPos),
+            Scale = 1f,
+            Color = "White",
+            Anchor = "Bottom",
+            Radius = 1f,
+        };
+
+        var entry = BuildWorldObject(descriptor);
+        if (entry != null) _selected = _editables.Count - 1;
+    }
+
+    private void SaveWorld()
+    {
+        _world.Objects = _editables.Select(e => FromInstance(e.Descriptor, e.Instance)).ToList();
+        WorldManager.Save(_world);
+        _saveMsg = $"Saved to {_world.Name} ({_world.Objects.Count} objects)";
+        _saveFlash = 120;
+        Logger.Info(_saveMsg);
+    }
+
+    // Edge-triggered key press (true only on the frame the key transitions to down).
+    private bool Pressed(ConsoleKey key)
+    {
+        bool down = Input.IsGetKey(key);
+        bool was = _prevDown.Contains(key);
+        if (down) _prevDown.Add(key); else _prevDown.Remove(key);
+        return down && !was;
+    }
+
+    private void DrawEditorOverlay()
+    {
+        int x = 2, y = 12;
+        if (!_editMode)
+        {
+            UI.AddText("[Tab] Edit mode", new Vector2Int(x, y), ConsoleColor.DarkGray);
+            return;
+        }
+
+        UI.AddText("== EDIT MODE ==", new Vector2Int(x, y++), ConsoleColor.Green);
+        UI.AddText($"Spawn: {_spawnTypes[_spawnIndex]}", new Vector2Int(x, y++), ConsoleColor.Cyan);
+
+        string sel = _selected >= 0 && _selected < _editables.Count
+            ? $"Selected: [{_selected + 1}/{_editables.Count}] {DescribeEntry(_editables[_selected])}"
+            : $"Selected: (none) — {_editables.Count} object(s)";
+        UI.AddText(sel, new Vector2Int(x, y++), ConsoleColor.Yellow);
+
+        UI.AddText("[G] cycle type  [Enter] spawn  [ [ / ] ] select", new Vector2Int(x, y++), ConsoleColor.Gray);
+        UI.AddText("Move: J/L=X  I/K=Z  U/O=Y    [F5] save", new Vector2Int(x, y++), ConsoleColor.Gray);
+
+        if (_saveFlash > 0)
+            UI.AddText(_saveMsg, new Vector2Int(x, y), ConsoleColor.Green);
+    }
+
+    private static string DescribeEntry(EditEntry e) =>
+        e.Descriptor.Type == "mesh" ? $"mesh:{e.Descriptor.Mesh}" : e.Descriptor.Type;
     
     
     private void HandleGameInput(float dt)
@@ -336,7 +516,7 @@ public class PriviewNetworkScene : Scene
         }
     }
     
-    private Object3d CreateCube()
+    public static Object3d CreateCube()
     {
         return new Object3d(
             new Vector3[]
