@@ -26,4 +26,7 @@ Notable changes from the original:
 Because Nova3DVisualiser is derived from Neo3dEngine (GPL-3.0), the entire work is licensed under the GNU General Public License v3.0. The full text is in the [LICENSE](LICENSE) file.
 
 ## Third-party components
-Nova3DVisualiser depends only on the .NET 8 runtime and its base class library; it bundles no third-party source code. If optional libraries are added in the future (for example **Spectre.Console**, MIT — which itself uses **SixLabors.ImageSharp**, Apache-2.0), their license notices will be listed in this section.
+This project references the following third-party packages via NuGet (their source is not redistributed in this repository):
+- **Terminal.Gui** — © Miguel de Icaza, Tig Kindel, and contributors (the gui-cs project) — MIT License.
+
+The combined work remains licensed under GPL-3.0.

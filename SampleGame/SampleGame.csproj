@@ -11,5 +11,9 @@
       <ProjectReference Include="..\Nova3DVisualiser\Nova3DVisualiser.csproj" />
     </ItemGroup>
 
+    <ItemGroup>
+      <PackageReference Include="Terminal.Gui" Version="1.*" />
+    </ItemGroup>
+
 
 </Project>

@@ -12,7 +12,8 @@ namespace SampleGame.Scenes;
 
 public class PriviewNetworkScene : Scene
 {
-    private readonly NetworkManager _netManager;
+    private readonly bool _online;
+    private readonly NetworkManager? _netManager;
     private readonly int _myNetId;
     private readonly Dictionary<int, Object3d> _remotePlayers = new();
     
@@ -33,8 +34,9 @@ public class PriviewNetworkScene : Scene
     private const int MaxHistory = 5;
 
 
-    public PriviewNetworkScene(IDisplaysManagerAsync manager, bool isServer, string targetIp, int port, bool addExtraLight, bool disableOwnLight) : base(manager)
+    public PriviewNetworkScene(IDisplaysManagerAsync manager, bool isServer, string targetIp, int port, bool addExtraLight, bool disableOwnLight, bool online = true) : base(manager)
     {
+        _online = online;
         Exposure = 0.05f;
         Ambient = 0.1f;
 
@@ -56,8 +58,16 @@ public class PriviewNetworkScene : Scene
         _demoCube.Position = new Vector3(2, 1, 2);
         _demoCube.Color = ConsoleColor.Cyan;
 
-        _netManager = new NetworkManager();
         _myNetId = isServer ? 1 : Random.Shared.Next(2, 10000);
+
+        if (!_online)
+        {
+            Logger.Info("Local (offline) mode - networking disabled");
+            Console.Title = "LOCAL (Offline)";
+            return;
+        }
+
+        _netManager = new NetworkManager();
 
         PacketManager.RegisterPacket<TransformPacket>();
         PacketManager.RegisterPacket<ChatPacket>();
@@ -65,20 +75,20 @@ public class PriviewNetworkScene : Scene
         PacketManager.Subscribe<TransformPacket>(OnTransformReceived);
         PacketManager.Subscribe<ChatPacket>(OnChatReceived);
 
-        if (isServer) 
+        if (isServer)
         {
             _netManager.StartServer(port);
             Logger.Info($"Server listening on port {port}");
             Console.Title = $"SERVER (Port: {port}) | ID: {_myNetId}";
         }
-        else 
+        else
         {
             _netManager.Connect(targetIp, port);
             Logger.Info($"Connecting to {targetIp}:{port}");
             Console.Title = $"CLIENT (ID: {_myNetId}) -> {targetIp}:{port}";
         }
 
-        
+
     }
 
     public override void Start()
@@ -101,7 +111,7 @@ public class PriviewNetworkScene : Scene
     public override void Update()
     {
         UI.Clear();
-        _netManager.ProcessEvents();
+        _netManager?.ProcessEvents();
 
         foreach (var m in _models)
             if (m.RotateSpeed != 0f)
@@ -126,7 +136,7 @@ public class PriviewNetworkScene : Scene
             }
         }
         
-        if (!_isChatting) 
+        if (!_isChatting && _netManager != null)
         {
             var packet = new TransformPacket(_myCamera.Position, _myCamera.LocalRotate);
             _netManager.SendPacket(packet, _myNetId);
@@ -199,8 +209,8 @@ public class PriviewNetworkScene : Scene
                 if (!string.IsNullOrWhiteSpace(_currentInput))
                 {
                     string msg = $"Player {_myNetId}: {_currentInput}";
-                    _netManager.SendPacket(new ChatPacket(msg), _myNetId);
-                    
+                    _netManager?.SendPacket(new ChatPacket(msg), _myNetId);
+
                     AddChatMessage(msg);
                 }
                 _isChatting = false;
