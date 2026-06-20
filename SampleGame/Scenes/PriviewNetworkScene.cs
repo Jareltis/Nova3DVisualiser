@@ -2,6 +2,7 @@
 using Nova3DVisualiser.AbstractClass;
 using Nova3DVisualiser.Implementation;
 using Nova3DVisualiser.Interfaces;
+using Nova3DVisualiser.Interfaces.modifier;
 using Nova3DVisualiser.Logging;
 using Nova3DVisualiser.Network;
 using Nova3DVisualiser.Shape;
@@ -35,7 +36,7 @@ public class PriviewNetworkScene : Scene
     // ---- In-scene editor (3b-i: toggle, spawn, select, move, save) ----
     // Pairs a saved WorldObject descriptor (Type/Mesh/Anchor/Radius metadata) with its
     // live scene instance (Object3d for mesh/cube, Sphere for sphere — both GameObjects).
-    private sealed class EditEntry
+    public sealed class EditEntry
     {
         public required WorldObject Descriptor;
         public required GameObject Instance;
@@ -47,9 +48,21 @@ public class PriviewNetworkScene : Scene
     private readonly List<string> _spawnTypes = new();   // "cube", "sphere", then each library mesh
     private int _spawnIndex = 0;
     private const float MoveStep = 0.5f;
+    private const float RotStep = MathF.PI / 12f;        // 15 degrees in the engine's radians
+    private const float ScaleStep = 0.1f;
+    private const float SpinStep = 0.1f;
+    private const float RadiusStep = 0.1f;
     private readonly HashSet<ConsoleKey> _prevDown = new();
     private int _saveFlash = 0;
     private string _saveMsg = "";
+
+    // Properties-panel editable fields (read-only Type/Mesh are not in here).
+    private enum Field { PosX, PosY, PosZ, RotX, RotY, RotZ, Scale, RotateSpeed, Color, Radius }
+    private int _fieldIndex = 0;
+
+    private static Field[] EditableFields(string? type) => type == "sphere"
+        ? new[] { Field.PosX, Field.PosY, Field.PosZ, Field.Radius, Field.Color }
+        : new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.Scale, Field.RotateSpeed, Field.Color };
 
 
     public PriviewNetworkScene(IDisplaysManagerAsync manager, WorldConfig world, bool isServer, string targetIp, int port, bool online = true) : base(manager)
@@ -201,6 +214,27 @@ public class PriviewNetworkScene : Scene
         return entry;
     }
 
+    /// <summary>
+    /// Returns the index of the editable entry whose instance the ray hits nearest, or -1 for no hit.
+    /// Reuses the renderer's own ray-object intersection (IDisplays.GetRenderData) — no new math.
+    /// </summary>
+    public static int PickNearest(Ray ray, IReadOnlyList<EditEntry> editables)
+    {
+        int best = -1;
+        float bestDist = float.MaxValue;
+        for (int i = 0; i < editables.Count; i++)
+        {
+            if (editables[i].Instance is not IDisplays disp) continue;
+            var rd = disp.GetRenderData(ray);
+            if (rd.Intersection > -1f && rd.Intersection < bestDist)
+            {
+                bestDist = rd.Intersection;
+                best = i;
+            }
+        }
+        return best;
+    }
+
     private static Vec3Config FromVec(Vector3 v) => new Vec3Config { X = v.X, Y = v.Y, Z = v.Z };
 
     /// <summary>
@@ -279,6 +313,19 @@ public class PriviewNetworkScene : Scene
         if (_saveFlash > 0) _saveFlash--;
         DrawChatInterface();
         DrawEditorOverlay();
+        if (_editMode)
+        {
+            DrawCrosshair();
+            DrawPropertiesPanel();
+        }
+    }
+
+    // Center-screen aim reticle, shown only in edit mode.
+    private void DrawCrosshair()
+    {
+        int cx = Console.WindowWidth / 2;
+        int cy = Console.WindowHeight / 2;
+        UI.AddText("+", new Vector2Int(cx, cy), ConsoleColor.Red);
     }
 
     // ---- Editor input (only called in edit mode, never while chatting) ----
@@ -292,16 +339,23 @@ public class PriviewNetworkScene : Scene
         if (Pressed(ConsoleKey.Enter))
             SpawnCurrent();
 
-        // Cycle the selection (wrap around).
+        // Aim-to-select: pick the editable object under the center crosshair.
+        if (Pressed(ConsoleKey.F))
+        {
+            int hit = PickNearest(_myCamera.GetRayForUv(Vector2.Zero), _editables);
+            if (hit >= 0) { _selected = hit; _fieldIndex = 0; }
+        }
+
+        // Cycle the selection (wrap around); reset the field cursor on a new selection.
         if (_editables.Count > 0)
         {
             if (Pressed(ConsoleKey.Oem4)) // '['
-                _selected = (_selected <= 0 ? _editables.Count : _selected) - 1;
+            { _selected = (_selected <= 0 ? _editables.Count : _selected) - 1; _fieldIndex = 0; }
             if (Pressed(ConsoleKey.Oem6)) // ']'
-                _selected = (_selected + 1) % _editables.Count;
+            { _selected = (_selected + 1) % _editables.Count; _fieldIndex = 0; }
         }
 
-        // Move the selected object by a fixed step per press (world axes).
+        // Move the selected object by a fixed step per press (world axes); fast nudge.
         if (_selected >= 0 && _selected < _editables.Count)
         {
             var delta = Vector3.Zero;
@@ -318,11 +372,72 @@ public class PriviewNetworkScene : Scene
                 inst.Position += delta;
                 if (inst is Object3d o) o.UpdateGeometry();
             }
+
+            // Properties panel: navigate fields (,/.) and adjust the active field (N/M).
+            var fields = EditableFields(_editables[_selected].Descriptor.Type);
+            if (Pressed(ConsoleKey.OemComma))  _fieldIndex = (_fieldIndex - 1 + fields.Length) % fields.Length;
+            if (Pressed(ConsoleKey.OemPeriod)) _fieldIndex = (_fieldIndex + 1) % fields.Length;
+            _fieldIndex = Math.Clamp(_fieldIndex, 0, fields.Length - 1);
+
+            int dir = 0;
+            if (Pressed(ConsoleKey.N)) dir = -1;
+            if (Pressed(ConsoleKey.M)) dir = +1;
+            if (dir != 0) AdjustField(fields[_fieldIndex], _editables[_selected].Instance, dir);
+
+            // Delete the selected object.
+            if (Pressed(ConsoleKey.Delete)) DeleteSelected();
         }
 
         // Save the arrangement back into the world JSON.
         if (Pressed(ConsoleKey.F5))
             SaveWorld();
+    }
+
+    // Applies a single decrease/increase (dir = -1/+1) to the active field on the live instance.
+    private void AdjustField(Field f, GameObject inst, int dir)
+    {
+        var o = inst as Object3d;
+        switch (f)
+        {
+            case Field.PosX: inst.Position.X += dir * MoveStep; o?.UpdateGeometry(); break;
+            case Field.PosY: inst.Position.Y += dir * MoveStep; o?.UpdateGeometry(); break;
+            case Field.PosZ: inst.Position.Z += dir * MoveStep; o?.UpdateGeometry(); break;
+            case Field.RotX: inst.LocalRotate.X += dir * RotStep; o?.UpdateGeometry(); break;
+            case Field.RotY: inst.LocalRotate.Y += dir * RotStep; o?.UpdateGeometry(); break;
+            case Field.RotZ: inst.LocalRotate.Z += dir * RotStep; o?.UpdateGeometry(); break;
+            case Field.Scale:
+                if (o != null) { o.Scale = MathF.Max(0.01f, o.Scale + dir * ScaleStep); o.UpdateGeometry(); }
+                break;
+            case Field.RotateSpeed:
+                if (o != null) o.RotateSpeed += dir * SpinStep;
+                break;
+            case Field.Color:
+                inst.Color = CycleColor(inst.Color, dir);
+                break;
+            case Field.Radius:
+                if (inst is Sphere s) s.R = MathF.Max(0.01f, s.R + dir * RadiusStep);
+                break;
+        }
+    }
+
+    private static ConsoleColor CycleColor(ConsoleColor c, int dir)
+    {
+        int n = Enum.GetValues<ConsoleColor>().Length;   // 16
+        return (ConsoleColor)((((int)c + dir) % n + n) % n);
+    }
+
+    private void DeleteSelected()
+    {
+        if (_selected < 0 || _selected >= _editables.Count) return;
+
+        var entry = _editables[_selected];
+        if (entry.Instance is IDisplays disp) RemoveDisplaysObject(disp);
+        if (entry.Instance is Object3d o) _models.Remove(o);
+        _editables.RemoveAt(_selected);
+
+        if (_editables.Count == 0) _selected = -1;
+        else if (_selected >= _editables.Count) _selected = _editables.Count - 1;
+        _fieldIndex = 0;
     }
 
     private void SpawnCurrent()
@@ -347,7 +462,7 @@ public class PriviewNetworkScene : Scene
         };
 
         var entry = BuildWorldObject(descriptor);
-        if (entry != null) _selected = _editables.Count - 1;
+        if (entry != null) { _selected = _editables.Count - 1; _fieldIndex = 0; }
     }
 
     private void SaveWorld()
@@ -394,6 +509,70 @@ public class PriviewNetworkScene : Scene
 
     private static string DescribeEntry(EditEntry e) =>
         e.Descriptor.Type == "mesh" ? $"mesh:{e.Descriptor.Mesh}" : e.Descriptor.Type;
+
+    // Right-side Visual-Studio-style properties panel for the selected object.
+    private void DrawPropertiesPanel()
+    {
+        const int panelW = 30;
+        int px = Math.Max(0, Console.WindowWidth - panelW);
+        int py = 2;
+
+        UI.AddText("== PROPERTIES ==", new Vector2Int(px, py++), ConsoleColor.Green);
+
+        if (_selected < 0 || _selected >= _editables.Count)
+        {
+            UI.AddText("(no selection)", new Vector2Int(px, py), ConsoleColor.DarkGray);
+            return;
+        }
+
+        var entry = _editables[_selected];
+        var inst = entry.Instance;
+        string type = entry.Descriptor.Type ?? "";
+        var fields = EditableFields(type);
+        Field active = fields[Math.Clamp(_fieldIndex, 0, fields.Length - 1)];
+
+        // Read-only header.
+        UI.AddText($"  Type: {type}", new Vector2Int(px, py++), ConsoleColor.DarkGray);
+        if (type == "mesh")
+            UI.AddText($"  Mesh: {entry.Descriptor.Mesh}", new Vector2Int(px, py++), ConsoleColor.DarkGray);
+
+        // Editable fields with the active-field cursor.
+        foreach (var f in fields)
+        {
+            bool on = f == active;
+            string line = $"{(on ? ">" : " ")} {FieldLabel(f)}: {FieldValue(f, inst)}";
+            UI.AddText(line, new Vector2Int(px, py++), on ? ConsoleColor.Cyan : ConsoleColor.Gray);
+        }
+
+        UI.AddText(",/. field   N/M value   Del", new Vector2Int(px, py), ConsoleColor.DarkGray);
+    }
+
+    private static string FieldLabel(Field f) => f switch
+    {
+        Field.PosX => "Pos X", Field.PosY => "Pos Y", Field.PosZ => "Pos Z",
+        Field.RotX => "Rot X", Field.RotY => "Rot Y", Field.RotZ => "Rot Z",
+        Field.Scale => "Scale", Field.RotateSpeed => "Spin", Field.Color => "Color",
+        Field.Radius => "Radius", _ => f.ToString()
+    };
+
+    private static string FieldValue(Field f, GameObject inst)
+    {
+        var o = inst as Object3d;
+        return f switch
+        {
+            Field.PosX => inst.Position.X.ToString("F2"),
+            Field.PosY => inst.Position.Y.ToString("F2"),
+            Field.PosZ => inst.Position.Z.ToString("F2"),
+            Field.RotX => inst.LocalRotate.X.ToString("F2"),
+            Field.RotY => inst.LocalRotate.Y.ToString("F2"),
+            Field.RotZ => inst.LocalRotate.Z.ToString("F2"),
+            Field.Scale => (o?.Scale ?? 1f).ToString("F2"),
+            Field.RotateSpeed => (o?.RotateSpeed ?? 0f).ToString("F2"),
+            Field.Color => inst.Color.ToString(),
+            Field.Radius => (inst as Sphere)?.R.ToString("F2") ?? "-",
+            _ => ""
+        };
+    }
     
     
     private void HandleGameInput(float dt)

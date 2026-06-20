@@ -23,6 +23,7 @@ class Program
         if (args.Length > 0 && args[0] == "bvhtest") { BvhSelfTest(); return; }
         if (args.Length > 0 && args[0] == "worldtest") { WorldSelfTest(); return; }
         if (args.Length > 0 && args[0] == "editortest") { EditorSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "picktest") { PickSelfTest(); return; }
 
         Logger.Init(AppPaths.LogsFolder);
         Logger.Info("Application started");
@@ -527,21 +528,63 @@ class Program
         cube.Scale = descriptor.Scale;
         if (Enum.TryParse<ConsoleColor>(descriptor.Color, true, out var col)) cube.Color = col;
 
-        // Mutate the instance (as the move keys would).
+        // Mutate the instance across every editable property (as the panel would).
         cube.Position += new Vector3(5f, 0f, 0f);
+        cube.LocalRotate = new Vector3(0.25f, 0.5f, -0.75f);
+        cube.Scale = 3.5f;
+        cube.RotateSpeed = 1.25f;
+        cube.Color = ConsoleColor.Green;
 
         WorldObject back = PriviewNetworkScene.FromInstance(descriptor, cube);
 
-        Console.WriteLine($"Back: type={back.Type}, pos=({back.Position.X},{back.Position.Y},{back.Position.Z}), scale={back.Scale}, color={back.Color}");
+        Console.WriteLine($"Back: type={back.Type}, pos=({back.Position.X},{back.Position.Y},{back.Position.Z}), " +
+                          $"rot=({back.Rotation.X},{back.Rotation.Y},{back.Rotation.Z}), scale={back.Scale}, spin={back.RotateSpeed}, color={back.Color}");
 
         bool ok =
             back.Type == "cube" &&
+            back.Mesh == null &&
             Math.Abs(back.Position.X - 6f) < 1e-4f &&
             Math.Abs(back.Position.Y - 2f) < 1e-4f &&
             Math.Abs(back.Position.Z - 3f) < 1e-4f &&
-            Math.Abs(back.Scale - 2f) < 1e-4f &&
-            back.Color == "Magenta";
+            Math.Abs(back.Rotation.X - 0.25f) < 1e-4f &&
+            Math.Abs(back.Rotation.Y - 0.5f) < 1e-4f &&
+            Math.Abs(back.Rotation.Z + 0.75f) < 1e-4f &&
+            Math.Abs(back.Scale - 3.5f) < 1e-4f &&
+            Math.Abs(back.RotateSpeed - 1.25f) < 1e-4f &&
+            back.Color == "Green";
 
         Console.WriteLine(ok ? "EDITOR TEST PASSED" : "EDITOR TEST FAILED");
+    }
+
+    // Non-interactive check of the raycast pick: two spheres along +X, a ray down +X picks
+    // the nearer one; a ray pointing away picks nothing. Reuses PriviewNetworkScene.PickNearest.
+    static void PickSelfTest()
+    {
+        Logger.Init(AppPaths.LogsFolder);
+        Console.WriteLine("=== PICK SELF-TEST ===");
+
+        var near = new PriviewNetworkScene.EditEntry
+        {
+            Descriptor = new WorldObject { Type = "sphere", Radius = 1f },
+            Instance = new Sphere(new Vector3(5f, 0f, 0f), Vector3.Zero, 1f),
+        };
+        var far = new PriviewNetworkScene.EditEntry
+        {
+            Descriptor = new WorldObject { Type = "sphere", Radius = 1f },
+            Instance = new Sphere(new Vector3(10f, 0f, 0f), Vector3.Zero, 1f),
+        };
+        var editables = new List<PriviewNetworkScene.EditEntry> { far, near }; // far first on purpose
+
+        var towards = new Ray(new Vector3(0f, 0f, 0f), new Vector3(1f, 0f, 0f).Norm());
+        var away = new Ray(new Vector3(0f, 0f, 0f), new Vector3(-1f, 0f, 0f).Norm());
+
+        int hit = PriviewNetworkScene.PickNearest(towards, editables);
+        int miss = PriviewNetworkScene.PickNearest(away, editables);
+
+        Console.WriteLine($"Aiming +X -> index {hit} (expect 1, the nearer sphere at X=5)");
+        Console.WriteLine($"Aiming -X -> index {miss} (expect -1, no hit)");
+
+        bool ok = hit == 1 && miss == -1;
+        Console.WriteLine(ok ? "PICK TEST PASSED" : "PICK TEST FAILED");
     }
 }

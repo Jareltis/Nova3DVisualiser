@@ -23,6 +23,8 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
     { _renderCamera = camera; }
     protected void AddDisplaysObject(IDisplays @object)
     { _allDisplays.Add(@object); }
+    protected void RemoveDisplaysObject(IDisplays @object)
+    { _allDisplays.Remove(@object); }
 
     protected void AddLight(Light light)
     { _allLight.Add(light); }
