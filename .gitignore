@@ -12,5 +12,8 @@ obj/
 # Runtime logs (recreated at run time)
 SampleGame/logs/
 
+# Meshes downloaded from a server at run time
+SampleGame/received/
+
 # License-uncertain asset, excluded from the repository
 SampleGame/models/buddha.*

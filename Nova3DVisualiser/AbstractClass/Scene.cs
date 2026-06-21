@@ -28,6 +28,8 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
 
     protected void AddLight(Light light)
     { _allLight.Add(light); }
+    protected void RemoveLight(Light light)
+    { _allLight.Remove(light); }
     
     public abstract void Start();
     public abstract void Update();

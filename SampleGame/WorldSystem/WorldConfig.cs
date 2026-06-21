@@ -41,6 +41,7 @@ public class Vec3Config
 /// <summary>One scene object: a library mesh, or a built-in cube/sphere primitive.</summary>
 public class WorldObject
 {
+    public int Id { get; set; }                       // stable per-object id (server assigns; client adopts verbatim)
     public string Type { get; set; } = "mesh";        // "mesh" | "cube" | "sphere"
     public string? Mesh { get; set; }                 // mesh name in models/ (Type "mesh")
     public Vec3Config Position { get; set; } = new();

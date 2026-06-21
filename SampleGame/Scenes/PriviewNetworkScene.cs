@@ -9,24 +9,33 @@ using Nova3DVisualiser.Shape;
 using Nova3DVisualiser.StaticClass;
 using SampleGame.NetworkPackets;
 using SampleGame.Worlds;
+using System.Text.Json;
 
 namespace SampleGame.Scenes;
 
 public class PriviewNetworkScene : Scene
 {
     private readonly bool _online;
+    private readonly bool _isServer;
     private readonly NetworkManager? _netManager;
     private readonly int _myNetId;
     private readonly Dictionary<int, Object3d> _remotePlayers = new();
-    
+
     readonly Camera _myCamera;
     readonly Light _mainLight;
 
-    private readonly WorldConfig _world;
+    private WorldConfig _world;
     private readonly List<Object3d> _models = new();   // spinnable Object3d objects (meshes + cubes)
+    private string _modelsFolder = AppPaths.ModelsFolder;   // where world meshes load from (server world -> received/ on a client)
+    private Object3d? _floor;                              // the platform, tracked so a client can replace it
 
-    private readonly bool _ownLightEnabled;
-    private readonly Light? _extraLight;
+    private bool _ownLightEnabled;
+    private Light? _extraLight;
+
+    // ---- Client world download (4b) ----
+    private bool _awaitingWorld = false;   // client only: true until the server's world arrives
+    private bool _worldReceived = false;   // client only: a world has been applied
+    private float _requestTimer = 0f;      // client only: countdown to the next WorldRequestPacket
 
     private bool _isChatting = false;
     private string _currentInput = "";
@@ -45,6 +54,12 @@ public class PriviewNetworkScene : Scene
     private bool _editMode = false;
     private readonly List<EditEntry> _editables = new();
     private int _selected = -1;
+    private int _nextObjectId = 0;      // next id to hand a spawned object (server/local authority; 5b broadcasts spawns)
+
+    // Server streams its edits as deltas; clients are view-only over the synced world.
+    // CanEdit gates every world-mutating action; camera/selection/inspection stay open.
+    private bool _editDirty = false;    // set by an edit-action this frame; coalesced into one Modify broadcast
+    private bool CanEdit => !_online || _isServer;
     private readonly List<string> _spawnTypes = new();   // "cube", "sphere", then each library mesh
     private int _spawnIndex = 0;
     private const float MoveStep = 0.5f;
@@ -68,6 +83,7 @@ public class PriviewNetworkScene : Scene
     public PriviewNetworkScene(IDisplaysManagerAsync manager, WorldConfig world, bool isServer, string targetIp, int port, bool online = true) : base(manager)
     {
         _online = online;
+        _isServer = isServer;
         Exposure = 0.05f;
         Ambient = 0.1f;
 
@@ -93,18 +109,28 @@ public class PriviewNetworkScene : Scene
 
         PacketManager.RegisterPacket<TransformPacket>();
         PacketManager.RegisterPacket<ChatPacket>();
+        PacketManager.RegisterPacket<WorldSyncPacket>();
+        PacketManager.RegisterPacket<WorldRequestPacket>();
+        PacketManager.RegisterPacket<WorldEditPacket>();
 
         PacketManager.Subscribe<TransformPacket>(OnTransformReceived);
         PacketManager.Subscribe<ChatPacket>(OnChatReceived);
 
         if (isServer)
         {
+            // The server answers a joining client's world request with its world.
+            PacketManager.Subscribe<WorldRequestPacket>(OnWorldRequested);
             _netManager.StartServer(port);
             Logger.Info($"Server listening on port {port}");
             Console.Title = $"SERVER (Port: {port}) | ID: {_myNetId}";
         }
         else
         {
+            // The client downloads the server's world and rebuilds the scene from it,
+            // then applies the server's live edit deltas in place (view-only).
+            PacketManager.Subscribe<WorldSyncPacket>(OnWorldSyncReceived);
+            PacketManager.Subscribe<WorldEditPacket>(OnWorldEditReceived);
+            _awaitingWorld = true;
             _netManager.Connect(targetIp, port);
             Logger.Info($"Connecting to {targetIp}:{port}");
             Console.Title = $"CLIENT (ID: {_myNetId}) -> {targetIp}:{port}";
@@ -115,13 +141,7 @@ public class PriviewNetworkScene : Scene
 
     public override void Start()
     {
-        if (_world.Platform.Enabled)
-        {
-            Object3d floor = CreatePlane(_world.Platform.Size);
-            floor.Position = new Vector3(0, 0, 0);
-            floor.Color = ParseColor(_world.Platform.Color, ConsoleColor.Yellow);
-            AddDisplaysObject(floor);
-        }
+        BuildPlatform();
 
         if (_ownLightEnabled) AddLight(_mainLight);
         if (_extraLight != null) AddLight(_extraLight);
@@ -133,8 +153,29 @@ public class PriviewNetworkScene : Scene
         _spawnTypes.Add("sphere");
         _spawnTypes.AddRange(WorldManager.ListAvailableMeshes());
 
+        // The world authority (server, and local solo) stamps stable sequential ids onto its
+        // objects, ignoring any file values so ids are guaranteed unique. A client leaves them
+        // alone — it adopts the server's ids verbatim when the world arrives (ApplyReceivedWorld).
+        if (CanEdit)
+        {
+            for (int i = 0; i < _world.Objects.Count; i++)
+                _world.Objects[i].Id = i;
+            _nextObjectId = _world.Objects.Count;
+        }
+
         foreach (var obj in _world.Objects)
             BuildWorldObject(obj);
+    }
+
+    // Builds the platform from the current world (tracked in _floor so it can be replaced).
+    private void BuildPlatform()
+    {
+        if (!_world.Platform.Enabled) return;
+        Object3d floor = CreatePlane(_world.Platform.Size);
+        floor.Position = new Vector3(0, 0, 0);
+        floor.Color = ParseColor(_world.Platform.Color, ConsoleColor.Yellow);
+        AddDisplaysObject(floor);
+        _floor = floor;
     }
 
     // Builds one world object (mesh / cube / sphere), adds it to the display, and records
@@ -154,22 +195,17 @@ public class PriviewNetworkScene : Scene
                     return null;
                 }
 
-                Object3d? mesh = ModelLoader.LoadRawMesh(AppPaths.ModelsFolder, o.Mesh);
+                Object3d? mesh = ModelLoader.LoadRawMesh(_modelsFolder, o.Mesh);
                 if (mesh == null)
                 {
                     Logger.Warning($"World mesh '{o.Mesh}' did not resolve; skipping.");
                     return null;
                 }
 
-                // Same order the old per-model loader used.
-                mesh.Position = ToVec(o.Position);
-                mesh.LocalRotate = ToVec(o.Rotation);
-                mesh.Scale = o.Scale;
-                mesh.Color = ParseColor(o.Color, ConsoleColor.White);
-                mesh.RotateSpeed = o.RotateSpeed;
-                mesh.ApplyAnchor(ParseAnchor(o.Anchor));
+                // ApplyToInstance anchors + transforms the mesh; BuildAcceleration then builds the
+                // BVH from the (anchored, scale-independent) local verts — order is independent.
+                ApplyToInstance(o, mesh);
                 mesh.BuildAcceleration();
-                mesh.UpdateGeometry();
 
                 _models.Add(mesh);
                 AddDisplaysObject(mesh);
@@ -180,12 +216,7 @@ public class PriviewNetworkScene : Scene
             case "cube":
             {
                 Object3d cube = CreateCube();
-                cube.Position = ToVec(o.Position);
-                cube.LocalRotate = ToVec(o.Rotation);
-                cube.Scale = o.Scale;
-                cube.Color = ParseColor(o.Color, ConsoleColor.White);
-                cube.RotateSpeed = o.RotateSpeed;
-                cube.UpdateGeometry();
+                ApplyToInstance(o, cube);   // cube has no anchor (gated on Type inside the helper)
 
                 _models.Add(cube);
                 AddDisplaysObject(cube);
@@ -195,10 +226,8 @@ public class PriviewNetworkScene : Scene
 
             case "sphere":
             {
-                var sphere = new Sphere(ToVec(o.Position), ToVec(o.Rotation), o.Radius)
-                {
-                    Color = ParseColor(o.Color, ConsoleColor.White)
-                };
+                var sphere = new Sphere(ToVec(o.Position), ToVec(o.Rotation), o.Radius);
+                ApplyToInstance(o, sphere);
                 AddDisplaysObject(sphere);
                 instance = sphere;
                 break;
@@ -235,6 +264,32 @@ public class PriviewNetworkScene : Scene
         return best;
     }
 
+    /// <summary>
+    /// Applies a WorldObject's transform/properties to an EXISTING live instance and refreshes
+    /// its geometry — never reloads the mesh. Shared by BuildWorldObject (post-creation) and the
+    /// client's Modify handler, so creation and a server delta stay identical. ApplyAnchor is only
+    /// for meshes (a cube has none) and is idempotent when re-applied with the same anchor.
+    /// </summary>
+    private static void ApplyToInstance(WorldObject o, GameObject instance)
+    {
+        instance.Position = ToVec(o.Position);
+        instance.LocalRotate = ToVec(o.Rotation);
+        instance.Color = ParseColor(o.Color, ConsoleColor.White);
+
+        if (instance is Object3d mesh)
+        {
+            mesh.Scale = o.Scale;
+            mesh.RotateSpeed = o.RotateSpeed;
+            if (string.Equals(o.Type?.Trim(), "mesh", StringComparison.OrdinalIgnoreCase))
+                mesh.ApplyAnchor(ParseAnchor(o.Anchor));
+            mesh.UpdateGeometry();
+        }
+        else if (instance is Sphere s)
+        {
+            s.R = o.Radius;
+        }
+    }
+
     private static Vec3Config FromVec(Vector3 v) => new Vec3Config { X = v.X, Y = v.Y, Z = v.Z };
 
     /// <summary>
@@ -247,10 +302,11 @@ public class PriviewNetworkScene : Scene
         var o3d = instance as Object3d;
         return new WorldObject
         {
+            Id = descriptor.Id,                                   // carry the stable id through live read-back
             Type = descriptor.Type,
             Mesh = descriptor.Mesh,
             Anchor = descriptor.Anchor,
-            Radius = descriptor.Radius,
+            Radius = (instance as Sphere)?.R ?? descriptor.Radius, // read the live radius for spheres
             Position = FromVec(instance.Position),
             Rotation = FromVec(instance.LocalRotate),
             Scale = o3d?.Scale ?? descriptor.Scale,
@@ -274,7 +330,18 @@ public class PriviewNetworkScene : Scene
     public override void Update()
     {
         UI.Clear();
-        _netManager?.ProcessEvents();
+        _netManager?.ProcessEvents();   // world-sync handler (if any) runs here, on this thread
+
+        // Client: keep asking the server for its world (~once/second) until it arrives.
+        if (_online && !_isServer && !_worldReceived)
+        {
+            _requestTimer -= GameTime.GetDeltaTime();
+            if (_requestTimer <= 0f)
+            {
+                _netManager?.SendPacket(new WorldRequestPacket(), _myNetId);
+                _requestTimer = 1f;
+            }
+        }
 
         foreach (var m in _models)
             if (m.RotateSpeed != 0f)
@@ -304,6 +371,18 @@ public class PriviewNetworkScene : Scene
             }
         }
 
+        // Server is the world authority: if an edit-action changed the selected object this
+        // frame, stream ONE coalesced Modify delta for it (at most one per object per frame).
+        if (_online && _isServer && _editDirty && _selected >= 0 && _selected < _editables.Count)
+        {
+            var entry = _editables[_selected];
+            var o = FromInstance(entry.Descriptor, entry.Instance);   // carries the stable id
+            _netManager?.SendPacket(
+                new WorldEditPacket { Op = 0, Id = o.Id, ObjectJson = JsonSerializer.Serialize(o) },
+                _myNetId);
+        }
+        _editDirty = false;
+
         if (!_isChatting && _netManager != null)
         {
             var packet = new TransformPacket(_myCamera.Position, _myCamera.LocalRotate);
@@ -312,6 +391,8 @@ public class PriviewNetworkScene : Scene
         if (_ownLightEnabled) _mainLight.Position = _myCamera.Position;
         if (_saveFlash > 0) _saveFlash--;
         DrawChatInterface();
+        if (_awaitingWorld)
+            UI.AddText("Waiting for world from server...", new Vector2Int(2, 10), ConsoleColor.Yellow);
         DrawEditorOverlay();
         if (_editMode)
         {
@@ -336,7 +417,8 @@ public class PriviewNetworkScene : Scene
             _spawnIndex = (_spawnIndex + 1) % _spawnTypes.Count;
 
         // Spawn the current type a couple of units in front of the camera, at ground level.
-        if (Pressed(ConsoleKey.Enter))
+        // (A view-only client cannot mutate the synced world.)
+        if (CanEdit && Pressed(ConsoleKey.Enter))
             SpawnCurrent();
 
         // Aim-to-select: pick the editable object under the center crosshair.
@@ -355,41 +437,47 @@ public class PriviewNetworkScene : Scene
             { _selected = (_selected + 1) % _editables.Count; _fieldIndex = 0; }
         }
 
-        // Move the selected object by a fixed step per press (world axes); fast nudge.
         if (_selected >= 0 && _selected < _editables.Count)
         {
-            var delta = Vector3.Zero;
-            if (Pressed(ConsoleKey.L)) delta.X += MoveStep;
-            if (Pressed(ConsoleKey.J)) delta.X -= MoveStep;
-            if (Pressed(ConsoleKey.I)) delta.Z += MoveStep;
-            if (Pressed(ConsoleKey.K)) delta.Z -= MoveStep;
-            if (Pressed(ConsoleKey.U)) delta.Y += MoveStep;
-            if (Pressed(ConsoleKey.O)) delta.Y -= MoveStep;
-
-            if (delta.X != 0f || delta.Y != 0f || delta.Z != 0f)
-            {
-                var inst = _editables[_selected].Instance;
-                inst.Position += delta;
-                if (inst is Object3d o) o.UpdateGeometry();
-            }
-
-            // Properties panel: navigate fields (,/.) and adjust the active field (N/M).
+            // Properties panel: navigate fields (,/.) stays open so a client can inspect.
             var fields = EditableFields(_editables[_selected].Descriptor.Type);
             if (Pressed(ConsoleKey.OemComma))  _fieldIndex = (_fieldIndex - 1 + fields.Length) % fields.Length;
             if (Pressed(ConsoleKey.OemPeriod)) _fieldIndex = (_fieldIndex + 1) % fields.Length;
             _fieldIndex = Math.Clamp(_fieldIndex, 0, fields.Length - 1);
 
-            int dir = 0;
-            if (Pressed(ConsoleKey.N)) dir = -1;
-            if (Pressed(ConsoleKey.M)) dir = +1;
-            if (dir != 0) AdjustField(fields[_fieldIndex], _editables[_selected].Instance, dir);
+            // World-mutating actions are authority-only; a client never edits the synced world.
+            if (CanEdit)
+            {
+                // Move the selected object by a fixed step per press (world axes); fast nudge.
+                var delta = Vector3.Zero;
+                if (Pressed(ConsoleKey.L)) delta.X += MoveStep;
+                if (Pressed(ConsoleKey.J)) delta.X -= MoveStep;
+                if (Pressed(ConsoleKey.I)) delta.Z += MoveStep;
+                if (Pressed(ConsoleKey.K)) delta.Z -= MoveStep;
+                if (Pressed(ConsoleKey.U)) delta.Y += MoveStep;
+                if (Pressed(ConsoleKey.O)) delta.Y -= MoveStep;
 
-            // Delete the selected object.
-            if (Pressed(ConsoleKey.Delete)) DeleteSelected();
+                if (delta.X != 0f || delta.Y != 0f || delta.Z != 0f)
+                {
+                    var inst = _editables[_selected].Instance;
+                    inst.Position += delta;
+                    if (inst is Object3d o) o.UpdateGeometry();
+                    _editDirty = true;
+                }
+
+                // Adjust the active field (N/M) — covers pos/rot/scale/spin/color/radius.
+                int dir = 0;
+                if (Pressed(ConsoleKey.N)) dir = -1;
+                if (Pressed(ConsoleKey.M)) dir = +1;
+                if (dir != 0) { AdjustField(fields[_fieldIndex], _editables[_selected].Instance, dir); _editDirty = true; }
+
+                // Delete the selected object.
+                if (Pressed(ConsoleKey.Delete)) DeleteSelected();
+            }
         }
 
-        // Save the arrangement back into the world JSON.
-        if (Pressed(ConsoleKey.F5))
+        // Save the arrangement back into the world JSON (authority only).
+        if (CanEdit && Pressed(ConsoleKey.F5))
             SaveWorld();
     }
 
@@ -430,13 +518,32 @@ public class PriviewNetworkScene : Scene
     {
         if (_selected < 0 || _selected >= _editables.Count) return;
 
-        var entry = _editables[_selected];
+        int id = _editables[_selected].Descriptor.Id;   // capture before removal (for the broadcast)
+        RemoveEntryAt(_selected);
+
+        // Server is the world authority: tell viewing clients to drop this object by id.
+        if (_online && _isServer)
+            _netManager?.SendPacket(new WorldEditPacket { Op = 2, Id = id }, _myNetId);
+    }
+
+    // Removes one editable entry from the display + tracking lists and keeps _selected/_fieldIndex
+    // consistent. Shared by DeleteSelected (server/local) and the client's Delete-delta handler,
+    // so both paths stay identical.
+    private void RemoveEntryAt(int index)
+    {
+        if (index < 0 || index >= _editables.Count) return;
+
+        var entry = _editables[index];
         if (entry.Instance is IDisplays disp) RemoveDisplaysObject(disp);
         if (entry.Instance is Object3d o) _models.Remove(o);
-        _editables.RemoveAt(_selected);
+        _editables.RemoveAt(index);
 
         if (_editables.Count == 0) _selected = -1;
-        else if (_selected >= _editables.Count) _selected = _editables.Count - 1;
+        else
+        {
+            if (index < _selected) _selected--;   // an earlier slot vanished — keep tracking the same object
+            _selected = Math.Clamp(_selected, 0, _editables.Count - 1);
+        }
         _fieldIndex = 0;
     }
 
@@ -452,6 +559,7 @@ public class PriviewNetworkScene : Scene
         string label = _spawnTypes[_spawnIndex];
         var descriptor = new WorldObject
         {
+            Id = _nextObjectId++,   // unique stable id (only the authority spawns; 5b broadcasts it)
             Type = label is "cube" or "sphere" ? label : "mesh",
             Mesh = label is "cube" or "sphere" ? null : label,
             Position = FromVec(spawnPos),
@@ -462,17 +570,56 @@ public class PriviewNetworkScene : Scene
         };
 
         var entry = BuildWorldObject(descriptor);
-        if (entry != null) { _selected = _editables.Count - 1; _fieldIndex = 0; }
+        if (entry == null) return;
+        _selected = _editables.Count - 1; _fieldIndex = 0;
+
+        // Server is the world authority: stream the new object to viewing clients. For a mesh,
+        // also stream its .obj so a client that never had it can render it (idempotent overwrite).
+        if (_online && _isServer)
+        {
+            var packet = new WorldEditPacket
+            {
+                Op = 1,
+                Id = descriptor.Id,
+                ObjectJson = JsonSerializer.Serialize(descriptor),
+            };
+            if (string.Equals(descriptor.Type, "mesh", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(descriptor.Mesh))
+            {
+                string path = Path.Combine(AppPaths.ModelsFolder, descriptor.Mesh + ".obj");
+                try
+                {
+                    packet.MeshName = descriptor.Mesh;
+                    packet.MeshObjText = File.ReadAllText(path);
+                }
+                catch (Exception ex) { Logger.Error($"Spawn: failed reading mesh '{descriptor.Mesh}' at {path}", ex); }
+            }
+            _netManager?.SendPacket(packet, _myNetId);
+        }
     }
 
     private void SaveWorld()
     {
-        _world.Objects = _editables.Select(e => FromInstance(e.Descriptor, e.Instance)).ToList();
+        _world = BuildLiveWorldConfig();
         WorldManager.Save(_world);
         _saveMsg = $"Saved to {_world.Name} ({_world.Objects.Count} objects)";
         _saveFlash = 120;
         Logger.Info(_saveMsg);
     }
+
+    /// <summary>
+    /// Builds a WorldConfig from the CURRENT live instances (the same FromInstance read-back
+    /// SaveWorld does), preserving each object's id plus the platform and graphics — WITHOUT
+    /// writing to disk. Used by SaveWorld and by OnWorldRequested, so a client connecting
+    /// mid-edit gets the live state (with live ids), not the stale last-saved _world.
+    /// </summary>
+    private WorldConfig BuildLiveWorldConfig() => new WorldConfig
+    {
+        Name = _world.Name,
+        Graphics = _world.Graphics,
+        Platform = _world.Platform,
+        Objects = _editables.Select(e => FromInstance(e.Descriptor, e.Instance)).ToList(),
+    };
 
     // Edge-triggered key press (true only on the frame the key transitions to down).
     private bool Pressed(ConsoleKey key)
@@ -695,6 +842,130 @@ public class PriviewNetworkScene : Scene
         }
     }
     
+    // ---- World download (4b): server answers a request; client applies the received world ----
+
+    // Server side: a client asked for the world — pack ours (from the real models/) and send it.
+    private void OnWorldRequested(WorldRequestPacket packet, int senderId)
+    {
+        // Send the LIVE world (current instances + live ids), not the stale last-saved _world,
+        // so a client joining mid-edit sees exactly what the server has now.
+        var live = BuildLiveWorldConfig();
+        var sync = WorldSync.Pack(live, AppPaths.ModelsFolder);
+        _netManager?.SendPacket(sync, _myNetId);
+        Logger.Info($"Sent world '{live.Name}' to client {senderId} ({sync.MeshTexts.Count} mesh file(s)).");
+    }
+
+    // Client side: the world arrived. Runs on the main thread (via ProcessEvents in Update),
+    // so it is safe to rebuild the scene here — Update fully precedes the render each frame.
+    private void OnWorldSyncReceived(WorldSyncPacket packet, int senderId)
+    {
+        var (world, meshTexts) = WorldSync.Unpack(packet);
+        ApplyReceivedWorld(world, meshTexts);
+    }
+
+    // Client side: a server edit delta arrived. Runs on the main thread (via ProcessEvents in
+    // Update), so applying directly to the live scene is safe. Handles Modify/Spawn/Delete.
+    private void OnWorldEditReceived(WorldEditPacket packet, int senderId)
+    {
+        if (packet.Op == 2)   // Delete: drop the object with this id
+        {
+            int del = _editables.FindIndex(e => e.Descriptor.Id == packet.Id);
+            if (del < 0) { Logger.Warning($"WorldEdit Delete for unknown id {packet.Id}; ignoring."); return; }
+            RemoveEntryAt(del);
+            return;
+        }
+
+        // Modify (0) and Spawn (1) both carry a WorldObject in ObjectJson.
+        WorldObject? o;
+        try { o = JsonSerializer.Deserialize<WorldObject>(packet.ObjectJson); }
+        catch (Exception ex) { Logger.Error("WorldEdit: bad ObjectJson", ex); return; }
+        if (o == null) return;
+
+        if (packet.Op == 1)   // Spawn: materialize a streamed mesh (if any), then build + append
+        {
+            if (!string.IsNullOrWhiteSpace(packet.MeshObjText) && !string.IsNullOrWhiteSpace(packet.MeshName))
+                MaterializeMesh(packet.MeshName, packet.MeshObjText);
+
+            // Idempotent: if this id already exists, drop the stale instance first (no duplicate).
+            int existing = _editables.FindIndex(e => e.Descriptor.Id == o.Id);
+            if (existing >= 0) RemoveEntryAt(existing);
+
+            BuildWorldObject(o);   // loads the mesh from _modelsFolder == received/; keeps the server's id
+            return;                // do NOT touch _selected — the client's selection is its own
+        }
+
+        // Modify (0): update the existing instance in place + keep the stored descriptor in sync.
+        int idx = _editables.FindIndex(e => e.Descriptor.Id == packet.Id);
+        if (idx < 0)
+        {
+            Logger.Warning($"WorldEdit Modify for unknown id {packet.Id}; ignoring.");
+            return;
+        }
+        ApplyToInstance(o, _editables[idx].Instance);
+        _editables[idx].Descriptor = o;
+    }
+
+    // Writes one received mesh to received/<name>.obj (idempotent overwrite). Shared by the 4b
+    // bulk world download and the 5b Spawn handler that streams a brand-new mesh in real time.
+    private static void MaterializeMesh(string name, string objText)
+    {
+        try
+        {
+            Directory.CreateDirectory(AppPaths.ReceivedFolder);
+            File.WriteAllText(Path.Combine(AppPaths.ReceivedFolder, name + ".obj"), objText);
+        }
+        catch (Exception ex) { Logger.Error($"Failed writing received mesh '{name}'", ex); }
+    }
+
+    private void ApplyReceivedWorld(WorldConfig world, IReadOnlyDictionary<string, string> meshTexts)
+    {
+        // 1) Materialize the received meshes into a dedicated folder (never the user's models/).
+        foreach (var kv in meshTexts)
+            MaterializeMesh(kv.Key, kv.Value);
+        _modelsFolder = AppPaths.ReceivedFolder;
+
+        // 2) Tear down the current world's objects + platform (camera stays; lights reconciled below).
+        foreach (var e in _editables)
+            if (e.Instance is IDisplays disp) RemoveDisplaysObject(disp);
+        _editables.Clear();
+        _models.Clear();
+        _selected = -1;
+        if (_floor != null) { RemoveDisplaysObject(_floor); _floor = null; }
+
+        // 3) Build the received world (BuildWorldObject loads meshes from _modelsFolder == received/).
+        _world = world;
+        // Adopt the server's ids verbatim (do NOT reassign); future local spawns (5b) start past them.
+        _nextObjectId = _world.Objects.Count == 0 ? 0 : _world.Objects.Max(o => o.Id) + 1;
+        BuildPlatform();
+        foreach (var o in _world.Objects)
+            BuildWorldObject(o);
+
+        // 4) Apply its graphics and reconcile the lights against the placeholder's.
+        EnableShadows = _world.Graphics.Shadows;
+        Object3d.UseBvh = _world.Graphics.Bvh;
+
+        bool wantOwn = !_world.Graphics.DisableCameraLight;
+        if (wantOwn && !_ownLightEnabled) AddLight(_mainLight);
+        if (!wantOwn && _ownLightEnabled) RemoveLight(_mainLight);
+        _ownLightEnabled = wantOwn;
+
+        if (_world.Graphics.ExtraLight && _extraLight == null)
+        {
+            _extraLight = new Light(new Vector3(2, 6, 0), 600f);
+            AddLight(_extraLight);
+        }
+        else if (!_world.Graphics.ExtraLight && _extraLight != null)
+        {
+            RemoveLight(_extraLight);
+            _extraLight = null;
+        }
+
+        // 5) Done — drop the waiting overlay (replace on a repeat send).
+        _awaitingWorld = false;
+        _worldReceived = true;
+        Logger.Info($"Applied received world '{_world.Name}': {_world.Objects.Count} objects, {meshTexts.Count} mesh file(s).");
+    }
+
     public static Object3d CreateCube()
     {
         return new Object3d(

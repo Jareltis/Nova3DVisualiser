@@ -6,6 +6,7 @@ using Nova3DVisualiser.Logging;
 using Nova3DVisualiser.Network;
 using Nova3DVisualiser.Shape;
 using Nova3DVisualiser.StaticClass;
+using SampleGame.NetworkPackets;
 using SampleGame.Scenes;
 using SampleGame.Worlds;
 using Terminal.Gui;
@@ -24,6 +25,7 @@ class Program
         if (args.Length > 0 && args[0] == "worldtest") { WorldSelfTest(); return; }
         if (args.Length > 0 && args[0] == "editortest") { EditorSelfTest(); return; }
         if (args.Length > 0 && args[0] == "picktest") { PickSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "worldsynctest") { WorldSyncSelfTest(); return; }
 
         Logger.Init(AppPaths.LogsFolder);
         Logger.Info("Application started");
@@ -68,7 +70,10 @@ class Program
                         break;
 
                     case Step.Role:
-                        step = ShowRoleDialog(ref isServer) == DlgResult.Back ? Step.Mode : Step.World;
+                        // Server picks a world; the Client gets its world from the server, so it
+                        // skips the World menu and goes straight to the network dialog.
+                        if (ShowRoleDialog(ref isServer) == DlgResult.Back) step = Step.Mode;
+                        else step = isServer ? Step.World : Step.Network;
                         break;
 
                     case Step.World:
@@ -88,7 +93,9 @@ class Program
                         break;
 
                     case Step.Network:
-                        if (ShowNetworkDialog(isServer, ref ip, ref port) == DlgResult.Back) step = Step.World;
+                        // Client's Network-dialog Back returns to Role; Server's returns to the World menu.
+                        if (ShowNetworkDialog(isServer, ref ip, ref port) == DlgResult.Back)
+                            step = isServer ? Step.World : Step.Role;
                         else done = true; // Start
                         break;
                 }
@@ -102,6 +109,19 @@ class Program
         // Reset the console to a clean state so the raw renderer starts cleanly.
         Console.ResetColor();
         Console.Clear();
+
+        // The Client never chose a world — give it a platform-only placeholder to start with;
+        // the real world arrives from the server over the network.
+        if (!quit && online && !isServer && chosenWorld == null)
+        {
+            chosenWorld = new WorldConfig
+            {
+                Name = "(remote)",
+                Graphics = new GraphicsConfig(),
+                Platform = new PlatformConfig { Enabled = true, Size = 10f, Color = "Yellow" },
+                Objects = new List<WorldObject>(),
+            };
+        }
 
         if (quit || chosenWorld == null)
         {
@@ -586,5 +606,100 @@ class Program
 
         bool ok = hit == 1 && miss == -1;
         Console.WriteLine(ok ? "PICK TEST PASSED" : "PICK TEST FAILED");
+    }
+
+    // Non-interactive round-trip of the world-transfer format: build a world (mesh + cube +
+    // sphere), Pack it, push the packet through its own serialize -> deserialize (bytes),
+    // Unpack, then assert the config and the monkey .obj text are recovered faithfully.
+    static void WorldSyncSelfTest()
+    {
+        Logger.Init(AppPaths.LogsFolder);
+        Console.WriteLine("=== WORLD SYNC SELF-TEST ===");
+
+        void Fail(string reason) => Console.WriteLine($"WORLD SYNC TEST FAILED: {reason}");
+
+        var world = new WorldConfig
+        {
+            Name = "synctest",
+            Graphics = new GraphicsConfig { Shadows = true, Bvh = false, ExtraLight = true, DisableCameraLight = true },
+            Platform = new PlatformConfig { Enabled = true, Size = 12f, Color = "Cyan" },
+            Objects = new List<WorldObject>
+            {
+                new WorldObject { Id = 10, Type = "mesh", Mesh = "monkey",
+                    Position = new Vec3Config { X = 1f, Y = 2f, Z = 3f },
+                    Rotation = new Vec3Config { X = 0.1f, Y = 0.2f, Z = 0.3f },
+                    Scale = 1.5f, Color = "Red", Anchor = "Center", RotateSpeed = 0.5f, Radius = 1f },
+                new WorldObject { Id = 11, Type = "cube",
+                    Position = new Vec3Config { X = -1f, Y = 0f, Z = 2f },
+                    Scale = 2f, Color = "Green" },
+                new WorldObject { Id = 12, Type = "sphere",
+                    Position = new Vec3Config { X = 4f, Y = 1f, Z = -2f },
+                    Radius = 2.5f, Color = "Blue" },
+            }
+        };
+
+        // Pack, then round-trip the packet through its own byte (de)serialization.
+        WorldSyncPacket packet = WorldSync.Pack(world, AppPaths.ModelsFolder);
+
+        byte[] bytes;
+        using (var ms = new MemoryStream())
+        {
+            using (var w = new BinaryWriter(ms)) packet.Serialize(w);
+            bytes = ms.ToArray();
+        }
+        Console.WriteLine($"Packet size: {bytes.Length} bytes ({world.Objects.Count} objects, {packet.MeshTexts.Count} mesh file(s)).");
+
+        var received = new WorldSyncPacket();
+        using (var r = new BinaryReader(new MemoryStream(bytes))) received.Deserialize(r);
+
+        var (back, meshTexts) = WorldSync.Unpack(received);
+
+        // Compare the recovered config field-by-field.
+        string? reason = CompareWorlds(world, back);
+        if (reason != null) { Fail(reason); return; }
+
+        // Mesh text must round-trip and match the on-disk file exactly.
+        string monkeyPath = Path.Combine(AppPaths.ModelsFolder, "monkey.obj");
+        if (!meshTexts.TryGetValue("monkey", out var recoveredObj) || string.IsNullOrEmpty(recoveredObj))
+        { Fail("recovered mesh text for 'monkey' is missing/empty."); return; }
+        if (recoveredObj != File.ReadAllText(monkeyPath))
+        { Fail("recovered 'monkey' .obj text does not match the on-disk file."); return; }
+
+        Console.WriteLine($"Recovered: name={back.Name}, objects={back.Objects.Count}, monkey .obj chars={recoveredObj.Length}");
+        Console.WriteLine("WORLD SYNC TEST PASSED");
+    }
+
+    // Returns null if the two worlds match (within float epsilon), else a reason string.
+    static string? CompareWorlds(WorldConfig a, WorldConfig b)
+    {
+        const float eps = 1e-4f;
+        bool Eq(float x, float y) => Math.Abs(x - y) < eps;
+
+        if (a.Name != b.Name) return $"name '{a.Name}' != '{b.Name}'";
+        if (a.Graphics.Shadows != b.Graphics.Shadows || a.Graphics.Bvh != b.Graphics.Bvh ||
+            a.Graphics.ExtraLight != b.Graphics.ExtraLight || a.Graphics.DisableCameraLight != b.Graphics.DisableCameraLight)
+            return "graphics flags differ";
+        if (a.Platform.Enabled != b.Platform.Enabled || !Eq(a.Platform.Size, b.Platform.Size) || a.Platform.Color != b.Platform.Color)
+            return "platform differs";
+        if (a.Objects.Count != b.Objects.Count) return $"object count {a.Objects.Count} != {b.Objects.Count}";
+
+        for (int i = 0; i < a.Objects.Count; i++)
+        {
+            var x = a.Objects[i];
+            var y = b.Objects[i];
+            if (x.Id != y.Id) return $"object[{i}].Id {x.Id} != {y.Id}";
+            if (x.Type != y.Type) return $"object[{i}].Type '{x.Type}' != '{y.Type}'";
+            if (x.Mesh != y.Mesh) return $"object[{i}].Mesh '{x.Mesh}' != '{y.Mesh}'";
+            if (!Eq(x.Position.X, y.Position.X) || !Eq(x.Position.Y, y.Position.Y) || !Eq(x.Position.Z, y.Position.Z))
+                return $"object[{i}].Position differs";
+            if (!Eq(x.Rotation.X, y.Rotation.X) || !Eq(x.Rotation.Y, y.Rotation.Y) || !Eq(x.Rotation.Z, y.Rotation.Z))
+                return $"object[{i}].Rotation differs";
+            if (!Eq(x.Scale, y.Scale)) return $"object[{i}].Scale differs";
+            if (x.Color != y.Color) return $"object[{i}].Color '{x.Color}' != '{y.Color}'";
+            if (x.Anchor != y.Anchor) return $"object[{i}].Anchor '{x.Anchor}' != '{y.Anchor}'";
+            if (!Eq(x.RotateSpeed, y.RotateSpeed)) return $"object[{i}].RotateSpeed differs";
+            if (!Eq(x.Radius, y.Radius)) return $"object[{i}].Radius differs";
+        }
+        return null;
     }
 }
