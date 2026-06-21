@@ -26,7 +26,12 @@ public class GraphicsConfig
 public class PlatformConfig
 {
     public bool Enabled { get; set; } = true;
-    public float Size { get; set; } = 10f;
+    // "square" (default) | "rectangle" | "circle". A world with no Shape (every existing
+    // world + the default) is treated as "square" using Size — unchanged geometry.
+    public string Shape { get; set; } = "square";
+    public float Size { get; set; } = 10f;     // square: half-extent (side = 2*Size); circle: diameter (radius = Size/2)
+    public float Width { get; set; } = 20f;    // rectangle only: full X extent
+    public float Depth { get; set; } = 20f;    // rectangle only: full Z extent
     public string Color { get; set; } = "Yellow";
 }
 

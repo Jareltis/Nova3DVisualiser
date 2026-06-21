@@ -72,16 +72,31 @@ public class ConsoleScreenAsync : Screen
     
     public override void RenderFrame(Scene scene)
     {
-        Parallel.For(0, Height, j =>
+        // Detail level as a cell stride: 1 = a ray per cell (full res, identical to before);
+        // 2-4 cast a ray only on every stride-th cell and block-fill the rest.
+        int stride = Math.Clamp(scene.RenderScale, 1, 4);
+        int anchorRows = (Height + stride - 1) / stride;
+
+        // Parallelize over anchor ROWS only; each anchor casts one ray and fills its own
+        // stride×stride block, so every parallel iteration writes a disjoint region (no race).
+        Parallel.For(0, anchorRows, jr =>
         {
-            for (int i = 0; i < Width; i++)
+            int j = jr * stride;
+            int jMax = Math.Min(j + stride, Height);   // clamp the bottom edge (ragged blocks)
+
+            for (int i = 0; i < Width; i += stride)
             {
                 Vector2 uv = CalculateUV(i, j);
                 var pixelData = scene.GetPixelData(uv);
 
-                int index = j * Width + i;
-                BrightnessBuffer[index] = pixelData.Brightness;
-                ColorBuffer[index] = pixelData.Color;
+                int iMax = Math.Min(i + stride, Width); // clamp the right edge
+                for (int by = j; by < jMax; by++)
+                    for (int bx = i; bx < iMax; bx++)
+                    {
+                        int index = by * Width + bx;
+                        BrightnessBuffer[index] = pixelData.Brightness;
+                        ColorBuffer[index] = pixelData.Color;
+                    }
             }
         });
 

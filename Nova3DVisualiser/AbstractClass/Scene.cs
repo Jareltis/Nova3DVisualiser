@@ -19,6 +19,11 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
 
     public bool EnableShadows = true;
 
+    // Render detail level: 1 = full resolution (one ray per cell, default); 2-4 cast a ray every
+    // Nth cell and block-fill the gaps (~N^2 fewer rays), trading resolution for speed. The screen
+    // reads this each frame; the scene sets it from input. World-agnostic (just an int).
+    public int RenderScale = 1;
+
     protected void SetMainCamera(Camera camera)
     { _renderCamera = camera; }
     protected void AddDisplaysObject(IDisplays @object)

@@ -297,6 +297,15 @@ class Program
         var cbExtra = new CheckBox("Extra fixed light", false) { X = 1, Y = 5 };
         var cbDisableOwn = new CheckBox("Disable camera light", false) { X = 1, Y = 6 };
         var cbPlatform = new CheckBox("Include platform", true) { X = 1, Y = 8 };
+        var rgShape = new RadioGroup(new ustring[] { "Square", "Rectangle", "Circle" }, 0)
+        {
+            X = 1, Y = 10,
+            DisplayMode = DisplayModeLayout.Horizontal,
+            HorizontalSpace = 2,
+        };
+        var sizeField = new TextField("10") { X = 22, Y = 11, Width = 8 };
+        var widthField = new TextField("20") { X = 22, Y = 12, Width = 8 };
+        var depthField = new TextField("20") { X = 33, Y = 12, Width = 8 };
 
         var create = new Button("Create", is_default: true);
         var back = new Button("Back");
@@ -320,7 +329,15 @@ class Program
                     ExtraLight = cbExtra.Checked,
                     DisableCameraLight = cbDisableOwn.Checked,
                 },
-                Platform = new PlatformConfig { Enabled = cbPlatform.Checked, Size = 10f, Color = "Yellow" },
+                Platform = new PlatformConfig
+                {
+                    Enabled = cbPlatform.Checked,
+                    Shape = rgShape.SelectedItem switch { 1 => "rectangle", 2 => "circle", _ => "square" },
+                    Size = ParseFloatOr(sizeField.Text, 10f),
+                    Width = ParseFloatOr(widthField.Text, 20f),
+                    Depth = ParseFloatOr(depthField.Text, 20f),
+                    Color = "Yellow",
+                },
                 Objects = new List<WorldObject>(),
             };
             WorldManager.Save(w);
@@ -329,12 +346,15 @@ class Program
             Application.RequestStop();
         };
 
-        var dialog = new Dialog("Create world", 56, 13, create, back);
+        var dialog = new Dialog("Create world", 56, 17, create, back);
         dialog.Add(
             new Label("World name:") { X = 1, Y = 0 }, nameField,
             new Label("Graphics (Space toggles):") { X = 1, Y = 2 },
             cbShadows, cbBvh, cbExtra, cbDisableOwn,
-            cbPlatform);
+            cbPlatform,
+            new Label("Platform shape:") { X = 1, Y = 9 }, rgShape,
+            new Label("Size (square/circle):") { X = 1, Y = 11 }, sizeField,
+            new Label("Rect W x D:") { X = 1, Y = 12 }, widthField, depthField);
         Application.Run(dialog);
 
         world = built;
@@ -388,6 +408,17 @@ class Program
             if (char.IsLetterOrDigit(c) || c == '-' || c == '_') sb.Append(c);
         }
         return sb.ToString();
+    }
+
+    // Parses a dialog text field as a positive float (invariant), falling back to a default for
+    // blank/invalid/non-positive input so the platform always gets a sane size.
+    static float ParseFloatOr(ustring? text, float fallback)
+    {
+        if (float.TryParse((text?.ToString() ?? "").Trim(),
+                System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture,
+                out float v) && v > 0f)
+            return v;
+        return fallback;
     }
 
     static void BvhSelfTest()
@@ -523,6 +554,35 @@ class Program
         var sphere = new Sphere(new Vector3(0, 0, 0), Vector3.Zero, 1f);
         Console.WriteLine($"Sphere build OK: r={sphere.R}");
 
+        // Backward-compat: the on-disk default world has no Shape, so it loads as "square".
+        if (world.Platform.Shape != "square")
+        { Console.WriteLine($"WORLD TEST FAILED: default platform shape '{world.Platform.Shape}' != 'square'."); return; }
+
+        // Round-trip the new platform fields (Shape + Width/Depth) through the world JSON
+        // (in-memory, same options WorldManager uses for save/load — no test artifact on disk).
+        var shaped = new WorldConfig
+        {
+            Name = "platshapetest",
+            Platform = new PlatformConfig { Enabled = true, Shape = "rectangle", Size = 9f, Width = 14f, Depth = 6f, Color = "Cyan" },
+        };
+        string shapedJson = System.Text.Json.JsonSerializer.Serialize(shaped, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+        var reloaded = System.Text.Json.JsonSerializer.Deserialize<WorldConfig>(shapedJson,
+            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        if (reloaded == null) { Console.WriteLine("WORLD TEST FAILED: could not deserialize round-tripped world."); return; }
+        var rp = reloaded.Platform;
+        if (rp.Shape != "rectangle" || Math.Abs(rp.Size - 9f) > 1e-4f ||
+            Math.Abs(rp.Width - 14f) > 1e-4f || Math.Abs(rp.Depth - 6f) > 1e-4f)
+        { Console.WriteLine($"WORLD TEST FAILED: platform fields did not round-trip (shape={rp.Shape}, size={rp.Size}, w={rp.Width}, d={rp.Depth})."); return; }
+        Console.WriteLine($"Platform round-trip OK: shape={rp.Shape}, size={rp.Size}, w={rp.Width}, d={rp.Depth}");
+
+        // Build a rectangle and a circle platform: each must produce real geometry.
+        var rect = PriviewNetworkScene.CreatePlatform(new PlatformConfig { Shape = "rectangle", Width = 14f, Depth = 6f });
+        var disc = PriviewNetworkScene.CreatePlatform(new PlatformConfig { Shape = "circle", Size = 8f });
+        var square = PriviewNetworkScene.CreatePlatform(new PlatformConfig { Shape = "square", Size = 10f });
+        Console.WriteLine($"Platform geometry: square faces={square.FaceCount}, rectangle faces={rect.FaceCount}, circle faces={disc.FaceCount}");
+        if (rect.FaceCount <= 0 || disc.FaceCount <= 0 || square.FaceCount <= 0)
+        { Console.WriteLine("WORLD TEST FAILED: a platform shape built with no faces."); return; }
+
         Console.WriteLine("WORLD TEST PASSED");
     }
 
@@ -572,6 +632,35 @@ class Program
             Math.Abs(back.Scale - 3.5f) < 1e-4f &&
             Math.Abs(back.RotateSpeed - 1.25f) < 1e-4f &&
             back.Color == "Green";
+
+        // Cover the generated primitives: each builds with geometry, and FromInstance round-trips
+        // its Type/transform/color exactly like the cube (they ride the same editor/save/sync path).
+        foreach (var (type, prim) in new (string, Object3d)[]
+        {
+            ("cylinder", PriviewNetworkScene.CreateCylinder()),
+            ("cone",     PriviewNetworkScene.CreateCone()),
+            ("pyramid",  PriviewNetworkScene.CreatePyramid()),
+        })
+        {
+            var desc = new WorldObject { Type = type, Color = "White" };
+            prim.Position = new Vector3(4f, 5f, 6f);
+            prim.LocalRotate = new Vector3(0.1f, 0.2f, 0.3f);
+            prim.Scale = 1.5f;
+            prim.RotateSpeed = 0.7f;
+            prim.Color = ConsoleColor.Red;
+
+            WorldObject b = PriviewNetworkScene.FromInstance(desc, prim);
+            bool pok =
+                prim.FaceCount > 0 &&
+                b.Type == type && b.Mesh == null &&
+                Math.Abs(b.Position.X - 4f) < 1e-4f && Math.Abs(b.Position.Y - 5f) < 1e-4f && Math.Abs(b.Position.Z - 6f) < 1e-4f &&
+                Math.Abs(b.Rotation.X - 0.1f) < 1e-4f && Math.Abs(b.Rotation.Y - 0.2f) < 1e-4f && Math.Abs(b.Rotation.Z - 0.3f) < 1e-4f &&
+                Math.Abs(b.Scale - 1.5f) < 1e-4f && Math.Abs(b.RotateSpeed - 0.7f) < 1e-4f &&
+                b.Color == "Red";
+
+            Console.WriteLine($"  {type}: faces={prim.FaceCount}, back type={b.Type}, scale={b.Scale}, color={b.Color} -> {(pok ? "ok" : "BAD")}");
+            ok &= pok;
+        }
 
         Console.WriteLine(ok ? "EDITOR TEST PASSED" : "EDITOR TEST FAILED");
     }
@@ -679,7 +768,8 @@ class Program
         if (a.Graphics.Shadows != b.Graphics.Shadows || a.Graphics.Bvh != b.Graphics.Bvh ||
             a.Graphics.ExtraLight != b.Graphics.ExtraLight || a.Graphics.DisableCameraLight != b.Graphics.DisableCameraLight)
             return "graphics flags differ";
-        if (a.Platform.Enabled != b.Platform.Enabled || !Eq(a.Platform.Size, b.Platform.Size) || a.Platform.Color != b.Platform.Color)
+        if (a.Platform.Enabled != b.Platform.Enabled || !Eq(a.Platform.Size, b.Platform.Size) || a.Platform.Color != b.Platform.Color ||
+            a.Platform.Shape != b.Platform.Shape || !Eq(a.Platform.Width, b.Platform.Width) || !Eq(a.Platform.Depth, b.Platform.Depth))
             return "platform differs";
         if (a.Objects.Count != b.Objects.Count) return $"object count {a.Objects.Count} != {b.Objects.Count}";
 

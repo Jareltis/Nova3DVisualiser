@@ -151,6 +151,9 @@ public class PriviewNetworkScene : Scene
         // Spawn palette for the editor: the two primitives, then every library mesh.
         _spawnTypes.Add("cube");
         _spawnTypes.Add("sphere");
+        _spawnTypes.Add("cylinder");
+        _spawnTypes.Add("cone");
+        _spawnTypes.Add("pyramid");
         _spawnTypes.AddRange(WorldManager.ListAvailableMeshes());
 
         // The world authority (server, and local solo) stamps stable sequential ids onto its
@@ -171,7 +174,7 @@ public class PriviewNetworkScene : Scene
     private void BuildPlatform()
     {
         if (!_world.Platform.Enabled) return;
-        Object3d floor = CreatePlane(_world.Platform.Size);
+        Object3d floor = CreatePlatform(_world.Platform);
         floor.Position = new Vector3(0, 0, 0);
         floor.Color = ParseColor(_world.Platform.Color, ConsoleColor.Yellow);
         AddDisplaysObject(floor);
@@ -185,7 +188,8 @@ public class PriviewNetworkScene : Scene
     {
         GameObject? instance = null;
 
-        switch (o.Type?.Trim().ToLowerInvariant())
+        string type = o.Type?.Trim().ToLowerInvariant() ?? "";
+        switch (type)
         {
             case "mesh":
             {
@@ -213,14 +217,25 @@ public class PriviewNetworkScene : Scene
                 break;
             }
 
+            // Generated primitives all ride the same path: build the mesh, transform it (no anchor —
+            // gated to "mesh" inside ApplyToInstance, so they stay origin-centred like the cube), add.
             case "cube":
+            case "cylinder":
+            case "cone":
+            case "pyramid":
             {
-                Object3d cube = CreateCube();
-                ApplyToInstance(o, cube);   // cube has no anchor (gated on Type inside the helper)
+                Object3d prim = type switch
+                {
+                    "cylinder" => CreateCylinder(),
+                    "cone"     => CreateCone(),
+                    "pyramid"  => CreatePyramid(),
+                    _          => CreateCube(),
+                };
+                ApplyToInstance(o, prim);
 
-                _models.Add(cube);
-                AddDisplaysObject(cube);
-                instance = cube;
+                _models.Add(prim);
+                AddDisplaysObject(prim);
+                instance = prim;
                 break;
             }
 
@@ -393,6 +408,8 @@ public class PriviewNetworkScene : Scene
         DrawChatInterface();
         if (_awaitingWorld)
             UI.AddText("Waiting for world from server...", new Vector2Int(2, 10), ConsoleColor.Yellow);
+        if (RenderScale > 1)
+            UI.AddText($"Detail {RenderScale}/4 [P]", new Vector2Int(2, 11), ConsoleColor.DarkGray);
         DrawEditorOverlay();
         if (_editMode)
         {
@@ -557,11 +574,13 @@ public class PriviewNetworkScene : Scene
         spawnPos.Y = 0f; // ground level
 
         string label = _spawnTypes[_spawnIndex];
+        // The built-in primitives keep their label as the Type; anything else is a library mesh.
+        bool isPrimitive = label is "cube" or "sphere" or "cylinder" or "cone" or "pyramid";
         var descriptor = new WorldObject
         {
             Id = _nextObjectId++,   // unique stable id (only the authority spawns; 5b broadcasts it)
-            Type = label is "cube" or "sphere" ? label : "mesh",
-            Mesh = label is "cube" or "sphere" ? null : label,
+            Type = isPrimitive ? label : "mesh",
+            Mesh = isPrimitive ? null : label,
             Position = FromVec(spawnPos),
             Scale = 1f,
             Color = "White",
@@ -732,7 +751,19 @@ public class PriviewNetworkScene : Scene
         if (Input.IsGetKey(ConsoleKey.UpArrow)) _myCamera.LocalRotate.Z += rotateSpeed * dt;
         if (Input.IsGetKey(ConsoleKey.DownArrow)) _myCamera.LocalRotate.Z -= rotateSpeed * dt;
         _myCamera.LocalRotate.Z = Math.Clamp(_myCamera.LocalRotate.Z, -1.5f, 1.5f);
-        _myCamera.LocalRotate.X = 0;
+
+        // Camera roll about the forward axis (Q left / E right, R resets). X is the roll euler,
+        // applied before pitch/yaw — it spins the view without changing the look direction.
+        if (Input.IsGetKey(ConsoleKey.Q)) _myCamera.LocalRotate.X += rotateSpeed * dt;
+        if (Input.IsGetKey(ConsoleKey.E)) _myCamera.LocalRotate.X -= rotateSpeed * dt;
+        if (Input.IsGetKey(ConsoleKey.R)) _myCamera.LocalRotate.X = 0f;
+
+        // Field of view / zoom (Z in / X out, V resets). Narrower FOV = zoomed in.
+        float fovSpeed = 30f;   // degrees/sec, held like the light controls
+        if (Input.IsGetKey(ConsoleKey.Z)) _myCamera.Fov -= fovSpeed * dt;
+        if (Input.IsGetKey(ConsoleKey.X)) _myCamera.Fov += fovSpeed * dt;
+        if (Input.IsGetKey(ConsoleKey.V)) _myCamera.Fov = Camera.DefaultFov;
+        _myCamera.Fov = Math.Clamp(_myCamera.Fov, 20f, 120f);
 
         Vector3 yawRotation = new Vector3(0, _myCamera.LocalRotate.Y, 0);
         Vector3 forward = new Vector3(1, 0, 0).Rotate(yawRotation);
@@ -747,6 +778,9 @@ public class PriviewNetworkScene : Scene
         
         if (Input.IsGetKey(ConsoleKey.OemPlus)) _mainLight.LightPower += moveSpeed * 50 * dt;
         if (Input.IsGetKey(ConsoleKey.OemMinus)) _mainLight.LightPower -= moveSpeed* 50  * dt;
+
+        // Detail level: tap P to cycle render resolution 1->2->3->4->1 (lower = fewer rays = faster).
+        if (Pressed(ConsoleKey.P)) RenderScale = RenderScale % 4 + 1;
     }
 
     private void OnTransformReceived(TransformPacket packet, int senderId)
@@ -1006,15 +1040,113 @@ public class PriviewNetworkScene : Scene
             });
     }
 
-    private Object3d CreatePlane(float size)
+    // Builds a flat-shaded Object3d from local vertices + 1-based triangle index triples: one
+    // normal per face, taken from the winding (Cross(b-a, c-a)) so the supplied normal always
+    // agrees with the renderer's winding-based back-face test. Mirrors CreateCube's flat style.
+    private static Object3d BuildFlat(List<Vector3> verts, List<(int a, int b, int c)> tris)
+    {
+        var vertArr = verts.ToArray();
+        var normals = new Vector3[tris.Count];
+        var faces = new FacingInfo[tris.Count];
+        for (int k = 0; k < tris.Count; k++)
+        {
+            var (a, b, c) = tris[k];
+            Vector3 e1 = vertArr[b - 1] - vertArr[a - 1];
+            Vector3 e2 = vertArr[c - 1] - vertArr[a - 1];
+            normals[k] = Vector3.Cross(e1, e2).Norm();
+            faces[k] = new FacingInfo(new int[] { a, b, c }, k + 1);
+        }
+        return new Object3d(vertArr, normals, faces);
+    }
+
+    // Unit-ish cylinder: radius 1, y in [-1, 1], origin-centred like the cube, with end caps.
+    public static Object3d CreateCylinder()
+    {
+        const int seg = 16;
+        var verts = new List<Vector3>();
+        for (int s = 0; s < seg; s++) { float a = MathF.Tau * s / seg; verts.Add(new Vector3(MathF.Cos(a), -1f, MathF.Sin(a))); }
+        for (int s = 0; s < seg; s++) { float a = MathF.Tau * s / seg; verts.Add(new Vector3(MathF.Cos(a),  1f, MathF.Sin(a))); }
+        int bc = verts.Count + 1; verts.Add(new Vector3(0, -1f, 0));   // bottom centre
+        int tc = verts.Count + 1; verts.Add(new Vector3(0,  1f, 0));   // top centre
+
+        int B(int s) => (s % seg) + 1;          // bottom ring (1-based)
+        int T(int s) => seg + (s % seg) + 1;    // top ring (1-based)
+
+        var tris = new List<(int, int, int)>();
+        for (int s = 0; s < seg; s++)
+        {
+            int b0 = B(s), b1 = B(s + 1), t0 = T(s), t1 = T(s + 1);
+            tris.Add((b0, t1, b1));   // side quad (two outward-wound tris)
+            tris.Add((b0, t0, t1));
+            tris.Add((tc, t1, t0));   // top cap (+Y)
+            tris.Add((bc, b0, b1));   // bottom cap (-Y)
+        }
+        return BuildFlat(verts, tris);
+    }
+
+    // Unit-ish cone: base radius 1 at y=-1, apex at (0,1,0), with a base cap.
+    public static Object3d CreateCone()
+    {
+        const int seg = 16;
+        var verts = new List<Vector3>();
+        for (int s = 0; s < seg; s++) { float a = MathF.Tau * s / seg; verts.Add(new Vector3(MathF.Cos(a), -1f, MathF.Sin(a))); }
+        int apex = verts.Count + 1; verts.Add(new Vector3(0,  1f, 0));
+        int bc = verts.Count + 1; verts.Add(new Vector3(0, -1f, 0));   // base centre
+
+        int B(int s) => (s % seg) + 1;
+
+        var tris = new List<(int, int, int)>();
+        for (int s = 0; s < seg; s++)
+        {
+            tris.Add((B(s), apex, B(s + 1)));   // side
+            tris.Add((bc, B(s), B(s + 1)));     // base cap (-Y)
+        }
+        return BuildFlat(verts, tris);
+    }
+
+    // Unit-ish pyramid: square base ±1 at y=-1, apex at (0,1,0).
+    public static Object3d CreatePyramid()
+    {
+        var verts = new List<Vector3>
+        {
+            new Vector3(-1f, -1f, -1f),   // 1
+            new Vector3( 1f, -1f, -1f),   // 2
+            new Vector3( 1f, -1f,  1f),   // 3
+            new Vector3(-1f, -1f,  1f),   // 4
+            new Vector3( 0f,  1f,  0f),   // 5 apex
+        };
+        var tris = new List<(int, int, int)>
+        {
+            (1, 2, 3), (1, 3, 4),                          // base (-Y)
+            (1, 5, 2), (2, 5, 3), (3, 5, 4), (4, 5, 1),    // sides
+        };
+        return BuildFlat(verts, tris);
+    }
+
+    // Builds the platform floor for the given config: a square (Size half-extent), a
+    // Width x Depth rectangle, or a circular disc (diameter Size). All face +Y (up), exactly
+    // like the square floor, so the renderer's winding-based cull keeps them visible from above.
+    public static Object3d CreatePlatform(PlatformConfig p)
+    {
+        switch (p.Shape?.Trim().ToLowerInvariant())
+        {
+            case "rectangle": return CreatePlane(p.Width * 0.5f, p.Depth * 0.5f);
+            case "circle":    return CreateDisc(p.Size * 0.5f);
+            default:          return CreatePlane(p.Size, p.Size);   // "square" (and any legacy/unknown)
+        }
+    }
+
+    // A flat quad on y=0 spanning [-halfX, halfX] x [-halfZ, halfZ], +Y normal (the square uses
+    // halfX == halfZ == Size, preserving the original geometry exactly).
+    private static Object3d CreatePlane(float halfX, float halfZ)
     {
         return new Object3d(
             new Vector3[]
             {
-                new Vector3(-size, 0f, size),
-                new Vector3(size, 0f, size),
-                new Vector3(-size, 0f, -size),
-                new Vector3(size, 0f, -size)
+                new Vector3(-halfX, 0f, halfZ),
+                new Vector3(halfX, 0f, halfZ),
+                new Vector3(-halfX, 0f, -halfZ),
+                new Vector3(halfX, 0f, -halfZ)
             },
             new Vector3[]
             {
@@ -1025,5 +1157,26 @@ public class PriviewNetworkScene : Scene
                 new FacingInfo(new int[] {2,3,1}, 1),
                 new FacingInfo(new int[] {2,4,3}, 1),
             });
+    }
+
+    // A flat disc on y=0: a triangle fan from the centre to a ring at the given radius, wound
+    // (centre, ring[s+1], ring[s]) so each face's normal is +Y — same facing as the square floor.
+    private static Object3d CreateDisc(float radius)
+    {
+        const int seg = 32;
+        var verts = new List<Vector3>();
+        for (int s = 0; s < seg; s++)
+        {
+            float a = MathF.Tau * s / seg;
+            verts.Add(new Vector3(radius * MathF.Cos(a), 0f, radius * MathF.Sin(a)));
+        }
+        int centre = verts.Count + 1; verts.Add(new Vector3(0f, 0f, 0f));
+
+        int R(int s) => (s % seg) + 1;   // ring vertex (1-based)
+        var tris = new List<(int, int, int)>();
+        for (int s = 0; s < seg; s++)
+            tris.Add((centre, R(s + 1), R(s)));   // wound so Cross(b-a,c-a) points +Y
+
+        return BuildFlat(verts, tris);
     }
 }
