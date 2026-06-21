@@ -676,41 +676,94 @@ public class PriviewNetworkScene : Scene
     private static string DescribeEntry(EditEntry e) =>
         e.Descriptor.Type == "mesh" ? $"mesh:{e.Descriptor.Mesh}" : e.Descriptor.Type;
 
-    // Right-side Visual-Studio-style properties panel for the selected object.
+    // Visual-Studio-style properties panel for the selected object, framed like the Terminal.Gui
+    // setup dialogs (a titled, bordered box) but drawn via the in-scene UI overlay. The box
+    // auto-sizes to the current content each frame and sits in the top-right corner.
     private void DrawPropertiesPanel()
     {
-        const int panelW = 30;
-        int px = Math.Max(0, Console.WindowWidth - panelW);
-        int py = 2;
-
-        UI.AddText("== PROPERTIES ==", new Vector2Int(px, py++), ConsoleColor.Green);
+        var lines = new List<(string text, ConsoleColor color)>();
 
         if (_selected < 0 || _selected >= _editables.Count)
         {
-            UI.AddText("(no selection)", new Vector2Int(px, py), ConsoleColor.DarkGray);
-            return;
+            lines.Add(("(no selection)", ConsoleColor.DarkGray));
         }
-
-        var entry = _editables[_selected];
-        var inst = entry.Instance;
-        string type = entry.Descriptor.Type ?? "";
-        var fields = EditableFields(type);
-        Field active = fields[Math.Clamp(_fieldIndex, 0, fields.Length - 1)];
-
-        // Read-only header.
-        UI.AddText($"  Type: {type}", new Vector2Int(px, py++), ConsoleColor.DarkGray);
-        if (type == "mesh")
-            UI.AddText($"  Mesh: {entry.Descriptor.Mesh}", new Vector2Int(px, py++), ConsoleColor.DarkGray);
-
-        // Editable fields with the active-field cursor.
-        foreach (var f in fields)
+        else
         {
-            bool on = f == active;
-            string line = $"{(on ? ">" : " ")} {FieldLabel(f)}: {FieldValue(f, inst)}";
-            UI.AddText(line, new Vector2Int(px, py++), on ? ConsoleColor.Cyan : ConsoleColor.Gray);
+            var entry = _editables[_selected];
+            var inst = entry.Instance;
+            string type = entry.Descriptor.Type ?? "";
+            var fields = EditableFields(type);
+            Field active = fields[Math.Clamp(_fieldIndex, 0, fields.Length - 1)];
+
+            // Read-only header.
+            lines.Add(($"  Type: {type}", ConsoleColor.DarkGray));
+            if (type == "mesh")
+                lines.Add(($"  Mesh: {entry.Descriptor.Mesh}", ConsoleColor.DarkGray));
+
+            // Editable fields with the active-field cursor.
+            foreach (var f in fields)
+            {
+                bool on = f == active;
+                string line = $"{(on ? ">" : " ")} {FieldLabel(f)}: {FieldValue(f, inst)}";
+                lines.Add((line, on ? ConsoleColor.Cyan : ConsoleColor.Gray));
+            }
+
+            lines.Add((",/. field   N/M value   Del", ConsoleColor.DarkGray));
         }
 
-        UI.AddText(",/. field   N/M value   Del", new Vector2Int(px, py), ConsoleColor.DarkGray);
+        DrawOverlayBox("PROPERTIES", lines);
+    }
+
+    // True when the console's output encoding can represent the box-drawing glyphs; if not, the
+    // overlay box falls back to ASCII (+ - |). Probed once via an encoding round-trip.
+    private static readonly bool BoxCharsSupported = DetectBoxChars();
+    private static bool DetectBoxChars()
+    {
+        try
+        {
+            const string probe = "┌─┐│└┘";
+            var enc = Console.OutputEncoding;
+            return enc.GetString(enc.GetBytes(probe)) == probe;
+        }
+        catch { return false; }
+    }
+
+    // Draws a bordered box (Terminal.Gui-dialog feel: grey frame, inset green title) via the UI
+    // overlay: a top border with the title seated in it, blank framed side rows with the content
+    // overlaid, and a bottom border. Auto-sizes to the widest content line and is anchored to the
+    // top-right corner, clear of the centre crosshair and the bottom chat.
+    private void DrawOverlayBox(string title, IReadOnlyList<(string text, ConsoleColor color)> lines)
+    {
+        bool uni = BoxCharsSupported;
+        char tl = uni ? '┌' : '+', tr = uni ? '┐' : '+', bl = uni ? '└' : '+', br = uni ? '┘' : '+';
+        char hz = uni ? '─' : '-', vt = uni ? '│' : '|';
+        const ConsoleColor border = ConsoleColor.Gray;
+        const ConsoleColor titleColor = ConsoleColor.Green;
+
+        // Interior width: the widest content line, but always enough to seat the title in the top
+        // border, plus one space of padding on each side.
+        int innerW = title.Length + 1;
+        foreach (var (text, _) in lines) innerW = Math.Max(innerW, text.Length);
+        innerW += 2;
+
+        int boxW = innerW + 2;   // + the two side borders
+        int left = Math.Max(0, Console.WindowWidth - boxW);
+        int top = 0;
+
+        // Top border with the inset title:  ┌─ PROPERTIES ───┐
+        UI.AddText(tl + new string(hz, innerW) + tr, new Vector2Int(left, top), border);
+        UI.AddText($" {title} ", new Vector2Int(left + 2, top), titleColor);
+
+        // Content rows: a blank framed row, then the line overlaid one space in from the border.
+        int row = top + 1;
+        foreach (var (text, color) in lines)
+        {
+            UI.AddText(vt + new string(' ', innerW) + vt, new Vector2Int(left, row), border);
+            UI.AddText(text, new Vector2Int(left + 2, row), color);
+            row++;
+        }
+
+        UI.AddText(bl + new string(hz, innerW) + br, new Vector2Int(left, row), border);
     }
 
     private static string FieldLabel(Field f) => f switch
