@@ -27,6 +27,34 @@ class Program
         if (args.Length > 0 && args[0] == "picktest") { PickSelfTest(); return; }
         if (args.Length > 0 && args[0] == "worldsynctest") { WorldSyncSelfTest(); return; }
 
+        // Crash net: the render loop is async + parallel (Parallel.For), so a crash on a worker
+        // thread or an unobserved task never reaches the try/catch below. Capture those globally
+        // too, so any crash lands in logs/ with a FATAL marker and the console is restored.
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            LogFatal("AppDomain.UnhandledException", e.ExceptionObject as Exception);
+        TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            LogFatal("TaskScheduler.UnobservedTaskException", e.Exception);
+            e.SetObserved();
+        };
+
+        try
+        {
+            RunApp();
+        }
+        catch (Exception ex)
+        {
+            LogFatal("Main", ex);
+        }
+        finally
+        {
+            RestoreConsole();
+        }
+    }
+
+    // The full interactive app: Terminal.Gui setup wizard -> scene build -> render loop.
+    static void RunApp()
+    {
         Logger.Init(AppPaths.LogsFolder);
         Logger.Info("Application started");
 
@@ -57,6 +85,10 @@ class Program
             Colors.Base = scheme;
             Colors.Dialog = scheme;
             Colors.Menu = scheme;
+
+            // Each step's Dialog is run inside a full-screen host toplevel (see RunStepDialog), so
+            // running a step overdraws the WHOLE screen and the previous step cannot linger behind
+            // it — without any manual Clear/Refresh (those destabilized Terminal.Gui and crashed).
 
             var step = Step.Mode;
             bool done = false;
@@ -150,6 +182,58 @@ class Program
         //new Frame(new PreviewScene(new DisplayManagerAsync()), new ConsoleScreenAsync()).MainLoop();
     }
 
+    // Runs one wizard step's centered Dialog inside a full-screen host toplevel. Because the host
+    // fills and overdraws the WHOLE screen when it draws, running a step fully covers the previous
+    // step — fixing the lingering-frame bug with NO manual Clear/Refresh. The inner Dialog keeps
+    // its centered, fixed-size box look (border, title, buttons); the host is borderless and fills
+    // the screen with the wizard's grey-on-black scheme. The Dialog's buttons still call
+    // Application.RequestStop(), which stops this host, so each ShowXxxDialog returns as before.
+    static void RunStepDialog(Dialog dialog)
+    {
+        var host = new Window
+        {
+            X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(),
+            ColorScheme = Colors.Base,
+        };
+        host.Border.BorderStyle = BorderStyle.None;
+        host.Add(dialog);
+        Application.Run(host);
+    }
+
+    // Writes the full exception (type, message, stack, and every InnerException) to the log with a
+    // FATAL marker, restores the console, and echoes the text so it survives the raw renderer.
+    static void LogFatal(string source, Exception? ex)
+    {
+        string text = $"FATAL [{source}] {DescribeException(ex)}";
+        try { Logger.Error(text); } catch { /* logging must never crash the crash handler */ }
+        RestoreConsole();
+        try { Console.Error.WriteLine(text); } catch { }
+    }
+
+    // Flattens an exception chain (each level's type, message, and stack) for the log.
+    static string DescribeException(Exception? ex)
+    {
+        if (ex == null) return "(no exception object)";
+        var sb = new System.Text.StringBuilder();
+        for (Exception? e = ex; e != null; e = e.InnerException)
+        {
+            sb.AppendLine($"{e.GetType().FullName}: {e.Message}");
+            sb.AppendLine(e.StackTrace);
+            if (e.InnerException != null) sb.AppendLine("--- inner exception ---");
+        }
+        return sb.ToString();
+    }
+
+    // Brings the terminal back to a usable state (after a crash or a normal exit): shut Terminal.Gui
+    // down if it is still up, reset colors, and show the cursor. Every step is guarded so restoring
+    // the console never throws.
+    static void RestoreConsole()
+    {
+        try { Application.Shutdown(); } catch { }
+        try { Console.ResetColor(); } catch { }
+        try { Console.CursorVisible = true; } catch { }
+    }
+
     // ---- Dialog 1: session mode (Local / Online). Secondary button quits the app. ----
     static DlgResult ShowModeDialog(ref bool online)
     {
@@ -166,7 +250,7 @@ class Program
 
         var dialog = new Dialog("Session mode", 50, 9, ok, btnQuit);
         dialog.Add(new Label("Run a local solo session or go online?") { X = 1, Y = 0 }, radio);
-        Application.Run(dialog);
+        RunStepDialog(dialog);
 
         if (result == DlgResult.Ok) online = radio.SelectedItem == 1;
         return result;
@@ -188,7 +272,7 @@ class Program
 
         var dialog = new Dialog("Network role", 50, 9, ok, back);
         dialog.Add(new Label("Host a server or join one?") { X = 1, Y = 0 }, radio);
-        Application.Run(dialog);
+        RunStepDialog(dialog);
 
         if (result == DlgResult.Ok) isServer = radio.SelectedItem == 0;
         return result;
@@ -252,7 +336,7 @@ class Program
                 portField);
         }
 
-        Application.Run(dialog);
+        RunStepDialog(dialog);
 
         if (result == DlgResult.Ok)
         {
@@ -275,7 +359,7 @@ class Program
 
         var dialog = new Dialog("World", 50, 9, ok, back);
         dialog.Add(new Label("Create a new world or load a saved one?") { X = 1, Y = 0 }, radio);
-        Application.Run(dialog);
+        RunStepDialog(dialog);
 
         create = radio.SelectedItem == 0;
         return result;
@@ -355,7 +439,7 @@ class Program
             new Label("Platform shape:") { X = 1, Y = 9 }, rgShape,
             new Label("Size (square/circle):") { X = 1, Y = 11 }, sizeField,
             new Label("Rect W x D:") { X = 1, Y = 12 }, widthField, depthField);
-        Application.Run(dialog);
+        RunStepDialog(dialog);
 
         world = built;
         return result;
@@ -394,7 +478,7 @@ class Program
         int height = Math.Min(20, 7 + Math.Max(1, names.Count));
         var dialog = new Dialog("Load world", 50, height, load, back);
         dialog.Add(new Label("Select a saved world:") { X = 1, Y = 0 }, radio);
-        Application.Run(dialog);
+        RunStepDialog(dialog);
 
         world = loaded;
         return result;
