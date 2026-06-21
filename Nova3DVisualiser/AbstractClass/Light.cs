@@ -7,7 +7,6 @@ namespace Nova3DVisualiser.AbstractClass;
 public class Light (Vector3 position, float lightPower) : GameObject(position, Vector3.Zero)
 {
     public float LightPower = lightPower;
-    //private readonly IDisplaysManager _displaysManager = new DisplaysManager();
 
     private float CalculateBrightness(RenderData renderData)
     {
