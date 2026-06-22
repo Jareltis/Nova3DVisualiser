@@ -1,7 +1,10 @@
 ﻿using System.Net;
+using System.Runtime.InteropServices;
 using NStack;
 using Nova3DVisualiser;
+using Nova3DVisualiser.AbstractClass;
 using Nova3DVisualiser.Implementation;
+using Nova3DVisualiser.Interfaces.modifier;
 using Nova3DVisualiser.Logging;
 using Nova3DVisualiser.Network;
 using Nova3DVisualiser.Shape;
@@ -26,6 +29,7 @@ class Program
         if (args.Length > 0 && args[0] == "editortest") { EditorSelfTest(); return; }
         if (args.Length > 0 && args[0] == "picktest") { PickSelfTest(); return; }
         if (args.Length > 0 && args[0] == "worldsynctest") { WorldSyncSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "colortest") { ColorSelfTest(); return; }
 
         // Crash net: the render loop is async + parallel (Parallel.For), so a crash on a worker
         // thread or an unobserved task never reaches the try/catch below. Capture those globally
@@ -670,6 +674,60 @@ class Program
         Console.WriteLine("WORLD TEST PASSED");
     }
 
+    // Visual + headless display check for 24-bit truecolor. Enables VT the SAME way the renderer
+    // does, reports the console mode + truecolor env hints, prints labeled swatches and a blue ramp
+    // using the SAME ESC[38;2;r;g;bm emission, and finally writes a raw blue swatch so its bytes can
+    // be hexdumped. The user runs this to confirm the terminal renders blue (ruling out a VT issue).
+    static void ColorSelfTest()
+    {
+        char esc = (char)27;
+        ConsoleScreenAsync.EnableVirtualTerminal();   // exact renderer VT-enable path
+
+        Console.WriteLine("=== COLOR TEST (24-bit truecolor) ===");
+
+        uint mode = 0; bool gotMode = false;
+        if (OperatingSystem.IsWindows())
+            try { gotMode = GetConsoleMode(GetStdHandle(StdOut), out mode); } catch { }
+        Console.WriteLine(gotMode
+            ? $"console mode = 0x{mode:X4}  (ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x4 -> {((mode & 0x4u) != 0 ? "SET" : "NOT set")})"
+            : "console mode = (unavailable — stdout redirected or non-Windows; run live in a terminal to see it)");
+        Console.WriteLine($"WT_SESSION={Environment.GetEnvironmentVariable("WT_SESSION")}  " +
+                          $"COLORTERM={Environment.GetEnvironmentVariable("COLORTERM")}  " +
+                          $"TERM_PROGRAM={Environment.GetEnvironmentVariable("TERM_PROGRAM")}");
+        Console.WriteLine();
+
+        void Swatch(string label, int r, int g, int b)
+            => Console.WriteLine($"{label,-9} {esc}[38;2;{r};{g};{b}m████████{esc}[0m  (escape: 38;2;{r};{g};{b})");
+
+        Swatch("RED",      255, 0,   0);
+        Swatch("GREEN",    0,   255, 0);
+        Swatch("BLUE",     0,   0,   255);
+        Swatch("WHITE",    255, 255, 255);
+        Swatch("CYAN",     0,   255, 255);
+        Swatch("MAGENTA",  255, 0,   255);
+        Swatch("YELLOW",   255, 255, 0);
+        Swatch("DARKBLUE", 0,   0,   128);
+        Swatch("DARKCYAN", 0,   128, 128);
+        Console.WriteLine();
+
+        Console.Write("BLUE RAMP ");
+        for (int v = 0; v <= 255; v += 16)
+            Console.Write($"{esc}[38;2;0;0;{v}m█");
+        Console.WriteLine($"{esc}[0m");
+        Console.WriteLine();
+
+        // Raw blue swatch escape, written plainly so its bytes can be hexdumped (must carry 38;2;0;0;255).
+        Console.WriteLine("raw BLUE swatch escape (hexdump the line below; bytes must contain 38;2;0;0;255):");
+        Console.Out.Write($"{esc}[38;2;0;0;255m████{esc}[0m");
+        Console.WriteLine();
+
+        Console.WriteLine("COLOR TEST DONE — expect: PURE BLUE shows blue (not black), ramp goes dark->blue, CYAN != GREEN.");
+    }
+
+    private const int StdOut = -11;
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
     // Non-interactive round-trip of the editor's save-back conversion (FromInstance):
     // build a cube object from a descriptor, mutate its live Position, convert back, and
     // assert the result reflects the move while preserving Type/Color/Scale.
@@ -746,6 +804,201 @@ class Program
             ok &= pok;
         }
 
+        // Cover the new "light" object end-to-end through a real (offline) scene, one entry per
+        // Kind: Start() builds a visible marker (FaceCount > 0) AND an engine Light of the right
+        // Kind, paired in one EditEntry; FromInstance round-trips every light field (kind, direction,
+        // cone, area size, power, position). (Platform off so the lights are the only entries.)
+        {
+            var lightWorld = new WorldConfig
+            {
+                Name = "lighttest",
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 0, Type = "light", LightKind = "point", Color = "White",
+                        Position = new Vec3Config { X = 2f, Y = 3f, Z = -1f }, Power = 750f },
+                    new WorldObject { Id = 1, Type = "light", LightKind = "directional", Color = "Cyan",
+                        Position = new Vec3Config { X = -2f, Y = 4f, Z = 0f }, Power = 400f,
+                        Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f }, LightSpin = 0.5f },
+                    new WorldObject { Id = 2, Type = "light", LightKind = "spot", Color = "Red",
+                        Position = new Vec3Config { X = 0f, Y = 5f, Z = 0f }, Power = 900f,
+                        Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f }, ConeAngle = 18f,
+                        BeamCount = 4, ConeShape = "square" },
+                    new WorldObject { Id = 3, Type = "light", LightKind = "area", Color = "Green",
+                        Position = new Vec3Config { X = 1f, Y = 3f, Z = 2f }, Power = 600f,
+                        Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f }, LightSize = 2f },
+                },
+            };
+
+            var scene = new PriviewNetworkScene(new DisplayManagerAsync(), lightWorld, isServer: false, "127.0.0.1", 0, online: false);
+            scene.Start();
+
+            var lightEntries = scene.EditableEntries.Where(e => e.Light != null).ToList();
+            bool lok = lightEntries.Count == 4;
+            if (!lok) Console.WriteLine($"  light: expected 4 light entries, got {lightEntries.Count} -> BAD");
+
+            var expectKinds = new[] { LightKind.Point, LightKind.Directional, LightKind.Spot, LightKind.Area };
+            for (int i = 0; lok && i < lightEntries.Count; i++)
+            {
+                var e = lightEntries[i];
+                var orig = lightWorld.Objects[i];                 // the descriptor we fed in (round-trip target)
+                var marker = e.Instance as Object3d;
+                WorldObject lb = PriviewNetworkScene.FromInstance(e.Descriptor, e.Instance, e.Light);
+                bool one =
+                    marker != null && marker.FaceCount > 0 &&                       // marker is visible
+                    e.Light!.Kind == expectKinds[i] &&                              // scene gained a Light of this kind
+                    lb.Type == "light" && lb.Mesh == null &&
+                    lb.LightKind == orig.LightKind &&                              // kind round-trips
+                    lb.Color == orig.Color &&                                     // color round-trips
+                    Math.Abs(lb.Direction.X - orig.Direction.X) < 1e-4f &&         // direction round-trips (already unit)
+                    Math.Abs(lb.Direction.Y - orig.Direction.Y) < 1e-4f &&
+                    Math.Abs(lb.Direction.Z - orig.Direction.Z) < 1e-4f &&
+                    Math.Abs(lb.ConeAngle - orig.ConeAngle) < 1e-4f &&             // cone round-trips
+                    Math.Abs(lb.LightSize - orig.LightSize) < 1e-4f &&            // area size round-trips
+                    lb.BeamCount == orig.BeamCount &&                              // beam count round-trips
+                    e.Light!.BeamCount == orig.BeamCount &&                        // ...and reached the engine Light
+                    lb.ConeShape == orig.ConeShape &&                             // cone shape round-trips
+                    Math.Abs(lb.Power - orig.Power) < 1e-4f &&                    // power round-trips
+                    Math.Abs(lb.Position.X - orig.Position.X) < 1e-4f &&          // marker position round-trips
+                    Math.Abs(lb.Position.Y - orig.Position.Y) < 1e-4f &&
+                    Math.Abs(lb.Position.Z - orig.Position.Z) < 1e-4f;
+                Console.WriteLine($"  light[{i}] kind={e.Light!.Kind}: marker faces={marker?.FaceCount}, back kind={lb.LightKind}, cone={lb.ConeAngle}, size={lb.LightSize}, power={lb.Power} -> {(one ? "ok" : "BAD")}");
+                lok &= one;
+            }
+            ok &= lok;
+        }
+
+        // Headless multi-beam check — a spot with BeamCount=4 fans four cones about the aim, so a
+        // point sitting squarely in a FANNED (non-primary) beam is lit with Beams=4 but dark with
+        // Beams=1 (the lone primary cone misses it). Aim +X (horizontal -> fans about world Y); the
+        // k=1 beam points -Z, so a point straight down -Z from the light lands dead-center in it.
+        {
+            var mgr = new DisplayManagerAsync();
+            var none = new List<IDisplays>();
+            var P = new Vector3(0f, 0f, -3f);                                   // on the k=1 (-Z) fanned beam axis
+            var rd = new RenderData(0f, (new Vector3(0f, 0f, 0f) - P).Norm(), P, ConsoleColor.White);
+            var spot = new Light(new Vector3(0f, 0f, 0f), 500f)
+            { Kind = LightKind.Spot, Direction = new Vector3(1f, 0f, 0f), ConeAngleDeg = 30f };
+
+            spot.BeamCount = 1; float b1 = spot.Contribution(rd, none, mgr, shadows: false);
+            spot.BeamCount = 4; float b4 = spot.Contribution(rd, none, mgr, shadows: false);
+            bool bok = b1 == 0f && b4 > 0f;
+            Console.WriteLine($"  beams: fanned point Beams=1 -> {b1:F3} (want 0), Beams=4 -> {b4:F3} (want >0) -> {(bok ? "ok" : "BAD")}");
+            ok &= bok;
+        }
+
+        // Headless cone-shape check — a SQUARE cross-section lights its corners; the inscribed CIRCLE
+        // does not. Aim +X, half-angle 30deg (t=tan30); a point at normalized cross-section offset
+        // (0.8t, 0.8t) sits inside the square but past the circle's edge (sqrt(2)*0.8t > t).
+        {
+            var mgr = new DisplayManagerAsync();
+            var none = new List<IDisplays>();
+            float t = MathF.Tan(30f * MathF.PI / 180f);
+            var P = new Vector3(1f, -0.8f * t, 0.8f * t);                       // u=+Z, v=-Y at axial 1
+            var rd = new RenderData(0f, (new Vector3(0f, 0f, 0f) - P).Norm(), P, ConsoleColor.White);
+            var spot = new Light(new Vector3(0f, 0f, 0f), 500f)
+            { Kind = LightKind.Spot, Direction = new Vector3(1f, 0f, 0f), ConeAngleDeg = 30f, BeamCount = 1 };
+
+            spot.ConeShape = ConeShapeKind.Circle; float circ = spot.Contribution(rd, none, mgr, shadows: false);
+            spot.ConeShape = ConeShapeKind.Square; float sq = spot.Contribution(rd, none, mgr, shadows: false);
+            bool sok = circ == 0f && sq > 0f;
+            Console.WriteLine($"  shape: corner point Circle -> {circ:F3} (want 0), Square -> {sq:F3} (want >0) -> {(sok ? "ok" : "BAD")}");
+            ok &= sok;
+        }
+
+        // Headless dominance/shadow check — the core multi-light fix. A surface point blocked from
+        // light A but reached by an unblocked light B on the OTHER side must still be lit by B: each
+        // light is shadow-tested independently and contributes additively (no global/min/multiplied
+        // shadow factor). A occluded -> 0; B clear -> > 0; their sum stays > 0.
+        {
+            var mgr = new DisplayManagerAsync();
+            var occluder = new Sphere(new Vector3(-2f, 2f, 0f), Vector3.Zero, 1f);  // sits between P and light A
+            var objs = new List<IDisplays> { occluder };
+
+            var rd = new RenderData(0f, new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, 0f), ConsoleColor.White);  // up-facing point at origin
+            var lightA = new Light(new Vector3(-4f, 4f, 0f), 500f);  // line of sight blocked by the sphere
+            var lightB = new Light(new Vector3( 4f, 4f, 0f), 500f);  // clear line of sight
+
+            float a = lightA.Contribution(rd, objs, mgr, shadows: true);
+            float b = lightB.Contribution(rd, objs, mgr, shadows: true);
+
+            bool dok = a == 0f && b > 0f && (a + b) > 0f;
+            Console.WriteLine($"  dominance: blocked A={a:F3} (want 0), reached B={b:F3} (want >0), sum={(a + b):F3} -> {(dok ? "ok" : "BAD")}");
+            ok &= dok;
+        }
+
+        // Color round-trip — the BLUE/Z channel must survive ConsoleColor->RGB->Rgb24 (regression guard).
+        {
+            Vector3 blue = ColorRgb.ToRgb(ConsoleColor.Blue);
+            Rgb24 unitBlue = Rgb24.FromUnit(new Vector3(0f, 0f, 1f));
+            Rgb24 white = Rgb24.FromUnit(ColorRgb.ToRgb(ConsoleColor.White));
+            Rgb24 cyan = Rgb24.FromUnit(ColorRgb.ToRgb(ConsoleColor.Cyan));
+            Rgb24 magenta = Rgb24.FromUnit(ColorRgb.ToRgb(ConsoleColor.Magenta));
+            Console.WriteLine($"  color: ToRgb(Blue)=({blue.X:F2},{blue.Y:F2},{blue.Z:F2}); unitBlue=({unitBlue.R},{unitBlue.G},{unitBlue.B}); white=({white.R},{white.G},{white.B}); cyan=({cyan.R},{cyan.G},{cyan.B}); magenta=({magenta.R},{magenta.G},{magenta.B})");
+            bool cok =
+                blue.Z > 0.99f && blue.X < 0.01f && blue.Y < 0.01f &&
+                unitBlue.R == 0 && unitBlue.G == 0 && unitBlue.B == 255 &&
+                white.R == 255 && white.G == 255 && white.B == 255 &&
+                cyan.R == 0 && cyan.G == 255 && cyan.B == 255 &&
+                magenta.R == 255 && magenta.G == 0 && magenta.B == 255;
+            Console.WriteLine($"  color: blue/Z survives RGB->Rgb24 -> {(cok ? "ok" : "BAD")}");
+            ok &= cok;
+        }
+
+        // SurfaceTint combine — a colored light shows on a BLUE-LESS surface. Replicates Scene's new
+        // hybrid combine (defaults SurfaceTint=0.4, Ambient=0.1, Exposure=0.05) on a yellow surface
+        // (albedo (1,1,0), blue=0) lit by a pure-blue light: old pure-multiplicative blue was 0; the
+        // hybrid lets blue through (> 0).
+        {
+            Vector3 albedo = ColorRgb.ToRgb(ConsoleColor.Yellow);   // (1,1,0): blue channel = 0
+            Vector3 accum = new Vector3(0f, 0f, 10f);               // pure-blue light contribution
+            const float tint = 0.4f, amb = 0.1f, exp = 0.05f;       // Scene defaults
+            float oldBlue = albedo.Z * (amb + accum.Z * exp);       // pure multiplicative -> 0
+            float tB = 1f - tint * (1f - albedo.Z);
+            float newBlue = albedo.Z * amb + tB * accum.Z * exp;    // hybrid -> > 0
+            bool stok = oldBlue == 0f && newBlue > 0f;
+            Console.WriteLine($"  surfacetint: yellow surface + blue light -> oldBlue={oldBlue:F3} (was 0), newBlue={newBlue:F3} (>0) -> {(stok ? "ok" : "BAD")}");
+            ok &= stok;
+        }
+
+        // Part B — the settings "extra light" injects as exactly ONE real editable light object on the
+        // authority/solo, and is idempotent (a world that already has a light is not doubled).
+        {
+            var injWorld = new WorldConfig
+            {
+                Name = "extralight-inject",
+                Graphics = new GraphicsConfig { ExtraLight = true },
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject>(),   // no lights yet -> one should be injected
+            };
+            var s1 = new PriviewNetworkScene(new DisplayManagerAsync(), injWorld, isServer: false, "127.0.0.1", 0, online: false);
+            s1.Start();
+            var le = s1.EditableEntries.FirstOrDefault(e => e.Light != null);
+            int lights1 = s1.EditableEntries.Count(e => e.Light != null);
+            bool injOk = lights1 == 1 && le != null && (le.Instance as Object3d)?.FaceCount > 0;
+            Console.WriteLine($"  extralight-inject: light entries={lights1} (want 1), marker faces={(le?.Instance as Object3d)?.FaceCount} -> {(injOk ? "ok" : "BAD")}");
+            ok &= injOk;
+
+            // Idempotent: ExtraLight on, but the world already contains a light -> no second injection.
+            var dupWorld = new WorldConfig
+            {
+                Name = "extralight-idempotent",
+                Graphics = new GraphicsConfig { ExtraLight = true },
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Type = "light", LightKind = "point", Color = "White",
+                        Position = new Vec3Config { X = 0f, Y = 5f, Z = 0f }, Power = 500f },
+                },
+            };
+            var s2 = new PriviewNetworkScene(new DisplayManagerAsync(), dupWorld, isServer: false, "127.0.0.1", 0, online: false);
+            s2.Start();
+            int lights2 = s2.EditableEntries.Count(e => e.Light != null);
+            bool dupOk = lights2 == 1;
+            Console.WriteLine($"  extralight-idempotent: light entries={lights2} (want 1, no double) -> {(dupOk ? "ok" : "BAD")}");
+            ok &= dupOk;
+        }
+
         Console.WriteLine(ok ? "EDITOR TEST PASSED" : "EDITOR TEST FAILED");
     }
 
@@ -808,6 +1061,12 @@ class Program
                 new WorldObject { Id = 12, Type = "sphere",
                     Position = new Vec3Config { X = 4f, Y = 1f, Z = -2f },
                     Radius = 2.5f, Color = "Blue" },
+                new WorldObject { Id = 13, Type = "light",
+                    Position = new Vec3Config { X = 5f, Y = 4f, Z = 1f },
+                    Power = 800f, Color = "Magenta", LightKind = "spot",
+                    Direction = new Vec3Config { X = 0.5f, Y = -1f, Z = 0.25f },
+                    ConeAngle = 22f, LightSize = 1.5f, LightSpin = 0.75f,
+                    BeamCount = 3, ConeShape = "triangle" },
             }
         };
 
@@ -873,6 +1132,16 @@ class Program
             if (x.Anchor != y.Anchor) return $"object[{i}].Anchor '{x.Anchor}' != '{y.Anchor}'";
             if (!Eq(x.RotateSpeed, y.RotateSpeed)) return $"object[{i}].RotateSpeed differs";
             if (!Eq(x.Radius, y.Radius)) return $"object[{i}].Radius differs";
+            if (!Eq(x.Power, y.Power)) return $"object[{i}].Power differs";
+            // ---- light-only rich fields ----
+            if (x.LightKind != y.LightKind) return $"object[{i}].LightKind '{x.LightKind}' != '{y.LightKind}'";
+            if (!Eq(x.Direction.X, y.Direction.X) || !Eq(x.Direction.Y, y.Direction.Y) || !Eq(x.Direction.Z, y.Direction.Z))
+                return $"object[{i}].Direction differs";
+            if (!Eq(x.ConeAngle, y.ConeAngle)) return $"object[{i}].ConeAngle differs";
+            if (!Eq(x.LightSize, y.LightSize)) return $"object[{i}].LightSize differs";
+            if (!Eq(x.LightSpin, y.LightSpin)) return $"object[{i}].LightSpin differs";
+            if (x.BeamCount != y.BeamCount) return $"object[{i}].BeamCount {x.BeamCount} != {y.BeamCount}";
+            if (x.ConeShape != y.ConeShape) return $"object[{i}].ConeShape '{x.ConeShape}' != '{y.ConeShape}'";
         }
         return null;
     }

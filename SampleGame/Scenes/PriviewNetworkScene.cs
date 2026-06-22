@@ -30,7 +30,6 @@ public class PriviewNetworkScene : Scene
     private Object3d? _floor;                              // the platform, tracked so a client can replace it
 
     private bool _ownLightEnabled;
-    private Light? _extraLight;
 
     // ---- Client world download (4b) ----
     private bool _awaitingWorld = false;   // client only: true until the server's world arrives
@@ -49,6 +48,9 @@ public class PriviewNetworkScene : Scene
     {
         public required WorldObject Descriptor;
         public required GameObject Instance;
+        // For a "light" object: the engine Light paired with the visible marker (Instance), so
+        // move/power/delete update BOTH. Null for ordinary mesh/primitive/sphere objects.
+        public Light? Light;
     }
 
     private bool _editMode = false;
@@ -67,17 +69,43 @@ public class PriviewNetworkScene : Scene
     private const float ScaleStep = 0.1f;
     private const float SpinStep = 0.1f;
     private const float RadiusStep = 0.1f;
+    private const float PowerStep = 50f;                 // light power adjust per N/M press
+    private const float DirStep = 0.15f;                 // light direction component adjust (then re-normalized)
+    private const float ConeStep = 2f;                   // spot cone half-angle, degrees per press
+    private const float AreaStep = 0.1f;                 // area light half-extent per press
+    private const float LightSpinStep = 0.2f;            // light direction sweep speed, rad/s per press
+    private const float LightMarkerScale = 0.3f;         // size of the small cube that marks a light
+    private static readonly Vector3 LightMarkerOffset = Vector3.Zero;  // Light sits exactly at its marker; the marker is a non-shadow-caster so there's no self-shadow to avoid
     private readonly HashSet<ConsoleKey> _prevDown = new();
     private int _saveFlash = 0;
     private string _saveMsg = "";
 
     // Properties-panel editable fields (read-only Type/Mesh are not in here).
-    private enum Field { PosX, PosY, PosZ, RotX, RotY, RotZ, Scale, RotateSpeed, Color, Radius }
+    private enum Field { PosX, PosY, PosZ, RotX, RotY, RotZ, Scale, RotateSpeed, Color, Radius,
+                         Power, Kind, DirX, DirY, DirZ, ConeAngle, AreaSize, Spin, Beams, Shape }
     private int _fieldIndex = 0;
 
-    private static Field[] EditableFields(string? type) => type == "sphere"
-        ? new[] { Field.PosX, Field.PosY, Field.PosZ, Field.Radius, Field.Color }
-        : new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.Scale, Field.RotateSpeed, Field.Color };
+    // Editable fields for the selected entry. A light's set depends on its Kind: every light shows
+    // Pos/Power/Color/Kind; directional/spot/area add Direction + Spin, spot adds Cone, area adds
+    // Size. Spheres and the rest are by type, as before.
+    private static Field[] FieldsFor(EditEntry e)
+    {
+        string type = e.Descriptor.Type ?? "";
+        if (type == "sphere")
+            return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.Radius, Field.Color };
+        if (type == "light")
+        {
+            var f = new List<Field> { Field.PosX, Field.PosY, Field.PosZ, Field.Power, Field.Color, Field.Kind };
+            switch (e.Light?.Kind ?? LightKind.Point)
+            {
+                case LightKind.Directional: f.AddRange(new[] { Field.DirX, Field.DirY, Field.DirZ, Field.Spin }); break;
+                case LightKind.Spot:        f.AddRange(new[] { Field.DirX, Field.DirY, Field.DirZ, Field.ConeAngle, Field.Beams, Field.Shape, Field.Spin }); break;
+                case LightKind.Area:        f.AddRange(new[] { Field.DirX, Field.DirY, Field.DirZ, Field.AreaSize, Field.Spin }); break;
+            }
+            return f.ToArray();
+        }
+        return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.Scale, Field.RotateSpeed, Field.Color };
+    }
 
 
     public PriviewNetworkScene(IDisplaysManagerAsync manager, WorldConfig world, bool isServer, string targetIp, int port, bool online = true) : base(manager)
@@ -89,8 +117,8 @@ public class PriviewNetworkScene : Scene
 
         _world = world;
         _ownLightEnabled = !world.Graphics.DisableCameraLight;
-        if (world.Graphics.ExtraLight)
-            _extraLight = new Light(new Vector3(2, 6, 0), 600f);
+        // The settings "extra light" is no longer a bare code Light here — the authority/solo injects
+        // it as a real editable "light" WorldObject in Start() (see MaybeInjectExtraLight).
 
         // Tunable starting framing: lower and nearly level so models sit near vertical center.
         _myCamera = new Camera(new Vector3(-5.5f, 1.5f, 0), new Vector3(0, 0, -0.05f));
@@ -144,7 +172,6 @@ public class PriviewNetworkScene : Scene
         BuildPlatform();
 
         if (_ownLightEnabled) AddLight(_mainLight);
-        if (_extraLight != null) AddLight(_extraLight);
 
         SetMainCamera(_myCamera);
 
@@ -154,6 +181,7 @@ public class PriviewNetworkScene : Scene
         _spawnTypes.Add("cylinder");
         _spawnTypes.Add("cone");
         _spawnTypes.Add("pyramid");
+        _spawnTypes.Add("light");
         _spawnTypes.AddRange(WorldManager.ListAvailableMeshes());
 
         // The world authority (server, and local solo) stamps stable sequential ids onto its
@@ -161,6 +189,7 @@ public class PriviewNetworkScene : Scene
         // alone — it adopts the server's ids verbatim when the world arrives (ApplyReceivedWorld).
         if (CanEdit)
         {
+            MaybeInjectExtraLight();   // authority/solo: add the settings extra light as a real object (once)
             for (int i = 0; i < _world.Objects.Count; i++)
                 _world.Objects[i].Id = i;
             _nextObjectId = _world.Objects.Count;
@@ -168,6 +197,26 @@ public class PriviewNetworkScene : Scene
 
         foreach (var obj in _world.Objects)
             BuildWorldObject(obj);
+    }
+
+    // The settings "extra light" toggle, realized as a full editable "light" WorldObject (so it gets
+    // a marker + Light via BuildWorldObject and is selectable/editable/saveable/syncable). Only the
+    // authority/solo injects (the client receives it through the synced config); idempotent — skipped
+    // when the world already contains any light (a saved/synced world won't be doubled). Call before
+    // the id-stamp so it earns a stable id like any other object.
+    private void MaybeInjectExtraLight()
+    {
+        if (!_world.Graphics.ExtraLight) return;
+        if (_world.Objects.Any(o => string.Equals(o.Type?.Trim(), "light", StringComparison.OrdinalIgnoreCase)))
+            return;
+        _world.Objects.Add(new WorldObject
+        {
+            Type = "light",
+            Position = new Vec3Config { X = 2f, Y = 6f, Z = 0f },
+            Power = 600f,
+            Color = "White",
+            LightKind = "point",
+        });
     }
 
     // Builds the platform from the current world (tracked in _floor so it can be replaced).
@@ -187,6 +236,7 @@ public class PriviewNetworkScene : Scene
     private EditEntry? BuildWorldObject(WorldObject o)
     {
         GameObject? instance = null;
+        Light? markerLight = null;
 
         string type = o.Type?.Trim().ToLowerInvariant() ?? "";
         switch (type)
@@ -248,12 +298,34 @@ public class PriviewNetworkScene : Scene
                 break;
             }
 
+            // A light = an engine Light PLUS a small bright MARKER that reflects its kind: Point => a
+            // cube; Directional/Spot => a cone/arrow aimed along Direction; Area => a flat square
+            // oriented by Direction (sized to the area half-extent). The Light sits a little above
+            // the marker (LightMarkerOffset) so the marker doesn't enclose it and self-shadow it.
+            // The EditEntry carries the Light (markerLight) so move/power/delete update BOTH.
+            case "light":
+            {
+                LightKind kind = ParseLightKind(o.LightKind);
+                Object3d marker = BuildLightMarker(kind, ToVec(o.Direction), o.LightSize);
+                marker.Position = ToVec(o.Position);
+                marker.Color = ParseColor(o.Color, ConsoleColor.Yellow);
+                marker.UpdateGeometry();
+                _models.Add(marker);
+                AddDisplaysObject(marker, castsShadow: false);   // a light marker is visual-only; it must not shadow
+                instance = marker;
+
+                markerLight = new Light(ToVec(o.Position) + LightMarkerOffset, o.Power);
+                ApplyLightFields(markerLight, o, ToVec(o.Position));   // kind/direction/cone/size/spin/color
+                AddLight(markerLight);
+                break;
+            }
+
             default:
                 Logger.Warning($"Unknown world object type '{o.Type}'; skipping.");
                 return null;
         }
 
-        var entry = new EditEntry { Descriptor = o, Instance = instance };
+        var entry = new EditEntry { Descriptor = o, Instance = instance, Light = markerLight };
         _editables.Add(entry);
         return entry;
     }
@@ -312,7 +384,7 @@ public class PriviewNetworkScene : Scene
     /// fresh WorldObject, keeping Type/Mesh/Anchor/Radius from the descriptor. Takes a
     /// GameObject so it covers both Object3d (mesh/cube) and Sphere instances.
     /// </summary>
-    public static WorldObject FromInstance(WorldObject descriptor, GameObject instance)
+    public static WorldObject FromInstance(WorldObject descriptor, GameObject instance, Light? light = null)
     {
         var o3d = instance as Object3d;
         return new WorldObject
@@ -322,12 +394,154 @@ public class PriviewNetworkScene : Scene
             Mesh = descriptor.Mesh,
             Anchor = descriptor.Anchor,
             Radius = (instance as Sphere)?.R ?? descriptor.Radius, // read the live radius for spheres
-            Position = FromVec(instance.Position),
+            Position = FromVec(instance.Position),                 // light: the marker's position
             Rotation = FromVec(instance.LocalRotate),
             Scale = o3d?.Scale ?? descriptor.Scale,
             Color = instance.Color.ToString(),
             RotateSpeed = o3d?.RotateSpeed ?? descriptor.RotateSpeed,
+            // ---- light read-back: every live light field flows back from the paired Light ----
+            Power = light?.LightPower ?? descriptor.Power,
+            LightKind = light != null ? LightKindToString(light.Kind) : descriptor.LightKind,
+            Direction = light != null ? FromVec(light.Direction) : descriptor.Direction,
+            ConeAngle = light?.ConeAngleDeg ?? descriptor.ConeAngle,
+            LightSize = light?.AreaSize ?? descriptor.LightSize,
+            LightSpin = light?.SpinSpeed ?? descriptor.LightSpin,
+            BeamCount = light?.BeamCount ?? descriptor.BeamCount,
+            ConeShape = light != null ? ConeShapeToString(light.ConeShape) : descriptor.ConeShape,
         };
+    }
+
+    // Pushes a light WorldObject's full state onto its engine Light (kind/direction/cone/size/spin/
+    // power + position from the marker). Shared by BuildWorldObject and the client's Modify handler.
+    private static void ApplyLightFields(Light light, WorldObject o, Vector3 markerPos)
+    {
+        light.Kind = ParseLightKind(o.LightKind);
+        Vector3 dir = ToVec(o.Direction);
+        light.Direction = dir.Length() > 1e-6f ? dir.Norm() : new Vector3(0f, -1f, 0f);
+        light.ConeAngleDeg = o.ConeAngle;
+        light.AreaSize = o.LightSize;
+        light.SpinSpeed = o.LightSpin;
+        light.BeamCount = Math.Max(1, o.BeamCount);
+        light.ConeShape = ParseConeShape(o.ConeShape);
+        light.LightPower = o.Power;
+        light.Rgb = ColorRgb.ToRgb(ParseColor(o.Color, ConsoleColor.White));   // the light's emission color
+        light.Position = markerPos + LightMarkerOffset;
+    }
+
+    private static LightKind ParseLightKind(string? s) => s?.Trim().ToLowerInvariant() switch
+    {
+        "directional" => LightKind.Directional,
+        "spot"        => LightKind.Spot,
+        "area"        => LightKind.Area,
+        _             => LightKind.Point,
+    };
+
+    private static string LightKindToString(LightKind k) => k switch
+    {
+        LightKind.Directional => "directional",
+        LightKind.Spot        => "spot",
+        LightKind.Area        => "area",
+        _                     => "point",
+    };
+
+    private static ConeShapeKind ParseConeShape(string? s) => s?.Trim().ToLowerInvariant() switch
+    {
+        "square"   => ConeShapeKind.Square,
+        "triangle" => ConeShapeKind.Triangle,
+        _          => ConeShapeKind.Circle,
+    };
+
+    private static string ConeShapeToString(ConeShapeKind k) => k switch
+    {
+        ConeShapeKind.Square   => "square",
+        ConeShapeKind.Triangle => "triangle",
+        _                      => "circle",
+    };
+
+    // Keeps a light's engine Light co-located with its (movable) marker: the Light sits a small
+    // fixed offset above the marker so the marker doesn't enclose it. No-op for non-light entries.
+    private static void SyncLightToMarker(EditEntry entry)
+    {
+        if (entry.Light != null)
+            entry.Light.Position = entry.Instance.Position + LightMarkerOffset;
+    }
+
+    // The kind-specific marker mesh, pre-oriented along Direction: Point => cube; Directional/Spot
+    // => a cone whose apex points along Direction (the way it shines); Area => a flat double-sided
+    // square whose face faces Direction, scaled to the area half-extent. (A single oriented mesh per
+    // kind, rather than cube+cone, keeps one pickable Instance per entry.)
+    private static Object3d BuildLightMarker(LightKind kind, Vector3 dir, float areaSize)
+    {
+        switch (kind)
+        {
+            case LightKind.Directional:
+            case LightKind.Spot:
+            {
+                var m = CreateCone();
+                m.Scale = LightMarkerScale;
+                m.LocalRotate = DirToEuler(dir);
+                return m;
+            }
+            case LightKind.Area:
+            {
+                var m = CreateSquareMarker();
+                m.Scale = MathF.Max(0.05f, areaSize);
+                m.LocalRotate = DirToEuler(dir);
+                return m;
+            }
+            default:   // Point: direction is meaningless, so the cube stays axis-aligned
+            {
+                var m = CreateCube();
+                m.Scale = LightMarkerScale;
+                return m;
+            }
+        }
+    }
+
+    // Euler (X,Y,Z) angles that rotate the marker's local +Y axis onto unit direction d, with roll
+    // left at 0 (Object3d applies X then Y then Z). Falls back to straight-down if d collapses.
+    private static Vector3 DirToEuler(Vector3 d)
+    {
+        if (d.Length() < 1e-6f) d = new Vector3(0f, -1f, 0f);
+        d = d.Norm();
+        float rx = MathF.Acos(Math.Clamp(d.Y, -1f, 1f));   // tilt away from +Y
+        float ry = MathF.Atan2(d.X, d.Z);                  // heading in the XZ plane
+        return new Vector3(rx, ry, 0f);
+    }
+
+    // A flat unit square in the XZ plane (±1), double-sided so it shows from either side once
+    // oriented (a single-sided plane would vanish when its back faces the camera).
+    private static Object3d CreateSquareMarker()
+    {
+        var verts = new List<Vector3>
+        {
+            new Vector3(-1f, 0f,  1f),   // 1
+            new Vector3( 1f, 0f,  1f),   // 2
+            new Vector3(-1f, 0f, -1f),   // 3
+            new Vector3( 1f, 0f, -1f),   // 4
+        };
+        var tris = new List<(int, int, int)>
+        {
+            (2, 3, 1), (2, 4, 3),   // +Y face
+            (1, 3, 2), (3, 4, 2),   // -Y face (reverse winding)
+        };
+        return BuildFlat(verts, tris);
+    }
+
+    // Swaps an entry's marker mesh for a fresh one (carrying over position + color), keeping it
+    // selectable in place. Used when a light's Kind changes so the marker morphs cube<->cone<->square.
+    private void ReplaceMarker(EditEntry entry, Object3d fresh)
+    {
+        var old = entry.Instance;
+        fresh.Position = old.Position;
+        fresh.Color = old.Color;
+        fresh.UpdateGeometry();
+
+        if (old is IDisplays oldDisp) RemoveDisplaysObject(oldDisp);
+        if (old is Object3d oldO) _models.Remove(oldO);
+        _models.Add(fresh);
+        AddDisplaysObject(fresh, castsShadow: false);   // markers stay visual-only after a kind morph
+        entry.Instance = fresh;
     }
 
     private static Vector3 ToVec(Vec3Config v) => new Vector3(v.X, v.Y, v.Z);
@@ -365,6 +579,8 @@ public class PriviewNetworkScene : Scene
                 m.UpdateGeometry();
             }
 
+        AdvanceLights();   // sweep each light's Direction by its spin (no-op for point/zero-speed lights)
+
         if (_isChatting)
         {
             HandleChatInput();
@@ -391,7 +607,7 @@ public class PriviewNetworkScene : Scene
         if (_online && _isServer && _editDirty && _selected >= 0 && _selected < _editables.Count)
         {
             var entry = _editables[_selected];
-            var o = FromInstance(entry.Descriptor, entry.Instance);   // carries the stable id
+            var o = FromInstance(entry.Descriptor, entry.Instance, entry.Light);   // carries the stable id (+ light power)
             _netManager?.SendPacket(
                 new WorldEditPacket { Op = 0, Id = o.Id, ObjectJson = JsonSerializer.Serialize(o) },
                 _myNetId);
@@ -457,7 +673,7 @@ public class PriviewNetworkScene : Scene
         if (_selected >= 0 && _selected < _editables.Count)
         {
             // Properties panel: navigate fields (,/.) stays open so a client can inspect.
-            var fields = EditableFields(_editables[_selected].Descriptor.Type);
+            var fields = FieldsFor(_editables[_selected]);
             if (Pressed(ConsoleKey.OemComma))  _fieldIndex = (_fieldIndex - 1 + fields.Length) % fields.Length;
             if (Pressed(ConsoleKey.OemPeriod)) _fieldIndex = (_fieldIndex + 1) % fields.Length;
             _fieldIndex = Math.Clamp(_fieldIndex, 0, fields.Length - 1);
@@ -476,17 +692,19 @@ public class PriviewNetworkScene : Scene
 
                 if (delta.X != 0f || delta.Y != 0f || delta.Z != 0f)
                 {
-                    var inst = _editables[_selected].Instance;
+                    var entry = _editables[_selected];
+                    var inst = entry.Instance;
                     inst.Position += delta;
                     if (inst is Object3d o) o.UpdateGeometry();
+                    SyncLightToMarker(entry);   // a light's Light follows its marker
                     _editDirty = true;
                 }
 
-                // Adjust the active field (N/M) — covers pos/rot/scale/spin/color/radius.
+                // Adjust the active field (N/M) — covers pos/rot/scale/spin/color/radius/power.
                 int dir = 0;
                 if (Pressed(ConsoleKey.N)) dir = -1;
                 if (Pressed(ConsoleKey.M)) dir = +1;
-                if (dir != 0) { AdjustField(fields[_fieldIndex], _editables[_selected].Instance, dir); _editDirty = true; }
+                if (dir != 0) { AdjustField(fields[_fieldIndex], _editables[_selected], dir); _editDirty = true; }
 
                 // Delete the selected object.
                 if (Pressed(ConsoleKey.Delete)) DeleteSelected();
@@ -498,15 +716,16 @@ public class PriviewNetworkScene : Scene
             SaveWorld();
     }
 
-    // Applies a single decrease/increase (dir = -1/+1) to the active field on the live instance.
-    private void AdjustField(Field f, GameObject inst, int dir)
+    // Applies a single decrease/increase (dir = -1/+1) to the active field on the selected entry.
+    private void AdjustField(Field f, EditEntry entry, int dir)
     {
+        var inst = entry.Instance;
         var o = inst as Object3d;
         switch (f)
         {
-            case Field.PosX: inst.Position.X += dir * MoveStep; o?.UpdateGeometry(); break;
-            case Field.PosY: inst.Position.Y += dir * MoveStep; o?.UpdateGeometry(); break;
-            case Field.PosZ: inst.Position.Z += dir * MoveStep; o?.UpdateGeometry(); break;
+            case Field.PosX: inst.Position.X += dir * MoveStep; o?.UpdateGeometry(); SyncLightToMarker(entry); break;
+            case Field.PosY: inst.Position.Y += dir * MoveStep; o?.UpdateGeometry(); SyncLightToMarker(entry); break;
+            case Field.PosZ: inst.Position.Z += dir * MoveStep; o?.UpdateGeometry(); SyncLightToMarker(entry); break;
             case Field.RotX: inst.LocalRotate.X += dir * RotStep; o?.UpdateGeometry(); break;
             case Field.RotY: inst.LocalRotate.Y += dir * RotStep; o?.UpdateGeometry(); break;
             case Field.RotZ: inst.LocalRotate.Z += dir * RotStep; o?.UpdateGeometry(); break;
@@ -518,11 +737,69 @@ public class PriviewNetworkScene : Scene
                 break;
             case Field.Color:
                 inst.Color = CycleColor(inst.Color, dir);
+                if (entry.Light != null) entry.Light.Rgb = ColorRgb.ToRgb(inst.Color);   // light emits the marker color
                 break;
             case Field.Radius:
                 if (inst is Sphere s) s.R = MathF.Max(0.01f, s.R + dir * RadiusStep);
                 break;
+            case Field.Power:
+                if (entry.Light != null) entry.Light.LightPower = MathF.Max(0f, entry.Light.LightPower + dir * PowerStep);
+                break;
+            case Field.Kind:
+                if (entry.Light != null)
+                {
+                    int n = Enum.GetValues<LightKind>().Length;
+                    entry.Light.Kind = (LightKind)((((int)entry.Light.Kind + dir) % n + n) % n);
+                    // Morph the marker mesh (cube <-> cone <-> square) to match the new kind.
+                    ReplaceMarker(entry, BuildLightMarker(entry.Light.Kind, entry.Light.Direction, entry.Light.AreaSize));
+                }
+                break;
+            case Field.DirX: AdjustDirection(entry, new Vector3(dir * DirStep, 0f, 0f)); break;
+            case Field.DirY: AdjustDirection(entry, new Vector3(0f, dir * DirStep, 0f)); break;
+            case Field.DirZ: AdjustDirection(entry, new Vector3(0f, 0f, dir * DirStep)); break;
+            case Field.ConeAngle:
+                if (entry.Light != null) entry.Light.ConeAngleDeg = Math.Clamp(entry.Light.ConeAngleDeg + dir * ConeStep, 1f, 89f);
+                break;
+            case Field.AreaSize:
+                if (entry.Light != null)
+                {
+                    entry.Light.AreaSize = MathF.Max(0.05f, entry.Light.AreaSize + dir * AreaStep);
+                    if (entry.Light.Kind == LightKind.Area && entry.Instance is Object3d am)
+                    { am.Scale = entry.Light.AreaSize; am.UpdateGeometry(); }   // square marker tracks the area size
+                }
+                break;
+            case Field.Spin:
+                if (entry.Light != null) entry.Light.SpinSpeed += dir * LightSpinStep;
+                break;
+            case Field.Beams:
+                if (entry.Light != null) entry.Light.BeamCount = Math.Clamp(entry.Light.BeamCount + dir, 1, 8);
+                break;
+            case Field.Shape:
+                if (entry.Light != null)
+                {
+                    int n = Enum.GetValues<ConeShapeKind>().Length;
+                    entry.Light.ConeShape = (ConeShapeKind)((((int)entry.Light.ConeShape + dir) % n + n) % n);
+                }
+                break;
         }
+    }
+
+    // Nudges one light's Direction by delta and re-normalizes (kept a unit vector; falls back to
+    // straight down if it collapses to zero), then re-aims the marker to match.
+    private static void AdjustDirection(EditEntry entry, Vector3 delta)
+    {
+        if (entry.Light == null) return;
+        Vector3 d = entry.Light.Direction + delta;
+        entry.Light.Direction = d.Length() > 1e-6f ? d.Norm() : new Vector3(0f, -1f, 0f);
+        OrientLightMarker(entry);
+    }
+
+    // Re-aims a light's marker along its current Direction (no-op for a point light: its cube stays
+    // axis-aligned). Only the orientation changes; the mesh is left as-is.
+    private static void OrientLightMarker(EditEntry entry)
+    {
+        if (entry.Light == null || entry.Light.Kind == LightKind.Point) return;
+        if (entry.Instance is Object3d m) { m.LocalRotate = DirToEuler(entry.Light.Direction); m.UpdateGeometry(); }
     }
 
     private static ConsoleColor CycleColor(ConsoleColor c, int dir)
@@ -553,6 +830,7 @@ public class PriviewNetworkScene : Scene
         var entry = _editables[index];
         if (entry.Instance is IDisplays disp) RemoveDisplaysObject(disp);
         if (entry.Instance is Object3d o) _models.Remove(o);
+        if (entry.Light != null) RemoveLight(entry.Light);   // a light: actually turn it off, not just hide the marker
         _editables.RemoveAt(index);
 
         if (_editables.Count == 0) _selected = -1;
@@ -574,13 +852,14 @@ public class PriviewNetworkScene : Scene
         spawnPos.Y = 0f; // ground level
 
         string label = _spawnTypes[_spawnIndex];
-        // The built-in primitives keep their label as the Type; anything else is a library mesh.
-        bool isPrimitive = label is "cube" or "sphere" or "cylinder" or "cone" or "pyramid";
+        // The built-in types (primitives + light) keep their label as the Type; anything else is a
+        // library mesh.
+        bool isBuiltIn = label is "cube" or "sphere" or "cylinder" or "cone" or "pyramid" or "light";
         var descriptor = new WorldObject
         {
             Id = _nextObjectId++,   // unique stable id (only the authority spawns; 5b broadcasts it)
-            Type = isPrimitive ? label : "mesh",
-            Mesh = isPrimitive ? null : label,
+            Type = isBuiltIn ? label : "mesh",
+            Mesh = isBuiltIn ? null : label,
             Position = FromVec(spawnPos),
             Scale = 1f,
             Color = "White",
@@ -637,7 +916,7 @@ public class PriviewNetworkScene : Scene
         Name = _world.Name,
         Graphics = _world.Graphics,
         Platform = _world.Platform,
-        Objects = _editables.Select(e => FromInstance(e.Descriptor, e.Instance)).ToList(),
+        Objects = _editables.Select(e => FromInstance(e.Descriptor, e.Instance, e.Light)).ToList(),
     };
 
     // Edge-triggered key press (true only on the frame the key transitions to down).
@@ -690,9 +969,8 @@ public class PriviewNetworkScene : Scene
         else
         {
             var entry = _editables[_selected];
-            var inst = entry.Instance;
             string type = entry.Descriptor.Type ?? "";
-            var fields = EditableFields(type);
+            var fields = FieldsFor(entry);
             Field active = fields[Math.Clamp(_fieldIndex, 0, fields.Length - 1)];
 
             // Read-only header.
@@ -704,7 +982,7 @@ public class PriviewNetworkScene : Scene
             foreach (var f in fields)
             {
                 bool on = f == active;
-                string line = $"{(on ? ">" : " ")} {FieldLabel(f)}: {FieldValue(f, inst)}";
+                string line = $"{(on ? ">" : " ")} {FieldLabel(f)}: {FieldValue(f, entry)}";
                 lines.Add((line, on ? ConsoleColor.Cyan : ConsoleColor.Gray));
             }
 
@@ -771,11 +1049,16 @@ public class PriviewNetworkScene : Scene
         Field.PosX => "Pos X", Field.PosY => "Pos Y", Field.PosZ => "Pos Z",
         Field.RotX => "Rot X", Field.RotY => "Rot Y", Field.RotZ => "Rot Z",
         Field.Scale => "Scale", Field.RotateSpeed => "Spin", Field.Color => "Color",
-        Field.Radius => "Radius", _ => f.ToString()
+        Field.Radius => "Radius", Field.Power => "Power",
+        Field.Kind => "Kind", Field.DirX => "Dir X", Field.DirY => "Dir Y", Field.DirZ => "Dir Z",
+        Field.ConeAngle => "Cone", Field.AreaSize => "Size", Field.Spin => "Spin",
+        Field.Beams => "Beams", Field.Shape => "Shape",
+        _ => f.ToString()
     };
 
-    private static string FieldValue(Field f, GameObject inst)
+    private static string FieldValue(Field f, EditEntry entry)
     {
+        var inst = entry.Instance;
         var o = inst as Object3d;
         return f switch
         {
@@ -789,9 +1072,23 @@ public class PriviewNetworkScene : Scene
             Field.RotateSpeed => (o?.RotateSpeed ?? 0f).ToString("F2"),
             Field.Color => inst.Color.ToString(),
             Field.Radius => (inst as Sphere)?.R.ToString("F2") ?? "-",
+            Field.Power => (entry.Light?.LightPower ?? entry.Descriptor.Power).ToString("F0"),
+            Field.Kind => entry.Light != null ? LightKindToString(entry.Light.Kind) : "-",
+            Field.DirX => (entry.Light?.Direction.X ?? 0f).ToString("F2"),
+            Field.DirY => (entry.Light?.Direction.Y ?? 0f).ToString("F2"),
+            Field.DirZ => (entry.Light?.Direction.Z ?? 0f).ToString("F2"),
+            Field.ConeAngle => (entry.Light?.ConeAngleDeg ?? 0f).ToString("F0"),
+            Field.AreaSize => (entry.Light?.AreaSize ?? 0f).ToString("F2"),
+            Field.Spin => (entry.Light?.SpinSpeed ?? 0f).ToString("F2"),
+            Field.Beams => (entry.Light?.BeamCount ?? 1).ToString(),
+            Field.Shape => entry.Light != null ? ConeShapeToString(entry.Light.ConeShape) : "-",
             _ => ""
         };
     }
+
+    // Inspection/test accessor: the live editable entries (each pairs a descriptor with its
+    // instance, plus a Light for "light" objects). Read-only.
+    public IReadOnlyList<EditEntry> EditableEntries => _editables;
     
     
     private void HandleGameInput(float dt)
@@ -990,6 +1287,14 @@ public class PriviewNetworkScene : Scene
         }
         ApplyToInstance(o, _editables[idx].Instance);
         _editables[idx].Descriptor = o;
+        // A light: push the FULL new state (kind/direction/cone/size/spin/power/color) onto the
+        // paired Light, co-located with the (just-moved) marker — not just position+power — then
+        // morph + re-aim the client's marker so it mirrors the server's kind/direction/size.
+        if (_editables[idx].Light is Light light)
+        {
+            ApplyLightFields(light, o, _editables[idx].Instance.Position);
+            ReplaceMarker(_editables[idx], BuildLightMarker(light.Kind, light.Direction, light.AreaSize));
+        }
     }
 
     // Writes one received mesh to received/<name>.obj (idempotent overwrite). Shared by the 4b
@@ -1013,7 +1318,10 @@ public class PriviewNetworkScene : Scene
 
         // 2) Tear down the current world's objects + platform (camera stays; lights reconciled below).
         foreach (var e in _editables)
+        {
             if (e.Instance is IDisplays disp) RemoveDisplaysObject(disp);
+            if (e.Light != null) RemoveLight(e.Light);   // drop a light object's engine Light too
+        }
         _editables.Clear();
         _models.Clear();
         _selected = -1;
@@ -1036,16 +1344,8 @@ public class PriviewNetworkScene : Scene
         if (!wantOwn && _ownLightEnabled) RemoveLight(_mainLight);
         _ownLightEnabled = wantOwn;
 
-        if (_world.Graphics.ExtraLight && _extraLight == null)
-        {
-            _extraLight = new Light(new Vector3(2, 6, 0), 600f);
-            AddLight(_extraLight);
-        }
-        else if (!_world.Graphics.ExtraLight && _extraLight != null)
-        {
-            RemoveLight(_extraLight);
-            _extraLight = null;
-        }
+        // The settings extra light is now a normal "light" object inside the received config and was
+        // already built in step 3 — no separate reconcile needed (the camera light above stays special).
 
         // 5) Done — drop the waiting overlay (replace on a repeat send).
         _awaitingWorld = false;

@@ -11,14 +11,14 @@ public abstract class Screen
     public int Height { get; }
 
     protected readonly float[] BrightnessBuffer;
-    protected readonly ConsoleColor[] ColorBuffer;
+    protected readonly Rgb24[] ColorBuffer;
 
     protected Screen(int width, int height)
     {
         Width = width;
         Height = height;
         BrightnessBuffer = new float[width * height];
-        ColorBuffer = new ConsoleColor[width * height];
+        ColorBuffer = new Rgb24[width * height];
     }
 
     public virtual void RenderFrame(Scene scene)

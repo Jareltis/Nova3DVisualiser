@@ -47,7 +47,7 @@ public class Vec3Config
 public class WorldObject
 {
     public int Id { get; set; }                       // stable per-object id (server assigns; client adopts verbatim)
-    public string Type { get; set; } = "mesh";        // "mesh" | "cube" | "sphere"
+    public string Type { get; set; } = "mesh";        // "mesh" | "cube" | "sphere" | primitives | "light"
     public string? Mesh { get; set; }                 // mesh name in models/ (Type "mesh")
     public Vec3Config Position { get; set; } = new();
     public Vec3Config Rotation { get; set; } = new();
@@ -56,4 +56,13 @@ public class WorldObject
     public string Anchor { get; set; } = "Bottom";    // mesh only: Bottom | Center | Origin
     public float RotateSpeed { get; set; } = 0f;      // continuous spin about Y
     public float Radius { get; set; } = 1f;           // sphere only
+    public float Power { get; set; } = 500f;          // light only: engine Light.LightPower
+    // ---- light-only rich fields (ignored for other types) ----
+    public string LightKind { get; set; } = "point";  // point | directional | spot | area
+    public Vec3Config Direction { get; set; } = new Vec3Config { X = 0f, Y = -1f, Z = 0f };  // aim (dir/spot/area)
+    public float ConeAngle { get; set; } = 30f;        // spot: cone half-angle (degrees)
+    public float LightSize { get; set; } = 1f;         // area: square half-extent
+    public float LightSpin { get; set; } = 0f;         // sweep speed of Direction about Y (rad/s)
+    public int BeamCount { get; set; } = 1;            // spot: cones fanned evenly about the aim (>=1; 1 == single cone)
+    public string ConeShape { get; set; } = "circle";  // spot: cone cross-section "circle" | "square" | "triangle"
 }
