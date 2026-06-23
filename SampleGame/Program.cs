@@ -12,6 +12,7 @@ using Nova3DVisualiser.StaticClass;
 using SampleGame.NetworkPackets;
 using SampleGame.Scenes;
 using SampleGame.Worlds;
+using System.Text.Json;
 using Terminal.Gui;
 
 namespace SampleGame;
@@ -30,6 +31,9 @@ class Program
         if (args.Length > 0 && args[0] == "picktest") { PickSelfTest(); return; }
         if (args.Length > 0 && args[0] == "worldsynctest") { WorldSyncSelfTest(); return; }
         if (args.Length > 0 && args[0] == "colortest") { ColorSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "collisiontest") { CollisionSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "physicstest") { PhysicsSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "gputest") { GpuSelfTest(); return; }
 
         // Crash net: the render loop is async + parallel (Parallel.For), so a crash on a worker
         // thread or an unobserved task never reaches the try/catch below. Capture those globally
@@ -177,10 +181,35 @@ class Program
         var scene = new PriviewNetworkScene(new DisplayManagerAsync(), chosenWorld, isServer, ip, port, online);
         scene.EnableShadows = chosenWorld.Graphics.Shadows;
 
+        // Pick the renderer the world asked for. "gpu" tries an NVIDIA/ILGPU screen and silently
+        // falls back to the CPU screen if no usable GPU is present (logged + printed once).
+        Screen screen;
+        if (string.Equals(chosenWorld.Graphics.Renderer, "gpu", StringComparison.OrdinalIgnoreCase))
+        {
+            var gpu = Nova3DVisualiser.Gpu.GpuScreen.TryCreate(out string gpuStatus);
+            if (gpu != null)
+            {
+                Logger.Info($"GPU renderer active: {gpuStatus}");
+                Console.WriteLine($"GPU renderer: {gpuStatus}");
+                screen = gpu;
+            }
+            else
+            {
+                Logger.Warning($"GPU renderer unavailable ({gpuStatus}); falling back to CPU.");
+                Console.WriteLine($"GPU unavailable ({gpuStatus}) — using CPU renderer.");
+                Thread.Sleep(900);
+                screen = new ConsoleScreenAsync();
+            }
+        }
+        else
+        {
+            screen = new ConsoleScreenAsync();
+        }
+
         Logger.Info("Scene constructed, entering render loop");
         try
         {
-            new Frame(scene, new ConsoleScreenAsync()).MainLoop();
+            new Frame(scene, screen).MainLoop();
         }
         catch (Exception ex) { Logger.Error("Unhandled exception in main loop", ex); throw; }
         //new Frame(new PreviewScene(new DisplayManagerAsync()), new ConsoleScreenAsync()).MainLoop();
@@ -384,6 +413,12 @@ class Program
         var cbBvh = new CheckBox("BVH acceleration", true) { X = 1, Y = 4 };
         var cbExtra = new CheckBox("Extra fixed light", false) { X = 1, Y = 5 };
         var cbDisableOwn = new CheckBox("Disable camera light", false) { X = 1, Y = 6 };
+        var rgRenderer = new RadioGroup(new ustring[] { "CPU", "GPU (NVIDIA)" }, 0)
+        {
+            X = 11, Y = 7,
+            DisplayMode = DisplayModeLayout.Horizontal,
+            HorizontalSpace = 2,
+        };
         var cbPlatform = new CheckBox("Include platform", true) { X = 1, Y = 8 };
         var rgShape = new RadioGroup(new ustring[] { "Square", "Rectangle", "Circle" }, 0)
         {
@@ -394,6 +429,9 @@ class Program
         var sizeField = new TextField("10") { X = 22, Y = 11, Width = 8 };
         var widthField = new TextField("20") { X = 22, Y = 12, Width = 8 };
         var depthField = new TextField("20") { X = 33, Y = 12, Width = 8 };
+        var cbGravity = new CheckBox("Gravity", false) { X = 1, Y = 14 };
+        var cbCollision = new CheckBox("Collision", true) { X = 20, Y = 14 };
+        var gravityField = new TextField("9.8") { X = 22, Y = 15, Width = 8 };
 
         var create = new Button("Create", is_default: true);
         var back = new Button("Back");
@@ -416,6 +454,7 @@ class Program
                     Bvh = cbBvh.Checked,
                     ExtraLight = cbExtra.Checked,
                     DisableCameraLight = cbDisableOwn.Checked,
+                    Renderer = rgRenderer.SelectedItem == 1 ? "gpu" : "cpu",
                 },
                 Platform = new PlatformConfig
                 {
@@ -427,6 +466,12 @@ class Program
                     Color = "Yellow",
                 },
                 Objects = new List<WorldObject>(),
+                Physics = new PhysicsConfig
+                {
+                    GravityEnabled = cbGravity.Checked,
+                    GravityStrength = float.TryParse(gravityField.Text?.ToString(), out var g) ? g : 9.8f,
+                    CollisionEnabled = cbCollision.Checked,
+                },
             };
             WorldManager.Save(w);
             built = w;
@@ -434,15 +479,18 @@ class Program
             Application.RequestStop();
         };
 
-        var dialog = new Dialog("Create world", 56, 17, create, back);
+        var dialog = new Dialog("Create world", 56, 20, create, back);
         dialog.Add(
             new Label("World name:") { X = 1, Y = 0 }, nameField,
             new Label("Graphics (Space toggles):") { X = 1, Y = 2 },
             cbShadows, cbBvh, cbExtra, cbDisableOwn,
+            new Label("Renderer:") { X = 1, Y = 7 }, rgRenderer,
             cbPlatform,
             new Label("Platform shape:") { X = 1, Y = 9 }, rgShape,
             new Label("Size (square/circle):") { X = 1, Y = 11 }, sizeField,
-            new Label("Rect W x D:") { X = 1, Y = 12 }, widthField, depthField);
+            new Label("Rect W x D:") { X = 1, Y = 12 }, widthField, depthField,
+            new Label("Physics (Space toggles):") { X = 1, Y = 13 }, cbGravity, cbCollision,
+            new Label("Gravity strength:") { X = 1, Y = 15 }, gravityField);
         RunStepDialog(dialog);
 
         world = built;
@@ -651,7 +699,8 @@ class Program
         var shaped = new WorldConfig
         {
             Name = "platshapetest",
-            Platform = new PlatformConfig { Enabled = true, Shape = "rectangle", Size = 9f, Width = 14f, Depth = 6f, Color = "Cyan" },
+            Platform = new PlatformConfig { Enabled = true, Shape = "rectangle", Size = 9f, Width = 14f, Depth = 6f, Color = "Cyan",
+                Position = new Vec3Config { X = 3f, Y = 1f, Z = -2f } },
         };
         string shapedJson = System.Text.Json.JsonSerializer.Serialize(shaped, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
         var reloaded = System.Text.Json.JsonSerializer.Deserialize<WorldConfig>(shapedJson,
@@ -659,9 +708,10 @@ class Program
         if (reloaded == null) { Console.WriteLine("WORLD TEST FAILED: could not deserialize round-tripped world."); return; }
         var rp = reloaded.Platform;
         if (rp.Shape != "rectangle" || Math.Abs(rp.Size - 9f) > 1e-4f ||
-            Math.Abs(rp.Width - 14f) > 1e-4f || Math.Abs(rp.Depth - 6f) > 1e-4f)
-        { Console.WriteLine($"WORLD TEST FAILED: platform fields did not round-trip (shape={rp.Shape}, size={rp.Size}, w={rp.Width}, d={rp.Depth})."); return; }
-        Console.WriteLine($"Platform round-trip OK: shape={rp.Shape}, size={rp.Size}, w={rp.Width}, d={rp.Depth}");
+            Math.Abs(rp.Width - 14f) > 1e-4f || Math.Abs(rp.Depth - 6f) > 1e-4f ||
+            Math.Abs(rp.Position.X - 3f) > 1e-4f || Math.Abs(rp.Position.Y - 1f) > 1e-4f || Math.Abs(rp.Position.Z + 2f) > 1e-4f)
+        { Console.WriteLine($"WORLD TEST FAILED: platform fields did not round-trip (shape={rp.Shape}, size={rp.Size}, w={rp.Width}, d={rp.Depth}, pos=({rp.Position.X},{rp.Position.Y},{rp.Position.Z}))."); return; }
+        Console.WriteLine($"Platform round-trip OK: shape={rp.Shape}, size={rp.Size}, w={rp.Width}, d={rp.Depth}, pos=({rp.Position.X},{rp.Position.Y},{rp.Position.Z})");
 
         // Build a rectangle and a circle platform: each must produce real geometry.
         var rect = PriviewNetworkScene.CreatePlatform(new PlatformConfig { Shape = "rectangle", Width = 14f, Depth = 6f });
@@ -748,14 +798,14 @@ class Program
         Object3d cube = PriviewNetworkScene.CreateCube();
         cube.Position = new Vector3(descriptor.Position.X, descriptor.Position.Y, descriptor.Position.Z);
         cube.Scale = descriptor.Scale;
-        if (Enum.TryParse<ConsoleColor>(descriptor.Color, true, out var col)) cube.Color = col;
+        cube.Color = PriviewNetworkScene.ParseColor(descriptor.Color, Rgba32.White);
 
         // Mutate the instance across every editable property (as the panel would).
         cube.Position += new Vector3(5f, 0f, 0f);
         cube.LocalRotate = new Vector3(0.25f, 0.5f, -0.75f);
         cube.Scale = 3.5f;
         cube.RotateSpeed = 1.25f;
-        cube.Color = ConsoleColor.Green;
+        cube.Color = PriviewNetworkScene.ParseColor("Green", Rgba32.White);
 
         WorldObject back = PriviewNetworkScene.FromInstance(descriptor, cube);
 
@@ -773,7 +823,24 @@ class Program
             Math.Abs(back.Rotation.Z + 0.75f) < 1e-4f &&
             Math.Abs(back.Scale - 3.5f) < 1e-4f &&
             Math.Abs(back.RotateSpeed - 1.25f) < 1e-4f &&
-            back.Color == "Green";
+            PriviewNetworkScene.ParseColor(back.Color, Rgba32.White) == PriviewNetworkScene.ParseColor("Green", Rgba32.White);
+
+        // Full-RGBA round-trip: a NON-palette color WITH non-opaque alpha must survive the
+        // Rgba32 -> hex -> Rgba32 path (alpha via "#C8327B80"), proving arbitrary 24-bit color + alpha
+        // persists (not just named presets). Opaque colors must still emit "#RRGGBB" (no alpha byte).
+        {
+            cube.Color = new Rgba32(200, 50, 123, 128);
+            WorldObject rgbBack = PriviewNetworkScene.FromInstance(descriptor, cube);
+            bool rgbOk = PriviewNetworkScene.ParseColor(rgbBack.Color, Rgba32.White) == new Rgba32(200, 50, 123, 128);
+
+            cube.Color = new Rgba32(200, 50, 123);   // opaque (A=255) -> "#RRGGBB", no alpha byte
+            WorldObject opqBack = PriviewNetworkScene.FromInstance(descriptor, cube);
+            bool opqOk = opqBack.Color == "#C8327B" &&
+                         PriviewNetworkScene.ParseColor(opqBack.Color, Rgba32.White) == new Rgba32(200, 50, 123);
+
+            Console.WriteLine($"  full-rgba: (200,50,123,128) -> hex={rgbBack.Color}; opaque -> {opqBack.Color} -> {(rgbOk && opqOk ? "ok" : "BAD")}");
+            ok &= rgbOk && opqOk;
+        }
 
         // Cover the generated primitives: each builds with geometry, and FromInstance round-trips
         // its Type/transform/color exactly like the cube (they ride the same editor/save/sync path).
@@ -789,7 +856,7 @@ class Program
             prim.LocalRotate = new Vector3(0.1f, 0.2f, 0.3f);
             prim.Scale = 1.5f;
             prim.RotateSpeed = 0.7f;
-            prim.Color = ConsoleColor.Red;
+            prim.Color = PriviewNetworkScene.ParseColor("Red", Rgba32.White);
 
             WorldObject b = PriviewNetworkScene.FromInstance(desc, prim);
             bool pok =
@@ -798,7 +865,7 @@ class Program
                 Math.Abs(b.Position.X - 4f) < 1e-4f && Math.Abs(b.Position.Y - 5f) < 1e-4f && Math.Abs(b.Position.Z - 6f) < 1e-4f &&
                 Math.Abs(b.Rotation.X - 0.1f) < 1e-4f && Math.Abs(b.Rotation.Y - 0.2f) < 1e-4f && Math.Abs(b.Rotation.Z - 0.3f) < 1e-4f &&
                 Math.Abs(b.Scale - 1.5f) < 1e-4f && Math.Abs(b.RotateSpeed - 0.7f) < 1e-4f &&
-                b.Color == "Red";
+                PriviewNetworkScene.ParseColor(b.Color, Rgba32.White) == PriviewNetworkScene.ParseColor("Red", Rgba32.White);
 
             Console.WriteLine($"  {type}: faces={prim.FaceCount}, back type={b.Type}, scale={b.Scale}, color={b.Color} -> {(pok ? "ok" : "BAD")}");
             ok &= pok;
@@ -843,13 +910,15 @@ class Program
                 var e = lightEntries[i];
                 var orig = lightWorld.Objects[i];                 // the descriptor we fed in (round-trip target)
                 var marker = e.Instance as Object3d;
+                float wantInfluence = 0.05f + 0.2f * i;           // mutate per-light ColorInfluence; must round-trip
+                e.Light!.ColorInfluence = wantInfluence;
                 WorldObject lb = PriviewNetworkScene.FromInstance(e.Descriptor, e.Instance, e.Light);
                 bool one =
                     marker != null && marker.FaceCount > 0 &&                       // marker is visible
                     e.Light!.Kind == expectKinds[i] &&                              // scene gained a Light of this kind
                     lb.Type == "light" && lb.Mesh == null &&
                     lb.LightKind == orig.LightKind &&                              // kind round-trips
-                    lb.Color == orig.Color &&                                     // color round-trips
+                    PriviewNetworkScene.ParseColor(lb.Color, Rgba32.White) == PriviewNetworkScene.ParseColor(orig.Color, Rgba32.White) &&   // color round-trips
                     Math.Abs(lb.Direction.X - orig.Direction.X) < 1e-4f &&         // direction round-trips (already unit)
                     Math.Abs(lb.Direction.Y - orig.Direction.Y) < 1e-4f &&
                     Math.Abs(lb.Direction.Z - orig.Direction.Z) < 1e-4f &&
@@ -859,6 +928,7 @@ class Program
                     e.Light!.BeamCount == orig.BeamCount &&                        // ...and reached the engine Light
                     lb.ConeShape == orig.ConeShape &&                             // cone shape round-trips
                     Math.Abs(lb.Power - orig.Power) < 1e-4f &&                    // power round-trips
+                    Math.Abs(lb.ColorInfluence - wantInfluence) < 1e-4f &&         // color-influence round-trips
                     Math.Abs(lb.Position.X - orig.Position.X) < 1e-4f &&          // marker position round-trips
                     Math.Abs(lb.Position.Y - orig.Position.Y) < 1e-4f &&
                     Math.Abs(lb.Position.Z - orig.Position.Z) < 1e-4f;
@@ -866,6 +936,99 @@ class Program
                 lok &= one;
             }
             ok &= lok;
+        }
+
+        // Area emitter shapes — one Area light per AreaShape (circle/square/triangle): each builds a
+        // visible flat marker (FaceCount > 0) and its AreaShape round-trips through FromInstance.
+        {
+            var areaWorld = new WorldConfig
+            {
+                Name = "areashapetest",
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 0, Type = "light", LightKind = "area", Color = "White",
+                        Position = new Vec3Config { X = -2f, Y = 4f, Z = 0f }, Power = 500f,
+                        Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f }, LightSize = 1.5f, AreaShape = "circle" },
+                    new WorldObject { Id = 1, Type = "light", LightKind = "area", Color = "White",
+                        Position = new Vec3Config { X = 0f, Y = 4f, Z = 0f }, Power = 500f,
+                        Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f }, LightSize = 1.5f, AreaShape = "square" },
+                    new WorldObject { Id = 2, Type = "light", LightKind = "area", Color = "White",
+                        Position = new Vec3Config { X = 2f, Y = 4f, Z = 0f }, Power = 500f,
+                        Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f }, LightSize = 1.5f, AreaShape = "triangle" },
+                },
+            };
+
+            var areaScene = new PriviewNetworkScene(new DisplayManagerAsync(), areaWorld, isServer: false, "127.0.0.1", 0, online: false);
+            areaScene.Start();
+            var areaEntries = areaScene.EditableEntries.Where(e => e.Light != null).ToList();
+            bool aok = areaEntries.Count == 3;
+            if (!aok) Console.WriteLine($"  area-shape: expected 3 area entries, got {areaEntries.Count} -> BAD");
+            var expectShapes = new[] { "circle", "square", "triangle" };
+            for (int i = 0; aok && i < areaEntries.Count; i++)
+            {
+                var e = areaEntries[i];
+                var marker = e.Instance as Object3d;
+                WorldObject ab = PriviewNetworkScene.FromInstance(e.Descriptor, e.Instance, e.Light);
+                bool one = marker != null && marker.FaceCount > 0 &&
+                           e.Light!.AreaShape == areaWorld.Objects[i].AreaShape switch { "circle" => ConeShapeKind.Circle, "triangle" => ConeShapeKind.Triangle, _ => ConeShapeKind.Square } &&
+                           ab.AreaShape == expectShapes[i];   // shape round-trips
+                Console.WriteLine($"  area-shape[{i}] {expectShapes[i]}: marker faces={marker?.FaceCount}, back AreaShape={ab.AreaShape} -> {(one ? "ok" : "BAD")}");
+                aok &= one;
+            }
+            ok &= aok;
+        }
+
+        // Marker reflects BeamCount + Directional shaped cone — a 4-beam spot bakes 4 cones into its
+        // marker (≈4x the faces of a 1-beam spot, same ConeShape); a Directional builds a shaped cone
+        // marker per ConeShape. All markers must be non-empty.
+        {
+            var markerWorld = new WorldConfig
+            {
+                Name = "markertest",
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 0, Type = "light", LightKind = "spot", Color = "White",
+                        Position = new Vec3Config { X = 0f, Y = 5f, Z = -4f }, Power = 500f,
+                        Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f }, ConeAngle = 20f, ConeShape = "circle", BeamCount = 1 },
+                    new WorldObject { Id = 1, Type = "light", LightKind = "spot", Color = "White",
+                        Position = new Vec3Config { X = 0f, Y = 5f, Z = 0f }, Power = 500f,
+                        Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f }, ConeAngle = 20f, ConeShape = "circle", BeamCount = 4 },
+                    new WorldObject { Id = 2, Type = "light", LightKind = "directional", Color = "White",
+                        Position = new Vec3Config { X = 4f, Y = 5f, Z = -4f }, Power = 400f,
+                        Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f }, ConeShape = "circle" },
+                    new WorldObject { Id = 3, Type = "light", LightKind = "directional", Color = "White",
+                        Position = new Vec3Config { X = 4f, Y = 5f, Z = 0f }, Power = 400f,
+                        Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f }, ConeShape = "square" },
+                    new WorldObject { Id = 4, Type = "light", LightKind = "directional", Color = "White",
+                        Position = new Vec3Config { X = 4f, Y = 5f, Z = 4f }, Power = 400f,
+                        Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f }, ConeShape = "triangle" },
+                },
+            };
+
+            var mScene = new PriviewNetworkScene(new DisplayManagerAsync(), markerWorld, isServer: false, "127.0.0.1", 0, online: false);
+            mScene.Start();
+            var mEntries = mScene.EditableEntries.Where(e => e.Light != null).ToList();
+            bool mok = mEntries.Count == 5;
+            if (!mok) Console.WriteLine($"  marker: expected 5 light entries, got {mEntries.Count} -> BAD");
+            if (mok)
+            {
+                int spot1 = (mEntries[0].Instance as Object3d)!.FaceCount;
+                int spot4 = (mEntries[1].Instance as Object3d)!.FaceCount;
+                bool beamOk = spot1 > 0 && spot4 > 0 && spot4 > spot1;
+                Console.WriteLine($"  marker: spot Beams=1 faces={spot1}, Beams=4 faces={spot4} (want 4>1, both>0) -> {(beamOk ? "ok" : "BAD")}");
+                mok &= beamOk;
+
+                foreach (var (idx, name) in new[] { (2, "circle"), (3, "square"), (4, "triangle") })
+                {
+                    int faces = (mEntries[idx].Instance as Object3d)!.FaceCount;
+                    bool dok = faces > 0;
+                    Console.WriteLine($"  marker: directional {name} faces={faces} (want >0) -> {(dok ? "ok" : "BAD")}");
+                    mok &= dok;
+                }
+            }
+            ok &= mok;
         }
 
         // Headless multi-beam check — a spot with BeamCount=4 fans four cones about the aim, so a
@@ -876,7 +1039,7 @@ class Program
             var mgr = new DisplayManagerAsync();
             var none = new List<IDisplays>();
             var P = new Vector3(0f, 0f, -3f);                                   // on the k=1 (-Z) fanned beam axis
-            var rd = new RenderData(0f, (new Vector3(0f, 0f, 0f) - P).Norm(), P, ConsoleColor.White);
+            var rd = new RenderData(0f, (new Vector3(0f, 0f, 0f) - P).Norm(), P, Rgba32.White);
             var spot = new Light(new Vector3(0f, 0f, 0f), 500f)
             { Kind = LightKind.Spot, Direction = new Vector3(1f, 0f, 0f), ConeAngleDeg = 30f };
 
@@ -895,7 +1058,7 @@ class Program
             var none = new List<IDisplays>();
             float t = MathF.Tan(30f * MathF.PI / 180f);
             var P = new Vector3(1f, -0.8f * t, 0.8f * t);                       // u=+Z, v=-Y at axial 1
-            var rd = new RenderData(0f, (new Vector3(0f, 0f, 0f) - P).Norm(), P, ConsoleColor.White);
+            var rd = new RenderData(0f, (new Vector3(0f, 0f, 0f) - P).Norm(), P, Rgba32.White);
             var spot = new Light(new Vector3(0f, 0f, 0f), 500f)
             { Kind = LightKind.Spot, Direction = new Vector3(1f, 0f, 0f), ConeAngleDeg = 30f, BeamCount = 1 };
 
@@ -915,7 +1078,7 @@ class Program
             var occluder = new Sphere(new Vector3(-2f, 2f, 0f), Vector3.Zero, 1f);  // sits between P and light A
             var objs = new List<IDisplays> { occluder };
 
-            var rd = new RenderData(0f, new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, 0f), ConsoleColor.White);  // up-facing point at origin
+            var rd = new RenderData(0f, new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, 0f), Rgba32.White);  // up-facing point at origin
             var lightA = new Light(new Vector3(-4f, 4f, 0f), 500f);  // line of sight blocked by the sphere
             var lightB = new Light(new Vector3( 4f, 4f, 0f), 500f);  // clear line of sight
 
@@ -925,6 +1088,21 @@ class Program
             bool dok = a == 0f && b > 0f && (a + b) > 0f;
             Console.WriteLine($"  dominance: blocked A={a:F3} (want 0), reached B={b:F3} (want >0), sum={(a + b):F3} -> {(dok ? "ok" : "BAD")}");
             ok &= dok;
+        }
+
+        // FindSortedIntersections — two spheres at different depths on one +X ray, passed in REVERSE
+        // (far first); the manager must return them front-to-back (nearest Intersection first).
+        {
+            var mgr = new DisplayManagerAsync();
+            var near = new Sphere(new Vector3(5f, 0f, 0f), Vector3.Zero, 1f);   // hit at ~4
+            var far  = new Sphere(new Vector3(10f, 0f, 0f), Vector3.Zero, 1f);  // hit at ~9
+            var objs = new List<IDisplays> { far, near };                       // reversed on purpose
+            var ray = new Ray(new Vector3(0f, 0f, 0f), new Vector3(1f, 0f, 0f).Norm());
+
+            var hits = mgr.FindSortedIntersections(ray, objs);
+            bool sok = hits.Count == 2 && hits[0].Intersection < hits[1].Intersection;
+            Console.WriteLine($"  sorted: {hits.Count} hits, depths {(hits.Count > 0 ? hits[0].Intersection.ToString("F2") : "-")} < {(hits.Count > 1 ? hits[1].Intersection.ToString("F2") : "-")} (front-to-back) -> {(sok ? "ok" : "BAD")}");
+            ok &= sok;
         }
 
         // Color round-trip — the BLUE/Z channel must survive ConsoleColor->RGB->Rgb24 (regression guard).
@@ -999,6 +1177,116 @@ class Program
             ok &= dupOk;
         }
 
+        // Part C — the PLATFORM is an editable entry (selectable like any object), backed by the live
+        // PlatformConfig, but never leaks into the saved/synced Objects list. An offline scene with a
+        // known platform + 2 ordinary objects: exactly one "platform" entry (a real Object3d floor);
+        // the non-platform entries match world.Objects; the live snapshot carries the platform via
+        // Platform (NOT Objects); and a live Shape edit propagates to the snapshot (save/sync path).
+        {
+            var platWorld = new WorldConfig
+            {
+                Name = "platedit",
+                Platform = new PlatformConfig { Enabled = true, Shape = "square", Size = 7f, Color = "Cyan" },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 0, Type = "cube", Color = "White",
+                        Position = new Vec3Config { X = 0f, Y = 0f, Z = 0f } },
+                    new WorldObject { Id = 1, Type = "sphere", Color = "Red", Radius = 1f,
+                        Position = new Vec3Config { X = 3f, Y = 0f, Z = 0f } },
+                },
+            };
+
+            var scene = new PriviewNetworkScene(new DisplayManagerAsync(), platWorld, isServer: false, "127.0.0.1", 0, online: false);
+            scene.Start();
+
+            var platEntries = scene.EditableEntries.Where(e => e.Platform != null).ToList();
+            int platTyped = scene.EditableEntries.Count(e => string.Equals(e.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase));
+            var platEntry = platEntries.FirstOrDefault();
+            var platFloor = platEntry?.Instance as Object3d;
+            bool pCount = platEntries.Count == 1 && platTyped == 1 && platEntry != null && platFloor != null && platFloor.FaceCount > 0;
+            Console.WriteLine($"  platform: editable entries={platEntries.Count} (want 1), typed=platform={platTyped}, floor faces={platFloor?.FaceCount} -> {(pCount ? "ok" : "BAD")}");
+            ok &= pCount;
+
+            int nonPlat = scene.EditableEntries.Count(e => !string.Equals(e.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase));
+            bool pNon = nonPlat == platWorld.Objects.Count;
+            Console.WriteLine($"  platform: non-platform entries={nonPlat} (want {platWorld.Objects.Count}) -> {(pNon ? "ok" : "BAD")}");
+            ok &= pNon;
+
+            var snap = scene.LiveWorldSnapshot();
+            bool snapLeak = snap.Objects.Any(o => string.Equals(o.Type, "platform", StringComparison.OrdinalIgnoreCase));
+            bool pSnap =
+                snap.Objects.Count == platWorld.Objects.Count &&            // platform absent from Objects
+                !snapLeak &&                                                // ...and nothing typed platform leaked
+                snap.Platform.Shape == "square" &&                          // platform rides through Platform
+                Math.Abs(snap.Platform.Size - 7f) < 1e-4f &&
+                PriviewNetworkScene.ParseColor(snap.Platform.Color, Rgba32.White) == PriviewNetworkScene.ParseColor("Cyan", Rgba32.White);
+            Console.WriteLine($"  platform: snapshot Objects={snap.Objects.Count} (want {platWorld.Objects.Count}), leak={snapLeak}, plat shape={snap.Platform.Shape}, size={snap.Platform.Size}, color={snap.Platform.Color} -> {(pSnap ? "ok" : "BAD")}");
+            ok &= pSnap;
+
+            // A live platform edit (Shape) must propagate to the save/sync snapshot.
+            if (platEntry?.Platform != null) platEntry.Platform.Shape = "circle";
+            string snapShape = scene.LiveWorldSnapshot().Platform.Shape;
+            bool pEdit = snapShape == "circle";
+            Console.WriteLine($"  platform: live Shape edit -> snapshot Platform.Shape={snapShape} (want circle) -> {(pEdit ? "ok" : "BAD")}");
+            ok &= pEdit;
+
+            // MOVE: moving the floor instance propagates to the snapshot (synced at snapshot time).
+            if (platEntry != null) platEntry.Instance.Position = new Vector3(2f, 1f, -3f);
+            var movedPos = scene.LiveWorldSnapshot().Platform.Position;
+            bool pMove = Math.Abs(movedPos.X - 2f) < 1e-4f && Math.Abs(movedPos.Y - 1f) < 1e-4f && Math.Abs(movedPos.Z + 3f) < 1e-4f;
+            Console.WriteLine($"  platform: move -> snapshot Platform.Position=({movedPos.X},{movedPos.Y},{movedPos.Z}) (want 2,1,-3) -> {(pMove ? "ok" : "BAD")}");
+            ok &= pMove;
+        }
+
+        // Part C2 — a DISABLED (i.e. deleted) platform reloads as ABSENT: no "platform" entry, and the
+        // live snapshot keeps Platform.Enabled == false. This is the persistence contract behind delete.
+        {
+            var offWorld = new WorldConfig
+            {
+                Name = "platoff",
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject>(),
+            };
+            var scene = new PriviewNetworkScene(new DisplayManagerAsync(), offWorld, isServer: false, "127.0.0.1", 0, online: false);
+            scene.Start();
+            int platTyped = scene.EditableEntries.Count(e => string.Equals(e.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase));
+            bool snapEnabled = scene.LiveWorldSnapshot().Platform.Enabled;
+            bool pOff = platTyped == 0 && !snapEnabled;
+            Console.WriteLine($"  platform-off: platform entries={platTyped} (want 0), snapshot Enabled={snapEnabled} (want False) -> {(pOff ? "ok" : "BAD")}");
+            ok &= pOff;
+        }
+
+        // Part D — a SPOT light's marker reflects its cone cross-section: each ConeShape (circle/square/
+        // triangle) builds a real cone marker (FaceCount > 0). Visual correctness is verified live.
+        {
+            var spotWorld = new WorldConfig
+            {
+                Name = "spotshapes",
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 0, Type = "light", LightKind = "spot", Color = "White", ConeShape = "circle",
+                        Position = new Vec3Config { X = -2f, Y = 4f, Z = 0f }, Power = 500f, ConeAngle = 25f },
+                    new WorldObject { Id = 1, Type = "light", LightKind = "spot", Color = "Red", ConeShape = "square",
+                        Position = new Vec3Config { X = 0f, Y = 4f, Z = 0f }, Power = 500f, ConeAngle = 35f },
+                    new WorldObject { Id = 2, Type = "light", LightKind = "spot", Color = "Cyan", ConeShape = "triangle",
+                        Position = new Vec3Config { X = 2f, Y = 4f, Z = 0f }, Power = 500f, ConeAngle = 45f },
+                },
+            };
+            var scene = new PriviewNetworkScene(new DisplayManagerAsync(), spotWorld, isServer: false, "127.0.0.1", 0, online: false);
+            scene.Start();
+            var spots = scene.EditableEntries.Where(e => e.Light?.Kind == LightKind.Spot).ToList();
+            bool sok = spots.Count == 3;
+            foreach (var e in spots)
+            {
+                var marker = e.Instance as Object3d;
+                bool one = marker != null && marker.FaceCount > 0;
+                Console.WriteLine($"  spot-marker shape={e.Light!.ConeShape}: marker faces={marker?.FaceCount} -> {(one ? "ok" : "BAD")}");
+                sok &= one;
+            }
+            ok &= sok;
+        }
+
         Console.WriteLine(ok ? "EDITOR TEST PASSED" : "EDITOR TEST FAILED");
     }
 
@@ -1047,8 +1335,9 @@ class Program
         var world = new WorldConfig
         {
             Name = "synctest",
-            Graphics = new GraphicsConfig { Shadows = true, Bvh = false, ExtraLight = true, DisableCameraLight = true },
-            Platform = new PlatformConfig { Enabled = true, Size = 12f, Color = "Cyan" },
+            Graphics = new GraphicsConfig { Shadows = true, Bvh = false, ExtraLight = true, DisableCameraLight = true, Renderer = "gpu" },
+            Platform = new PlatformConfig { Enabled = true, Size = 12f, Color = "Cyan", Collides = false, Gravity = true, Position = new Vec3Config { X = 1.5f, Y = -0.5f, Z = 2.5f } },
+            Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 12.5f, CollisionEnabled = false },
             Objects = new List<WorldObject>
             {
                 new WorldObject { Id = 10, Type = "mesh", Mesh = "monkey",
@@ -1057,7 +1346,7 @@ class Program
                     Scale = 1.5f, Color = "Red", Anchor = "Center", RotateSpeed = 0.5f, Radius = 1f },
                 new WorldObject { Id = 11, Type = "cube",
                     Position = new Vec3Config { X = -1f, Y = 0f, Z = 2f },
-                    Scale = 2f, Color = "Green" },
+                    Scale = 2f, Color = "Green", Collides = false, Gravity = true },
                 new WorldObject { Id = 12, Type = "sphere",
                     Position = new Vec3Config { X = 4f, Y = 1f, Z = -2f },
                     Radius = 2.5f, Color = "Blue" },
@@ -1066,7 +1355,12 @@ class Program
                     Power = 800f, Color = "Magenta", LightKind = "spot",
                     Direction = new Vec3Config { X = 0.5f, Y = -1f, Z = 0.25f },
                     ConeAngle = 22f, LightSize = 1.5f, LightSpin = 0.75f,
-                    BeamCount = 3, ConeShape = "triangle" },
+                    BeamCount = 3, ConeShape = "triangle", ColorInfluence = 0.85f },
+                new WorldObject { Id = 14, Type = "light",
+                    Position = new Vec3Config { X = -3f, Y = 5f, Z = -1f },
+                    Power = 650f, Color = "Cyan", LightKind = "area",
+                    Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f },
+                    LightSize = 2f, AreaShape = "triangle" },
             }
         };
 
@@ -1098,6 +1392,93 @@ class Program
         { Fail("recovered 'monkey' .obj text does not match the on-disk file."); return; }
 
         Console.WriteLine($"Recovered: name={back.Name}, objects={back.Objects.Count}, monkey .obj chars={recoveredObj.Length}");
+
+        // WorldSettings delta: round-trip the packet through its OWN serialize/deserialize, then
+        // re-parse the JSON payloads and assert the PlatformConfig + GraphicsConfig survive intact.
+        {
+            var settings = new WorldSettingsPacket
+            {
+                PlatformJson = JsonSerializer.Serialize(world.Platform),
+                GraphicsJson = JsonSerializer.Serialize(world.Graphics),
+            };
+            byte[] sbytes;
+            using (var ms = new MemoryStream())
+            {
+                using (var w = new BinaryWriter(ms)) settings.Serialize(w);
+                sbytes = ms.ToArray();
+            }
+            var recvSettings = new WorldSettingsPacket();
+            using (var r = new BinaryReader(new MemoryStream(sbytes))) recvSettings.Deserialize(r);
+
+            var opts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var pb = JsonSerializer.Deserialize<PlatformConfig>(recvSettings.PlatformJson, opts);
+            var gb = JsonSerializer.Deserialize<GraphicsConfig>(recvSettings.GraphicsJson, opts);
+            bool settingsOk =
+                pb != null && gb != null &&
+                pb.Enabled == world.Platform.Enabled && pb.Shape == world.Platform.Shape &&
+                Math.Abs(pb.Size - world.Platform.Size) < 1e-4f && pb.Color == world.Platform.Color &&
+                Math.Abs(pb.Position.X - world.Platform.Position.X) < 1e-4f &&
+                Math.Abs(pb.Position.Y - world.Platform.Position.Y) < 1e-4f &&
+                Math.Abs(pb.Position.Z - world.Platform.Position.Z) < 1e-4f &&
+                gb.Shadows == world.Graphics.Shadows && gb.Bvh == world.Graphics.Bvh &&
+                gb.ExtraLight == world.Graphics.ExtraLight && gb.DisableCameraLight == world.Graphics.DisableCameraLight &&
+                gb.Renderer == world.Graphics.Renderer;
+            Console.WriteLine($"WorldSettings round-trip: {sbytes.Length} bytes, platform shape={pb?.Shape} size={pb?.Size} color={pb?.Color}, graphics shadows={gb?.Shadows} bvh={gb?.Bvh} -> {(settingsOk ? "ok" : "BAD")}");
+            if (!settingsOk) { Fail("WorldSettings packet round-trip lost platform/graphics fields."); return; }
+        }
+
+        // PlayerLeft delta: round-trip the packet through its OWN serialize/deserialize; NetId survives.
+        {
+            var left = new PlayerLeftPacket { NetId = 4242 };
+            byte[] lbytes;
+            using (var ms = new MemoryStream())
+            {
+                using (var w = new BinaryWriter(ms)) left.Serialize(w);
+                lbytes = ms.ToArray();
+            }
+            var recvLeft = new PlayerLeftPacket();
+            using (var r = new BinaryReader(new MemoryStream(lbytes))) recvLeft.Deserialize(r);
+            bool leftOk = recvLeft.NetId == 4242;
+            Console.WriteLine($"PlayerLeft round-trip: {lbytes.Length} bytes, NetId={recvLeft.NetId} -> {(leftOk ? "ok" : "BAD")}");
+            if (!leftOk) { Fail("PlayerLeft packet round-trip lost NetId."); return; }
+        }
+
+        // MeshChunk delta: round-trip the packet through its OWN serialize/deserialize; fields survive.
+        {
+            var chunk = new MeshChunkPacket { MeshName = "bigmesh", Index = 3, Total = 7, Data = "v 1.0 2.0 3.0\n" };
+            byte[] cbytes;
+            using (var ms = new MemoryStream())
+            {
+                using (var w = new BinaryWriter(ms)) chunk.Serialize(w);
+                cbytes = ms.ToArray();
+            }
+            var recvChunk = new MeshChunkPacket();
+            using (var r = new BinaryReader(new MemoryStream(cbytes))) recvChunk.Deserialize(r);
+            bool chunkOk = recvChunk.MeshName == "bigmesh" && recvChunk.Index == 3 && recvChunk.Total == 7 && recvChunk.Data == "v 1.0 2.0 3.0\n";
+            Console.WriteLine($"MeshChunk round-trip: {cbytes.Length} bytes, name={recvChunk.MeshName} idx={recvChunk.Index}/{recvChunk.Total} -> {(chunkOk ? "ok" : "BAD")}");
+            if (!chunkOk) { Fail("MeshChunk packet round-trip lost fields."); return; }
+        }
+
+        // Split/reassemble: cut a long string into MeshChunkSize pieces, reassemble by Index, compare.
+        {
+            const int chunkSize = 16384;   // mirrors PriviewNetworkScene.MeshChunkSize
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < 40000; i++) sb.Append((char)('a' + (i % 26)));
+            string original = sb.ToString();
+
+            int total = (original.Length + chunkSize - 1) / chunkSize;
+            var parts = new string[total];
+            for (int i = 0; i < total; i++)
+            {
+                int start = i * chunkSize;
+                parts[i] = original.Substring(start, Math.Min(chunkSize, original.Length - start));
+            }
+            string reassembled = string.Concat(parts);
+            bool splitOk = total == 3 && reassembled == original;   // 40000 -> ceil(40000/16384) = 3 chunks
+            Console.WriteLine($"MeshChunk split: len={original.Length} -> {total} chunks, reassembled match={reassembled == original} -> {(splitOk ? "ok" : "BAD")}");
+            if (!splitOk) { Fail("MeshChunk split/reassemble mismatch."); return; }
+        }
+
         Console.WriteLine("WORLD SYNC TEST PASSED");
     }
 
@@ -1109,11 +1490,18 @@ class Program
 
         if (a.Name != b.Name) return $"name '{a.Name}' != '{b.Name}'";
         if (a.Graphics.Shadows != b.Graphics.Shadows || a.Graphics.Bvh != b.Graphics.Bvh ||
-            a.Graphics.ExtraLight != b.Graphics.ExtraLight || a.Graphics.DisableCameraLight != b.Graphics.DisableCameraLight)
+            a.Graphics.ExtraLight != b.Graphics.ExtraLight || a.Graphics.DisableCameraLight != b.Graphics.DisableCameraLight ||
+            a.Graphics.Renderer != b.Graphics.Renderer)
             return "graphics flags differ";
-        if (a.Platform.Enabled != b.Platform.Enabled || !Eq(a.Platform.Size, b.Platform.Size) || a.Platform.Color != b.Platform.Color ||
-            a.Platform.Shape != b.Platform.Shape || !Eq(a.Platform.Width, b.Platform.Width) || !Eq(a.Platform.Depth, b.Platform.Depth))
+        if (a.Platform.Enabled != b.Platform.Enabled || !Eq(a.Platform.Size, b.Platform.Size) ||
+            PriviewNetworkScene.ParseColor(a.Platform.Color, Rgba32.White) != PriviewNetworkScene.ParseColor(b.Platform.Color, Rgba32.White) ||
+            a.Platform.Shape != b.Platform.Shape || !Eq(a.Platform.Width, b.Platform.Width) || !Eq(a.Platform.Depth, b.Platform.Depth) ||
+            a.Platform.Collides != b.Platform.Collides || a.Platform.Gravity != b.Platform.Gravity ||
+            !Eq(a.Platform.Position.X, b.Platform.Position.X) || !Eq(a.Platform.Position.Y, b.Platform.Position.Y) || !Eq(a.Platform.Position.Z, b.Platform.Position.Z))
             return "platform differs";
+        if (a.Physics.GravityEnabled != b.Physics.GravityEnabled) return "physics gravity-enabled differs";
+        if (!Eq(a.Physics.GravityStrength, b.Physics.GravityStrength)) return "physics gravity-strength differs";
+        if (a.Physics.CollisionEnabled != b.Physics.CollisionEnabled) return "physics collision-enabled differs";
         if (a.Objects.Count != b.Objects.Count) return $"object count {a.Objects.Count} != {b.Objects.Count}";
 
         for (int i = 0; i < a.Objects.Count; i++)
@@ -1128,10 +1516,13 @@ class Program
             if (!Eq(x.Rotation.X, y.Rotation.X) || !Eq(x.Rotation.Y, y.Rotation.Y) || !Eq(x.Rotation.Z, y.Rotation.Z))
                 return $"object[{i}].Rotation differs";
             if (!Eq(x.Scale, y.Scale)) return $"object[{i}].Scale differs";
-            if (x.Color != y.Color) return $"object[{i}].Color '{x.Color}' != '{y.Color}'";
+            if (PriviewNetworkScene.ParseColor(x.Color, Rgba32.White) != PriviewNetworkScene.ParseColor(y.Color, Rgba32.White))
+                return $"object[{i}].Color '{x.Color}' != '{y.Color}'";
             if (x.Anchor != y.Anchor) return $"object[{i}].Anchor '{x.Anchor}' != '{y.Anchor}'";
             if (!Eq(x.RotateSpeed, y.RotateSpeed)) return $"object[{i}].RotateSpeed differs";
             if (!Eq(x.Radius, y.Radius)) return $"object[{i}].Radius differs";
+            if (x.Collides != y.Collides) return $"object[{i}].Collides {x.Collides} != {y.Collides}";
+            if (x.Gravity != y.Gravity) return $"object[{i}].Gravity {x.Gravity} != {y.Gravity}";
             if (!Eq(x.Power, y.Power)) return $"object[{i}].Power differs";
             // ---- light-only rich fields ----
             if (x.LightKind != y.LightKind) return $"object[{i}].LightKind '{x.LightKind}' != '{y.LightKind}'";
@@ -1142,7 +1533,300 @@ class Program
             if (!Eq(x.LightSpin, y.LightSpin)) return $"object[{i}].LightSpin differs";
             if (x.BeamCount != y.BeamCount) return $"object[{i}].BeamCount {x.BeamCount} != {y.BeamCount}";
             if (x.ConeShape != y.ConeShape) return $"object[{i}].ConeShape '{x.ConeShape}' != '{y.ConeShape}'";
+            if (x.AreaShape != y.AreaShape) return $"object[{i}].AreaShape differs";
+            if (!Eq(x.ColorInfluence, y.ColorInfluence)) return $"object[{i}].ColorInfluence differs";
         }
         return null;
+    }
+
+    // Headless check of the pure collision resolvers (the camera-bubble math): a sphere is ejected
+    // out of an AABB / another sphere when penetrating, kept exactly tangent at the surface, and
+    // returned UNCHANGED when clear. Mirrors what ResolveCameraCollision does each frame.
+    static void CollisionSelfTest()
+    {
+        Logger.Init(AppPaths.LogsFolder);
+        Console.WriteLine("=== COLLISION SELF-TEST ===");
+
+        const float eps = 1e-3f;
+        bool ok = true;
+
+        // Distance from a point to an AABB (0 when inside) — the penetration check.
+        static float DistToAabb(Vector3 c, Vector3 min, Vector3 max)
+        {
+            Vector3 cl = new(Math.Clamp(c.X, min.X, max.X), Math.Clamp(c.Y, min.Y, max.Y), Math.Clamp(c.Z, min.Z, max.Z));
+            return (c - cl).Length();
+        }
+
+        Vector3 bmin = new(-1f, -1f, -1f), bmax = new(1f, 1f, 1f);
+        const float r = 0.35f;
+
+        // 1) Centre INSIDE the box -> ejected until it no longer penetrates (dist from box >= r).
+        {
+            Vector3 outc = PriviewNetworkScene.ResolveSphereVsAabb(new Vector3(0f, 0f, 0f), r, bmin, bmax);
+            float dist = DistToAabb(outc, bmin, bmax);
+            bool t = dist >= r - eps;
+            Console.WriteLine($"  aabb-centre: ejected to ({outc.X:F3},{outc.Y:F3},{outc.Z:F3}), dist-from-box={dist:F3} (want >= {r}) -> {(t ? "ok" : "BAD")}");
+            ok &= t;
+        }
+
+        // 2) Beside the +X face -> pushed EXACTLY to the surface; tangential (Y,Z) kept.
+        {
+            Vector3 inc = new(1.2f, 0.5f, -0.3f);
+            Vector3 outc = PriviewNetworkScene.ResolveSphereVsAabb(inc, r, bmin, bmax);
+            float dist = DistToAabb(outc, bmin, bmax);
+            bool t = Math.Abs(dist - r) < eps && Math.Abs(outc.Y - inc.Y) < eps && Math.Abs(outc.Z - inc.Z) < eps && outc.X > inc.X;
+            Console.WriteLine($"  aabb-face: ({inc.X},{inc.Y},{inc.Z}) -> ({outc.X:F3},{outc.Y:F3},{outc.Z:F3}), dist-from-box={dist:F3} (want {r}), tangential kept -> {(t ? "ok" : "BAD")}");
+            ok &= t;
+        }
+
+        // 3) Sphere-vs-sphere overlap -> centres end up exactly r+sr apart.
+        {
+            Vector3 center = new(0.5f, 0f, 0f); float sr = 0.5f; float rr = r + sr;
+            Vector3 outc = PriviewNetworkScene.ResolveSphereVsSphere(new Vector3(0f, 0f, 0f), r, center, sr);
+            float d = (outc - center).Length();
+            bool t = Math.Abs(d - rr) < eps;
+            Console.WriteLine($"  sphere-sphere: resolved centre-dist={d:F3} (want {rr}) -> {(t ? "ok" : "BAD")}");
+            ok &= t;
+        }
+
+        // 4) Non-penetrating inputs are returned UNCHANGED (both AABB + sphere resolvers).
+        {
+            Vector3 farc = new(5f, 0f, 0f);
+            Vector3 a = PriviewNetworkScene.ResolveSphereVsAabb(farc, r, bmin, bmax);
+            Vector3 b = PriviewNetworkScene.ResolveSphereVsSphere(farc, r, new Vector3(0f, 0f, 0f), 0.5f);
+            bool t = a == farc && b == farc;
+            Console.WriteLine($"  no-penetration: aabb->({a.X},{a.Y},{a.Z}), sphere->({b.X},{b.Y},{b.Z}) (want unchanged 5,0,0) -> {(t ? "ok" : "BAD")}");
+            ok &= t;
+        }
+
+        Console.WriteLine(ok ? "COLLISION TEST PASSED" : "COLLISION TEST FAILED");
+    }
+
+    // Headless check of the pure gravity helpers (StepFallY + XZOverlap): a falling object converges
+    // to rest on its support without sinking through; with no support it free-falls forever; and the
+    // X/Z overlap test classifies AABB pairs correctly. Mirrors what StepPhysics integrates per frame.
+    static void PhysicsSelfTest()
+    {
+        Logger.Init(AppPaths.LogsFolder);
+        Console.WriteLine("=== PHYSICS SELF-TEST ===");
+
+        const float eps = 1e-2f;
+        bool ok = true;
+
+        // 1) Drop from bottom=10 onto supportTop=0; after ~300 steps it rests exactly on the support.
+        {
+            float bottom = 10f, vel = 0f, g = 9.8f, dt = 1f / 60f, support = 0f;
+            for (int i = 0; i < 300; i++) (bottom, vel) = PriviewNetworkScene.StepFallY(bottom, vel, dt, g, support);
+            bool t = Math.Abs(bottom - support) < eps && Math.Abs(vel) < eps && bottom >= support - eps;
+            Console.WriteLine($"  rest: after 300 steps bottom={bottom:F4} (want ~{support}), vel={vel:F4} (want ~0) -> {(t ? "ok" : "BAD")}");
+            ok &= t;
+        }
+
+        // 2) No support below (supportTop = -1000): keeps falling, velocity stays negative (free fall).
+        {
+            float bottom = 10f, vel = 0f, g = 9.8f, dt = 1f / 60f, support = -1000f;
+            float prev = bottom;
+            bool everRose = false, everNonNeg = false;
+            for (int i = 0; i < 120; i++)
+            {
+                (bottom, vel) = PriviewNetworkScene.StepFallY(bottom, vel, dt, g, support);
+                if (bottom >= prev) everRose = true;     // bottom must strictly decrease
+                if (vel >= 0f) everNonNeg = true;        // velocity must stay negative once falling
+                prev = bottom;
+            }
+            bool t = !everRose && !everNonNeg && bottom < 0f;   // fell well past the start, never rested
+            Console.WriteLine($"  freefall: after 120 steps bottom={bottom:F3} (falling, <0), vel={vel:F3} (<0), monotonic-down={!everRose} -> {(t ? "ok" : "BAD")}");
+            ok &= t;
+        }
+
+        // 3) XZOverlap: an overlapping pair is true; a pair separated in X (or Z) is false (Y ignored).
+        {
+            Vector3 aMin = new(-1f, -5f, -1f), aMax = new(1f, 5f, 1f);
+            bool overlap = PriviewNetworkScene.XZOverlap(aMin, aMax, new Vector3(0.5f, 100f, 0.5f), new Vector3(2f, 200f, 2f));   // X/Z overlap, Y far apart -> true
+            bool apartX  = PriviewNetworkScene.XZOverlap(aMin, aMax, new Vector3(3f, -5f, 0f), new Vector3(5f, 5f, 1f));          // separated in X -> false
+            bool apartZ  = PriviewNetworkScene.XZOverlap(aMin, aMax, new Vector3(0f, -5f, 3f), new Vector3(1f, 5f, 5f));          // separated in Z -> false
+            bool t = overlap && !apartX && !apartZ;
+            Console.WriteLine($"  xzoverlap: overlap={overlap} (want True), apartX={apartX} (want False), apartZ={apartZ} (want False) -> {(t ? "ok" : "BAD")}");
+            ok &= t;
+        }
+
+        Console.WriteLine(ok ? "PHYSICS TEST PASSED" : "PHYSICS TEST FAILED");
+    }
+
+    // A deterministic smooth-shaded UV sphere mesh (lat×lon grid), used by gputest to give the GPU
+    // BVH a real, deep tree to traverse (>64 tris). Vertex normals = unit position (smooth shading).
+    static Object3d BuildUvSphere(float radius, int lat, int lon)
+    {
+        var verts = new List<Vector3>();
+        var norms = new List<Vector3>();
+        int stride = lon + 1;
+        for (int i = 0; i <= lat; i++)
+        {
+            float theta = MathF.PI * i / lat;
+            for (int j = 0; j <= lon; j++)
+            {
+                float phi = MathF.Tau * j / lon;
+                float x = MathF.Sin(theta) * MathF.Cos(phi);
+                float y = MathF.Cos(theta);
+                float z = MathF.Sin(theta) * MathF.Sin(phi);
+                verts.Add(new Vector3(x, y, z) * radius);
+                norms.Add(new Vector3(x, y, z));
+            }
+        }
+        var faces = new List<FacingInfo>();
+        for (int i = 0; i < lat; i++)
+            for (int j = 0; j < lon; j++)
+            {
+                int a = i * stride + j + 1, b = i * stride + j + 2;            // 1-based
+                int c = (i + 1) * stride + j + 1, d = (i + 1) * stride + j + 2;
+                faces.Add(new FacingInfo(new[] { a, d, b }, new[] { a, d, b }));
+                faces.Add(new FacingInfo(new[] { a, c, d }, new[] { a, c, d }));
+            }
+        return new Object3d(verts.ToArray(), norms.ToArray(), faces.ToArray());
+    }
+
+    // A tiny deterministic scene (one cube + one sphere + one point light) used only by gputest.
+    sealed class GpuTestScene : Scene
+    {
+        public GpuTestScene() : base(new DisplayManagerAsync()) { }
+
+        public override void Start()
+        {
+            Exposure = 0.05f; Ambient = 0.1f; EnableShadows = true;
+
+            var cube = PriviewNetworkScene.CreateCube();
+            cube.Position = new Vector3(10f, 0f, 0f);
+            cube.Scale = 1.6f;
+            cube.Color = new Rgba32(220, 50, 50);
+            cube.UpdateGeometry();
+            AddDisplaysObject(cube);
+
+            var sphere = new Sphere(new Vector3(8f, -1f, 2.6f), Vector3.Zero, 1.3f) { Color = new Rgba32(60, 90, 230) };
+            AddDisplaysObject(sphere);
+
+            // A TRANSPARENT sphere directly in front of the cube — exercises front-to-back compositing
+            // (a semi-transparent layer over the opaque cube behind it).
+            var glass = new Sphere(new Vector3(4f, 0f, 0f), Vector3.Zero, 1.2f) { Color = new Rgba32(70, 230, 120, 128) };
+            AddDisplaysObject(glass);
+
+            // A high-poly, rotated mesh (1536 tris) — gives the GPU two-level BVH a real, deep tree to
+            // traverse in the object's local space (with a non-trivial rotation/scale transform).
+            var hi = BuildUvSphere(1f, 24, 32);
+            hi.Position = new Vector3(11f, 2f, 1f);
+            hi.Scale = 1.8f;
+            hi.LocalRotate = new Vector3(0.4f, 0.7f, 0.2f);
+            hi.Color = new Rgba32(200, 180, 60);
+            hi.UpdateGeometry();
+            hi.BuildAcceleration();
+            AddDisplaysObject(hi);
+
+            // One of every LightKind, with the rich extras: a point, a multi-beam SQUARE spot, and a
+            // TRIANGLE area light — so the GPU/CPU parity test covers beams, cone shapes and area sampling.
+            AddLight(new Light(new Vector3(2f, 5f, 1f), 600f) { Rgb = new Vector3(1f, 0.9f, 0.8f) });
+
+            AddLight(new Light(new Vector3(6f, 6f, 0f), 800f)
+            {
+                Kind = LightKind.Spot, Direction = new Vector3(0.3f, -1f, 0f).Norm(),
+                ConeAngleDeg = 35f, BeamCount = 2, ConeShape = ConeShapeKind.Square,
+                Rgb = new Vector3(0.7f, 0.8f, 1f),
+            });
+
+            AddLight(new Light(new Vector3(6f, 6f, -4f), 400f)
+            {
+                Kind = LightKind.Area, Direction = new Vector3(0f, -1f, 0.3f).Norm(),
+                AreaSize = 1.5f, AreaShape = ConeShapeKind.Triangle,
+                Rgb = new Vector3(1f, 0.85f, 0.7f),
+            });
+
+            SetMainCamera(new Camera(new Vector3(0f, 0f, 0f), Vector3.Zero));
+        }
+
+        public override void Update() { }
+    }
+
+    // gputest: render a fixed scene with the GPU kernel (on whatever accelerator ILGPU finds — CUDA on
+    // an NVIDIA box, else the managed CPU accelerator in CI) and compare it to the engine's own CPU
+    // raytracer pixel-by-pixel. They share the same intersection + shading + tone-map math for the
+    // supported "fast path", so an opaque scene with a point light must match within float epsilon
+    // (a few silhouette-edge pixels may differ on rounding — that is the small allowed budget).
+    static void GpuSelfTest()
+    {
+        Logger.Init(AppPaths.LogsFolder);
+        Console.WriteLine("=== GPU SELF-TEST ===");
+
+        try
+        {
+            var scene = new GpuTestScene();
+            scene.Start();
+
+            const int W = 64, H = 32;
+            const float aspect = 1.6f;
+
+            using var rt = new Nova3DVisualiser.Gpu.GpuRaytracer(requireGpu: false);
+            Console.WriteLine($"  accelerator: {rt.AcceleratorName} (hardware GPU = {rt.IsHardwareGpu})");
+
+            var brightness = new float[W * H];
+            var color = new Rgb24[W * H];
+
+            // Compares the GPU image to the engine's CPU image for the current shadow setting, counting
+            // a pixel as a mismatch only when it exceeds (bTol, cTol). Mismatches are split into "edge"
+            // (one renderer hit geometry, the other saw background — a silhouette float flip) and
+            // "interior" (both hit the surface but the shaded/shadowed value differs). With shadows off
+            // every feature is deterministic, so interior MUST be 0; with shadows on, soft/hard shadow
+            // boundaries add a benign band of interior flips.
+            (int nonBlack, int edge, int interior, float worstB, int worstC) Compare(float bTol, int cTol)
+            {
+                SceneSnapshot snap = scene.BuildSnapshot();
+                rt.Render(snap, W, H, aspect, brightness, color);
+
+                int nb = 0, edge = 0, interior = 0; float wb = 0f; int wc = 0;
+                for (int j = 0; j < H; j++)
+                    for (int i = 0; i < W; i++)
+                    {
+                        float uvx = ((float)i / (W - 1) * 2f - 1f) * aspect;
+                        float uvy = -((float)j / (H - 1) * 2f - 1f);
+                        var cpu = scene.GetPixelData(new Vector2(uvx, uvy));
+                        int idx = j * W + i;
+                        if (cpu.Brightness > 0.01f) nb++;
+
+                        float db = Math.Abs(cpu.Brightness - brightness[idx]);
+                        int dc = Math.Max(Math.Abs(cpu.Color.R - color[idx].R),
+                                 Math.Max(Math.Abs(cpu.Color.G - color[idx].G), Math.Abs(cpu.Color.B - color[idx].B)));
+                        if (db <= bTol && dc <= cTol) continue;
+
+                        bool cpuHit = cpu.Brightness > 0.01f, gpuHit = brightness[idx] > 0.01f;
+                        if (cpuHit != gpuHit) edge++;                 // silhouette hit/miss flip
+                        else { interior++; wb = Math.Max(wb, db); wc = Math.Max(wc, dc); }
+                    }
+                return (nb, edge, interior, wb, wc);
+            }
+
+            int total = W * H;
+
+            // Pass A — shadows OFF: intersection + transparency compositing + every light kind (incl.
+            // beams, cone shapes, area sampling) + tone-map are all deterministic, so the GPU image must
+            // match the CPU EXACTLY. ANY interior mismatch here (Δ>0) is a real kernel bug.
+            scene.EnableShadows = false;
+            var a = Compare(0.004f, 1);   // tiny: absorbs ULP/rounding noise, far below any feature-level diff
+            Console.WriteLine($"  [no shadows] nonBlack={a.nonBlack}, edge={a.edge}, interior={a.interior} (worstΔb={a.worstB:F4}, worstΔc={a.worstC})");
+
+            // Pass B — shadows ON: shadow rays are float-sensitive at boundaries (and the area light's
+            // 4 occlusion samples form a soft penumbra), so a band of pixels differs by a SMALL amount.
+            // We tolerate sub-penumbra noise per pixel and only require the disagreement to stay bounded
+            // in magnitude and not become pervasive (which a systematic shadow bug would).
+            scene.EnableShadows = true;
+            var b = Compare(0.1f, 28);
+            Console.WriteLine($"  [shadows]    nonBlack={b.nonBlack}, edge={b.edge}, interior={b.interior} (worstΔb={b.worstB:F4}, worstΔc={b.worstC})");
+
+            bool ok = a.nonBlack > 50
+                      && a.interior == 0 && a.edge == 0                                          // shading exact (Δ=0)
+                      && (float)b.interior / total < 0.06f && (float)b.edge / total < 0.06f;      // shadow boundary thin
+            Console.WriteLine(ok ? "GPU TEST PASSED" : "GPU TEST FAILED");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  exception: {ex.GetType().Name}: {ex.Message}");
+            Console.WriteLine("GPU TEST FAILED");
+        }
     }
 }

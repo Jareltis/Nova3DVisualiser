@@ -16,18 +16,7 @@ SampleGame/logs/
 SampleGame/received/
 
 # License-uncertain asset, excluded from the repository
-SampleGame/models/buddha.*
-SampleGame/models/anime.*
-SampleGame/models/anime1.*
-SampleGame/models/anime2.*
-SampleGame/models/anime3.*
-SampleGame/models/anime4.*
-SampleGame/models/anime5.*
+SampleGame/models/
 
 # Worlds
-SampleGame/worlds/myworld.*
-SampleGame/worlds/world1.*
-SampleGame/worlds/world2.*
-SampleGame/worlds/world3.*
-SampleGame/worlds/world4.*
-SampleGame/worlds/world5.*
+SampleGame/worlds/

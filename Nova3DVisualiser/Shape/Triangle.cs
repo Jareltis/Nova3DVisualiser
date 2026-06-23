@@ -17,6 +17,11 @@ public class Triangle(int[] indices, Vector3 n0, Vector3 n1, Vector3 n2)
     private readonly Vector3 _n1 = n1;
     private readonly Vector3 _n2 = n2;
 
+    // Local-space vertex normals (exposed so the GPU snapshot can bake world-space normals).
+    public Vector3 N0 => _n0;
+    public Vector3 N1 => _n1;
+    public Vector3 N2 => _n2;
+
     public RenderData GetRenderData(Ray ray, Vector3[] worldVertices, Vector3 rotationForNormal)
     {
         Vector3 v0 = worldVertices[_i0];

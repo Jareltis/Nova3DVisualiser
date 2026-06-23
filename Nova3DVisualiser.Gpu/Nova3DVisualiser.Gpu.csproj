@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Library</OutputType>
+        <TargetFramework>net8.0</TargetFramework>
+        <RootNamespace>Nova3DVisualiser.Gpu</RootNamespace>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\Nova3DVisualiser\Nova3DVisualiser.csproj" />
+    </ItemGroup>
+
+    <!-- GPU acceleration (NVIDIA via CUDA, with an automatic CPU fallback). ILGPU is a pure-managed
+         NuGet package: no CUDA Toolkit/nvcc needed, it JIT-compiles C# kernels to PTX using the
+         installed driver. This dependency lives ONLY here, never in the dependency-free engine. -->
+    <ItemGroup>
+      <PackageReference Include="ILGPU" Version="1.5.3" />
+      <PackageReference Include="ILGPU.Algorithms" Version="1.5.3" />
+    </ItemGroup>
+
+</Project>

@@ -94,9 +94,9 @@ public class PreviewScene (IDisplaysManagerAsync iDisplaysManager) : Scene(iDisp
         _plane.UpdateGeometry();
 
         _light.Position = new Vector3(0, 0, 0);
-        _sphere.Color = ConsoleColor.Red;
-        _plane.Color = ConsoleColor.DarkGreen;
-        _cube.Color = ConsoleColor.Cyan;
+        _sphere.Color = new Rgba32(255, 0, 0);
+        _plane.Color = new Rgba32(0, 128, 0);
+        _cube.Color = new Rgba32(0, 255, 255);
         AddDisplaysObject(_cube);
         AddDisplaysObject(_sphere);
         AddDisplaysObject(_plane);

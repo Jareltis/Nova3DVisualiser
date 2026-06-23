@@ -9,6 +9,7 @@
 
     <ItemGroup>
       <ProjectReference Include="..\Nova3DVisualiser\Nova3DVisualiser.csproj" />
+      <ProjectReference Include="..\Nova3DVisualiser.Gpu\Nova3DVisualiser.Gpu.csproj" />
     </ItemGroup>
 
     <ItemGroup>

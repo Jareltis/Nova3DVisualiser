@@ -9,6 +9,7 @@ using Nova3DVisualiser.Shape;
 using Nova3DVisualiser.StaticClass;
 using SampleGame.NetworkPackets;
 using SampleGame.Worlds;
+using System.Globalization;
 using System.Text.Json;
 
 namespace SampleGame.Scenes;
@@ -20,6 +21,15 @@ public class PriviewNetworkScene : Scene
     private readonly NetworkManager? _netManager;
     private readonly int _myNetId;
     private readonly Dictionary<int, Object3d> _remotePlayers = new();
+    private readonly Dictionary<int, int> _connToNet = new();   // server: connId -> peer netId (for disconnect cleanup)
+
+    // Large-mesh streaming: a big live spawn is split into chunks sent a few per frame so other
+    // packets interleave. Small meshes still inline in one WorldEditPacket.
+    private const int MeshChunkThreshold = 49152;   // .obj text <= this bytes inlines as today
+    private const int MeshChunkSize = 16384;        // chunk payload length (chars)
+    private const int ChunksPerFrame = 2;           // outgoing actions drained per Update
+    private readonly Queue<Action> _outgoing = new();                            // server: paced mesh-chunk + spawn sends
+    private readonly Dictionary<string, (int total, string[] parts)> _meshChunks = new();   // client: reassembly buffer
 
     readonly Camera _myCamera;
     readonly Light _mainLight;
@@ -51,6 +61,9 @@ public class PriviewNetworkScene : Scene
         // For a "light" object: the engine Light paired with the visible marker (Instance), so
         // move/power/delete update BOTH. Null for ordinary mesh/primitive/sphere objects.
         public Light? Light;
+        // For the special "platform" entry: the LIVE PlatformConfig (mutated in place), so editing
+        // its Shape/size/Color persists on save/sync. Non-null ONLY for the platform entry.
+        public PlatformConfig? Platform;
     }
 
     private bool _editMode = false;
@@ -70,10 +83,15 @@ public class PriviewNetworkScene : Scene
     private const float SpinStep = 0.1f;
     private const float RadiusStep = 0.1f;
     private const float PowerStep = 50f;                 // light power adjust per N/M press
+    private const float InfluenceStep = 0.05f;           // light color-influence adjust per N/M press
+    private const int ColorStep = 17;                    // 0..255 in 15 presses, hits both ends
     private const float DirStep = 0.15f;                 // light direction component adjust (then re-normalized)
     private const float ConeStep = 2f;                   // spot cone half-angle, degrees per press
     private const float AreaStep = 0.1f;                 // area light half-extent per press
     private const float LightSpinStep = 0.2f;            // light direction sweep speed, rad/s per press
+    private const float PlatformStep = 0.5f;             // platform size/width/depth adjust per N/M press
+    private const float PlatformMin = 0.5f;              // smallest platform extent (never zero/negative)
+    private static readonly string[] PlatformShapes = { "square", "rectangle", "circle" };   // ordered for PlatShape cycle
     private const float LightMarkerScale = 0.3f;         // size of the small cube that marks a light
     private static readonly Vector3 LightMarkerOffset = Vector3.Zero;  // Light sits exactly at its marker; the marker is a non-shadow-caster so there's no self-shadow to avoid
     private readonly HashSet<ConsoleKey> _prevDown = new();
@@ -81,8 +99,9 @@ public class PriviewNetworkScene : Scene
     private string _saveMsg = "";
 
     // Properties-panel editable fields (read-only Type/Mesh are not in here).
-    private enum Field { PosX, PosY, PosZ, RotX, RotY, RotZ, Scale, RotateSpeed, Color, Radius,
-                         Power, Kind, DirX, DirY, DirZ, ConeAngle, AreaSize, Spin, Beams, Shape }
+    private enum Field { PosX, PosY, PosZ, RotX, RotY, RotZ, Scale, RotateSpeed, ColorR, ColorG, ColorB, ColorA, Radius,
+                         Power, ClrInf, Kind, DirX, DirY, DirZ, ConeAngle, AreaSize, AreaShape, Spin, Beams, Shape,
+                         PlatShape, PlatSize, PlatWidth, PlatDepth, Collides, Gravity }
     private int _fieldIndex = 0;
 
     // Editable fields for the selected entry. A light's set depends on its Kind: every light shows
@@ -92,19 +111,30 @@ public class PriviewNetworkScene : Scene
     {
         string type = e.Descriptor.Type ?? "";
         if (type == "sphere")
-            return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.Radius, Field.Color };
+            return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.Radius, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.Collides, Field.Gravity };
+        if (type == "platform")
+        {
+            // The floor moves like any object (Pos), then a shape-dependent size set + Color.
+            return (e.Platform?.Shape?.Trim().ToLowerInvariant()) switch
+            {
+                "rectangle" => new[] { Field.PosX, Field.PosY, Field.PosZ, Field.PlatShape, Field.PlatWidth, Field.PlatDepth, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.Collides, Field.Gravity },
+                "circle"    => new[] { Field.PosX, Field.PosY, Field.PosZ, Field.PlatShape, Field.PlatSize, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.Collides, Field.Gravity },
+                _           => new[] { Field.PosX, Field.PosY, Field.PosZ, Field.PlatShape, Field.PlatSize, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.Collides, Field.Gravity },   // square + legacy/unknown
+            };
+        }
         if (type == "light")
         {
-            var f = new List<Field> { Field.PosX, Field.PosY, Field.PosZ, Field.Power, Field.Color, Field.Kind };
+            var f = new List<Field> { Field.PosX, Field.PosY, Field.PosZ, Field.Power, Field.ClrInf, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.Kind };
             switch (e.Light?.Kind ?? LightKind.Point)
             {
                 case LightKind.Directional: f.AddRange(new[] { Field.DirX, Field.DirY, Field.DirZ, Field.Spin }); break;
                 case LightKind.Spot:        f.AddRange(new[] { Field.DirX, Field.DirY, Field.DirZ, Field.ConeAngle, Field.Beams, Field.Shape, Field.Spin }); break;
-                case LightKind.Area:        f.AddRange(new[] { Field.DirX, Field.DirY, Field.DirZ, Field.AreaSize, Field.Spin }); break;
+                case LightKind.Area:        f.AddRange(new[] { Field.DirX, Field.DirY, Field.DirZ, Field.AreaSize, Field.AreaShape, Field.Spin }); break;
             }
+            f.Add(Field.Gravity);   // a light has no collider, but it CAN be made to fall
             return f.ToArray();
         }
-        return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.Scale, Field.RotateSpeed, Field.Color };
+        return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.Scale, Field.RotateSpeed, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.Collides, Field.Gravity };
     }
 
 
@@ -140,15 +170,21 @@ public class PriviewNetworkScene : Scene
         PacketManager.RegisterPacket<WorldSyncPacket>();
         PacketManager.RegisterPacket<WorldRequestPacket>();
         PacketManager.RegisterPacket<WorldEditPacket>();
+        PacketManager.RegisterPacket<WorldSettingsPacket>();
+        PacketManager.RegisterPacket<PlayerLeftPacket>();
+        PacketManager.RegisterPacket<MeshChunkPacket>();
 
         PacketManager.Subscribe<TransformPacket>(OnTransformReceived);
         PacketManager.Subscribe<ChatPacket>(OnChatReceived);
+        // Both sides: a client drops left peers; a server (future relayed leaves) is harmless.
+        PacketManager.Subscribe<PlayerLeftPacket>(OnPlayerLeft);
 
         if (isServer)
         {
             // The server answers a joining client's world request with its world.
             PacketManager.Subscribe<WorldRequestPacket>(OnWorldRequested);
             _netManager.StartServer(port);
+            _netManager.OnClientDisconnected += OnClientDisconnectedServer;
             Logger.Info($"Server listening on port {port}");
             Console.Title = $"SERVER (Port: {port}) | ID: {_myNetId}";
         }
@@ -158,6 +194,8 @@ public class PriviewNetworkScene : Scene
             // then applies the server's live edit deltas in place (view-only).
             PacketManager.Subscribe<WorldSyncPacket>(OnWorldSyncReceived);
             PacketManager.Subscribe<WorldEditPacket>(OnWorldEditReceived);
+            PacketManager.Subscribe<WorldSettingsPacket>(OnWorldSettingsReceived);
+            PacketManager.Subscribe<MeshChunkPacket>(OnMeshChunkReceived);
             _awaitingWorld = true;
             _netManager.Connect(targetIp, port);
             Logger.Info($"Connecting to {targetIp}:{port}");
@@ -182,6 +220,7 @@ public class PriviewNetworkScene : Scene
         _spawnTypes.Add("cone");
         _spawnTypes.Add("pyramid");
         _spawnTypes.Add("light");
+        _spawnTypes.Add("platform");
         _spawnTypes.AddRange(WorldManager.ListAvailableMeshes());
 
         // The world authority (server, and local solo) stamps stable sequential ids onto its
@@ -224,10 +263,22 @@ public class PriviewNetworkScene : Scene
     {
         if (!_world.Platform.Enabled) return;
         Object3d floor = CreatePlatform(_world.Platform);
-        floor.Position = new Vector3(0, 0, 0);
-        floor.Color = ParseColor(_world.Platform.Color, ConsoleColor.Yellow);
+        floor.Position = ToVec(_world.Platform.Position);
+        floor.Color = ParseColor(_world.Platform.Color, new Rgba32(255, 255, 0));
+        ApplyPhysicsFlags(floor, _world.Platform.Collides, _world.Platform.Gravity);
+        floor.UpdateGeometry();   // recompute the world AABB at its actual position (collider uses it)
         AddDisplaysObject(floor);
         _floor = floor;
+
+        // The platform is a SPECIAL editable entry backed by the LIVE PlatformConfig (mutated in
+        // place). A sentinel id (-1) keeps it clear of every real object id in the id-based handlers.
+        // Runs on both authority and client (re-run by ApplyReceivedWorld), so it covers all modes.
+        _editables.Add(new EditEntry
+        {
+            Descriptor = new WorldObject { Type = "platform", Id = -1 },
+            Instance   = floor,
+            Platform   = _world.Platform,
+        });
     }
 
     // Builds one world object (mesh / cube / sphere), adds it to the display, and records
@@ -306,9 +357,11 @@ public class PriviewNetworkScene : Scene
             case "light":
             {
                 LightKind kind = ParseLightKind(o.LightKind);
-                Object3d marker = BuildLightMarker(kind, ToVec(o.Direction), o.LightSize);
+                Object3d marker = BuildLightMarker(kind, ToVec(o.Direction), o.LightSize, ParseConeShape(o.ConeShape), o.ConeAngle, ParseConeShape(o.AreaShape), o.BeamCount);
                 marker.Position = ToVec(o.Position);
-                marker.Color = ParseColor(o.Color, ConsoleColor.Yellow);
+                marker.Color = ParseColor(o.Color, new Rgba32(255, 255, 0));
+                marker.Collides = false;   // a light marker is visual-only — never a collider
+                marker.Gravity = o.Gravity && _world.Physics.GravityEnabled;   // a light CAN fall if its gravity flag is on
                 marker.UpdateGeometry();
                 _models.Add(marker);
                 AddDisplaysObject(marker, castsShadow: false);   // a light marker is visual-only; it must not shadow
@@ -351,17 +404,164 @@ public class PriviewNetworkScene : Scene
         return best;
     }
 
+    // ---- Collision (camera bubble vs scene colliders) ----
+    private const float CameraRadius = 0.35f;
+
+    // Push a sphere (c,r) out of an AABB. Returns c unchanged if not penetrating.
+    public static Vector3 ResolveSphereVsAabb(Vector3 c, float r, Vector3 min, Vector3 max)
+    {
+        Vector3 cl = new(Math.Clamp(c.X, min.X, max.X), Math.Clamp(c.Y, min.Y, max.Y), Math.Clamp(c.Z, min.Z, max.Z));
+        Vector3 d = c - cl; float d2 = d * d;
+        if (d2 >= r * r) return c;
+        if (d2 > 1e-8f) { float dist = MathF.Sqrt(d2); return cl + d * (r / dist); }   // outside-ish: push to the surface
+        // centre inside the box: eject along the least-penetrating face
+        float px1 = c.X - min.X, px2 = max.X - c.X, py1 = c.Y - min.Y, py2 = max.Y - c.Y, pz1 = c.Z - min.Z, pz2 = max.Z - c.Z;
+        float m = MathF.Min(MathF.Min(MathF.Min(px1, px2), MathF.Min(py1, py2)), MathF.Min(pz1, pz2));
+        if (m == px1) c.X = min.X - r; else if (m == px2) c.X = max.X + r;
+        else if (m == py1) c.Y = min.Y - r; else if (m == py2) c.Y = max.Y + r;
+        else if (m == pz1) c.Z = min.Z - r; else c.Z = max.Z + r;
+        return c;
+    }
+
+    // Push a sphere (c,r) out of another sphere (center,sr).
+    public static Vector3 ResolveSphereVsSphere(Vector3 c, float r, Vector3 center, float sr)
+    {
+        Vector3 d = c - center; float d2 = d * d; float rr = r + sr;
+        if (d2 >= rr * rr) return c;
+        if (d2 > 1e-8f) { float dist = MathF.Sqrt(d2); return center + d * (rr / dist); }
+        return c + new Vector3(0f, rr, 0f);   // coincident: pop up
+    }
+
+    // Eject the camera's bubble out of every collidable scene object (a couple of passes catch
+    // multiple simultaneous contacts). A sphere collider for Sphere, the world AABB for Object3d.
+    private void ResolveCameraCollision()
+    {
+        for (int pass = 0; pass < 2; pass++)
+            foreach (var e in _editables)
+            {
+                if (e.Instance is not { Collides: true }) continue;
+                if (e.Instance is Sphere s)        _myCamera.Position = ResolveSphereVsSphere(_myCamera.Position, CameraRadius, s.Position, s.R);
+                else if (e.Instance is Object3d o) _myCamera.Position = ResolveSphereVsAabb(_myCamera.Position, CameraRadius, o.WorldMin, o.WorldMax);
+            }
+    }
+
+    // ---- Player character controller (only when the world has gravity) ----
+    // When gravity is on and fly mode is off, the camera is a walking character: gravity pulls it
+    // down, collision rests it on the floor/objects, Space jumps. F1 toggles a free-fly (noclip)
+    // mode for building/inspecting, which restores the old Space/C vertical flight. Player physics
+    // runs locally for every peer (it only moves _myCamera, never world objects), so it never desyncs.
+    private float _playerVelY = 0f;     // camera vertical velocity (gravity + jump)
+    private bool _onGround = false;     // camera resting on a surface this frame (gates jumping)
+    private bool _flyMode = false;      // F1: free-fly/noclip instead of walking
+    private const float JumpSpeed = 6f; // initial upward speed of a jump
+    private const float GroundEps = 1e-3f;
+
+    // The player walks (gravity + ground + jump) only in a gravity world with fly mode off.
+    private bool PlayerWalking => _world.Physics.GravityEnabled && !_flyMode;
+
+    // One player step: jump on Space (from the ground), apply gravity, then let the camera-bubble
+    // collision rest the camera on whatever is beneath it. Landing/headbonk are read from how the
+    // collision nudged Y relative to the pre-collision position.
+    private void StepPlayerPhysics(float dt)
+    {
+        if (_onGround && Pressed(ConsoleKey.Spacebar)) _playerVelY = JumpSpeed;   // jump
+
+        _playerVelY -= _world.Physics.GravityStrength * dt;
+        _myCamera.Position.Y += _playerVelY * dt;
+
+        float yBefore = _myCamera.Position.Y;
+        ResolveCameraCollision();              // pushes the bubble out of floor + objects (all axes)
+        float yAfter = _myCamera.Position.Y;
+
+        // Landed: collision lifted us while we were falling -> rest on the surface.
+        if (_playerVelY <= 0f && yAfter > yBefore + GroundEps) { _onGround = true; _playerVelY = 0f; }
+        else _onGround = false;
+        // Bonked a ceiling while rising -> stop the upward velocity.
+        if (_playerVelY > 0f && yAfter < yBefore - GroundEps) _playerVelY = 0f;
+    }
+
+    // ---- Gravity physics (vertical only; authority/solo, never synced to clients) ----
+    private readonly Dictionary<GameObject, float> _fallVel = new();   // per-object vertical velocity
+
+    // Do two AABBs overlap on the X/Z plane (Y ignored)? Picks out what sits under a falling object.
+    public static bool XZOverlap(Vector3 minA, Vector3 maxA, Vector3 minB, Vector3 maxB)
+        => minA.X <= maxB.X && maxA.X >= minB.X && minA.Z <= maxB.Z && maxA.Z >= minB.Z;
+
+    // Integrate one object's vertical fall for dt; if it would sink to/under supportTop while falling,
+    // rest it. Returns the new bottom-Y and velocity.
+    public static (float bottomY, float velY) StepFallY(float bottomY, float velY, float dt, float g, float supportTop)
+    {
+        velY -= g * dt;
+        bottomY += velY * dt;
+        if (velY <= 0f && bottomY <= supportTop) { bottomY = supportTop; velY = 0f; }
+        return (bottomY, velY);
+    }
+
+    // One gravity step: every object whose effective Gravity is on (per-object flag AND the world
+    // switch — meshes, primitives, spheres, and even a platform or light if its flag is set) falls and
+    // rests on the highest COLLIDABLE surface beneath it (X/Z overlap). Authority/solo only; default
+    // OFF and opt-in per object — clients are view-only and never simulate, so they can't diverge.
+    private void StepPhysics(float dt)
+    {
+        if (!CanEdit || !_world.Physics.GravityEnabled) return;
+        float g = _world.Physics.GravityStrength;
+        // dynamic = objects with effective gravity on; supports = every OTHER collidable object.
+        foreach (var e in _editables)
+        {
+            if (e.Instance is not { Gravity: true }) continue;
+            // object world bounds + bottom
+            Vector3 oMin, oMax; float bottom;
+            if (e.Instance is Object3d o) { oMin = o.WorldMin; oMax = o.WorldMax; bottom = o.WorldMin.Y; }
+            else if (e.Instance is Sphere s) { float r = s.R; oMin = s.Position - new Vector3(r, r, r); oMax = s.Position + new Vector3(r, r, r); bottom = s.Position.Y - r; }
+            else continue;
+            // highest support top under this object (X/Z overlap, top at or below the object's bottom + a small skin).
+            // Supports are COLLIDABLE objects, so a falling thing rests only on what can actually block it.
+            float supportTop = float.NegativeInfinity;
+            foreach (var s2 in _editables)
+            {
+                if (ReferenceEquals(s2, e) || s2.Instance is not { Collides: true }) continue;
+                Vector3 sMin, sMax;
+                if (s2.Instance is Object3d so) { sMin = so.WorldMin; sMax = so.WorldMax; }
+                else if (s2.Instance is Sphere ss) { float r = ss.R; sMin = ss.Position - new Vector3(r, r, r); sMax = ss.Position + new Vector3(r, r, r); }
+                else continue;
+                if (XZOverlap(oMin, oMax, sMin, sMax) && sMax.Y <= bottom + 0.25f && sMax.Y > supportTop) supportTop = sMax.Y;
+            }
+            if (float.IsNegativeInfinity(supportTop)) supportTop = -1000f;   // nothing below -> fall freely
+            float v = _fallVel.GetValueOrDefault(e.Instance, 0f);
+            var (newBottom, newV) = StepFallY(bottom, v, dt, g, supportTop);
+            _fallVel[e.Instance] = newV;
+            // A resting object doesn't move, so skip the per-frame geometry rebuild (the costly part).
+            float deltaY = newBottom - bottom;
+            if (MathF.Abs(deltaY) > 1e-6f)
+            {
+                e.Instance.Position.Y += deltaY;                 // shift so the bottom lands where physics says
+                if (e.Instance is Object3d oo) oo.UpdateGeometry();
+                SyncLightToMarker(e);   // if this is a (falling) light, keep its engine Light on the marker
+            }
+        }
+    }
+
     /// <summary>
     /// Applies a WorldObject's transform/properties to an EXISTING live instance and refreshes
     /// its geometry — never reloads the mesh. Shared by BuildWorldObject (post-creation) and the
     /// client's Modify handler, so creation and a server delta stay identical. ApplyAnchor is only
     /// for meshes (a cube has none) and is idempotent when re-applied with the same anchor.
     /// </summary>
-    private static void ApplyToInstance(WorldObject o, GameObject instance)
+    // Bakes the EFFECTIVE physics flags onto a live instance: a per-object flag only takes effect
+    // when the matching world switch is on (collision OFF in the world -> nothing collides; gravity
+    // OFF -> nothing falls). This is the single place the world-level gate is applied.
+    private void ApplyPhysicsFlags(GameObject instance, bool collidesIntent, bool gravityIntent)
+    {
+        instance.Collides = collidesIntent && _world.Physics.CollisionEnabled;
+        instance.Gravity  = gravityIntent  && _world.Physics.GravityEnabled;
+    }
+
+    private void ApplyToInstance(WorldObject o, GameObject instance)
     {
         instance.Position = ToVec(o.Position);
         instance.LocalRotate = ToVec(o.Rotation);
-        instance.Color = ParseColor(o.Color, ConsoleColor.White);
+        instance.Color = ParseColor(o.Color, Rgba32.White);
+        ApplyPhysicsFlags(instance, o.Collides, o.Gravity);
 
         if (instance is Object3d mesh)
         {
@@ -397,8 +597,10 @@ public class PriviewNetworkScene : Scene
             Position = FromVec(instance.Position),                 // light: the marker's position
             Rotation = FromVec(instance.LocalRotate),
             Scale = o3d?.Scale ?? descriptor.Scale,
-            Color = instance.Color.ToString(),
+            Color = ToHex(instance.Color),
             RotateSpeed = o3d?.RotateSpeed ?? descriptor.RotateSpeed,
+            Collides = instance.Collides,
+            Gravity = instance.Gravity,
             // ---- light read-back: every live light field flows back from the paired Light ----
             Power = light?.LightPower ?? descriptor.Power,
             LightKind = light != null ? LightKindToString(light.Kind) : descriptor.LightKind,
@@ -408,6 +610,8 @@ public class PriviewNetworkScene : Scene
             LightSpin = light?.SpinSpeed ?? descriptor.LightSpin,
             BeamCount = light?.BeamCount ?? descriptor.BeamCount,
             ConeShape = light != null ? ConeShapeToString(light.ConeShape) : descriptor.ConeShape,
+            AreaShape = light != null ? ConeShapeToString(light.AreaShape) : descriptor.AreaShape,
+            ColorInfluence = light?.ColorInfluence ?? descriptor.ColorInfluence,
         };
     }
 
@@ -423,8 +627,10 @@ public class PriviewNetworkScene : Scene
         light.SpinSpeed = o.LightSpin;
         light.BeamCount = Math.Max(1, o.BeamCount);
         light.ConeShape = ParseConeShape(o.ConeShape);
+        light.AreaShape = ParseConeShape(o.AreaShape);
         light.LightPower = o.Power;
-        light.Rgb = ColorRgb.ToRgb(ParseColor(o.Color, ConsoleColor.White));   // the light's emission color
+        light.Rgb = ParseColor(o.Color, Rgba32.White).ToUnit();   // the light's emission color (RGB only)
+        light.ColorInfluence = o.ColorInfluence;
         light.Position = markerPos + LightMarkerOffset;
     }
 
@@ -470,21 +676,34 @@ public class PriviewNetworkScene : Scene
     // => a cone whose apex points along Direction (the way it shines); Area => a flat double-sided
     // square whose face faces Direction, scaled to the area half-extent. (A single oriented mesh per
     // kind, rather than cube+cone, keeps one pickable Instance per entry.)
-    private static Object3d BuildLightMarker(LightKind kind, Vector3 dir, float areaSize)
+    private static Object3d BuildLightMarker(LightKind kind, Vector3 dir, float areaSize,
+                                             ConeShapeKind coneShape = ConeShapeKind.Circle, float coneAngleDeg = 30f,
+                                             ConeShapeKind areaShape = ConeShapeKind.Square, int beamCount = 1)
     {
         switch (kind)
         {
-            case LightKind.Directional:
             case LightKind.Spot:
             {
-                var m = CreateCone();
+                // A multi-beam spot fans BeamCount cones (mirrors SpotTerm); a single beam keeps the
+                // cheap one-cone-plus-LocalRotate marker.
+                if (beamCount > 1) return BuildSpotFanMarker(dir, beamCount, coneShape, coneAngleDeg);
+                // The spot marker shows its cross-section (coneShape) and aperture (wider cone = wider base).
+                float baseRadius = Math.Clamp(2f * MathF.Tan(coneAngleDeg * MathF.PI / 180f), 0.2f, 3f);
+                var m = BuildConeMarker(coneShape, baseRadius);
+                m.Scale = LightMarkerScale;
+                m.LocalRotate = DirToEuler(dir);
+                return m;
+            }
+            case LightKind.Directional:
+            {
+                var m = BuildConeMarker(coneShape, 1.15f);   // fixed aperture (a sun has no cone angle)
                 m.Scale = LightMarkerScale;
                 m.LocalRotate = DirToEuler(dir);
                 return m;
             }
             case LightKind.Area:
             {
-                var m = CreateSquareMarker();
+                var m = BuildAreaMarker(areaShape);
                 m.Scale = MathF.Max(0.05f, areaSize);
                 m.LocalRotate = DirToEuler(dir);
                 return m;
@@ -528,6 +747,43 @@ public class PriviewNetworkScene : Scene
         return BuildFlat(verts, tris);
     }
 
+    // A flat, double-sided UNIT (extent 1) emitter polygon in the XZ plane (y=0), matching the
+    // Area light's footprint: Square = the quad above; Circle = 16-seg disc; Triangle = equilateral
+    // (vertex at +Z). Both windings so it shows from either side once oriented. Scaled by AreaSize
+    // at the call site so the marker tracks the lighting half-extent.
+    private static Object3d BuildAreaMarker(ConeShapeKind shape)
+    {
+        if (shape == ConeShapeKind.Square) return CreateSquareMarker();
+
+        var verts = new List<Vector3>();
+        if (shape == ConeShapeKind.Triangle)
+        {
+            verts.Add(new Vector3(0f, 0f, 1f));               // 1
+            verts.Add(new Vector3(0.8660254f, 0f, -0.5f));    // 2
+            verts.Add(new Vector3(-0.8660254f, 0f, -0.5f));   // 3
+        }
+        else   // Circle: 16-seg ring, radius 1
+        {
+            for (int s = 0; s < 16; s++)
+            {
+                float a = MathF.Tau * s / 16;
+                verts.Add(new Vector3(MathF.Cos(a), 0f, MathF.Sin(a)));
+            }
+        }
+
+        int n = verts.Count;
+        int c = verts.Count + 1; verts.Add(new Vector3(0f, 0f, 0f));   // centre
+        int B(int s) => (s % n) + 1;
+
+        var tris = new List<(int, int, int)>();
+        for (int s = 0; s < n; s++)
+        {
+            tris.Add((c, B(s), B(s + 1)));   // one winding
+            tris.Add((c, B(s + 1), B(s)));   // reverse winding (double-sided)
+        }
+        return BuildFlat(verts, tris);
+    }
+
     // Swaps an entry's marker mesh for a fresh one (carrying over position + color), keeping it
     // selectable in place. Used when a light's Kind changes so the marker morphs cube<->cone<->square.
     private void ReplaceMarker(EditEntry entry, Object3d fresh)
@@ -535,6 +791,8 @@ public class PriviewNetworkScene : Scene
         var old = entry.Instance;
         fresh.Position = old.Position;
         fresh.Color = old.Color;
+        fresh.Collides = false;          // markers never collide
+        fresh.Gravity = old.Gravity;     // but a falling light keeps falling across a kind/shape morph
         fresh.UpdateGeometry();
 
         if (old is IDisplays oldDisp) RemoveDisplaysObject(oldDisp);
@@ -553,8 +811,29 @@ public class PriviewNetworkScene : Scene
         _ => AnchorMode.Bottom
     };
 
-    private static ConsoleColor ParseColor(string? s, ConsoleColor fallback) =>
-        Enum.TryParse<ConsoleColor>(s, true, out var c) ? c : fallback;
+    // Parses a scene color: "#RRGGBBAA"/"#RRGGBB"(A=255) hex, "r,g,b" / "r,g,b,a" bytes, or a legacy
+    // ConsoleColor name (so old worlds still load). Returns fallback for null/blank/unparseable.
+    public static Rgba32 ParseColor(string? s, Rgba32 fallback)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return fallback;
+        s = s.Trim();
+        string hex = s.StartsWith("#") ? s.Substring(1) : s;
+        if (hex.Length == 8 && uint.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint v8))
+            return new Rgba32((byte)((v8 >> 24) & 0xFF), (byte)((v8 >> 16) & 0xFF), (byte)((v8 >> 8) & 0xFF), (byte)(v8 & 0xFF));
+        if (hex.Length == 6 && int.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int v))
+            return new Rgba32((byte)((v >> 16) & 0xFF), (byte)((v >> 8) & 0xFF), (byte)(v & 0xFF));
+        var p = s.Split(',');
+        if (p.Length == 3 && byte.TryParse(p[0], out var r) && byte.TryParse(p[1], out var g) && byte.TryParse(p[2], out var b))
+            return new Rgba32(r, g, b);
+        if (p.Length == 4 && byte.TryParse(p[0], out var r2) && byte.TryParse(p[1], out var g2) && byte.TryParse(p[2], out var b2) && byte.TryParse(p[3], out var a2))
+            return new Rgba32(r2, g2, b2, a2);
+        if (Enum.TryParse<ConsoleColor>(s, true, out var cc)) return Rgba32.FromUnit(ColorRgb.ToRgb(cc));
+        return fallback;
+    }
+
+    // "#RRGGBB" when opaque, else "#RRGGBBAA" (so alpha persists through JSON + sync).
+    public static string ToHex(Rgba32 c) =>
+        c.A == 255 ? $"#{c.R:X2}{c.G:X2}{c.B:X2}" : $"#{c.R:X2}{c.G:X2}{c.B:X2}{c.A:X2}";
 
     public override void Update()
     {
@@ -590,7 +869,18 @@ public class PriviewNetworkScene : Scene
             // Tab toggles the editor; camera fly stays active in edit mode.
             if (Pressed(ConsoleKey.Tab)) _editMode = !_editMode;
 
-            HandleGameInput(GameTime.GetDeltaTime());
+            float dt = GameTime.GetDeltaTime();
+            HandleGameInput(dt);
+            if (PlayerWalking)
+            {
+                StepPlayerPhysics(dt);              // gravity + ground + jump
+            }
+            else
+            {
+                if (!_flyMode) ResolveCameraCollision();   // no-gravity world: keep wall pushout; fly mode passes through
+                _playerVelY = 0f; _onGround = false;       // reset so re-entering walk starts clean
+            }
+            StepPhysics(dt);
 
             if (_editMode) HandleEditorInput();
 
@@ -602,15 +892,15 @@ public class PriviewNetworkScene : Scene
             }
         }
 
-        // Server is the world authority: if an edit-action changed the selected object this
-        // frame, stream ONE coalesced Modify delta for it (at most one per object per frame).
+        // Server is the world authority: if an edit-action changed the selected object this frame,
+        // stream ONE coalesced delta for it. A dirty PLATFORM pushes the whole settings packet (it has
+        // no per-object delta); any other object streams a coalesced Modify.
         if (_online && _isServer && _editDirty && _selected >= 0 && _selected < _editables.Count)
         {
-            var entry = _editables[_selected];
-            var o = FromInstance(entry.Descriptor, entry.Instance, entry.Light);   // carries the stable id (+ light power)
-            _netManager?.SendPacket(
-                new WorldEditPacket { Op = 0, Id = o.Id, ObjectJson = JsonSerializer.Serialize(o) },
-                _myNetId);
+            var sel = _editables[_selected];
+            if (string.Equals(sel.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase))
+                BroadcastWorldSettings();                 // platform: push whole settings (no per-object delta)
+            else { var o = FromInstance(sel.Descriptor, sel.Instance, sel.Light); _netManager?.SendPacket(new WorldEditPacket { Op = 0, Id = o.Id, ObjectJson = JsonSerializer.Serialize(o) }, _myNetId); }
         }
         _editDirty = false;
 
@@ -619,6 +909,11 @@ public class PriviewNetworkScene : Scene
             var packet = new TransformPacket(_myCamera.Position, _myCamera.LocalRotate);
             _netManager.SendPacket(packet, _myNetId);
         }
+
+        // Drain a few paced mesh-chunk/spawn sends so a big live spawn doesn't block other packets.
+        for (int i = 0; i < ChunksPerFrame && _outgoing.Count > 0; i++)
+            _outgoing.Dequeue().Invoke();
+
         if (_ownLightEnabled) _mainLight.Position = _myCamera.Position;
         if (_saveFlash > 0) _saveFlash--;
         DrawChatInterface();
@@ -706,7 +1001,7 @@ public class PriviewNetworkScene : Scene
                 if (Pressed(ConsoleKey.M)) dir = +1;
                 if (dir != 0) { AdjustField(fields[_fieldIndex], _editables[_selected], dir); _editDirty = true; }
 
-                // Delete the selected object.
+                // Delete the selected object (the platform deletes by disabling — see DeleteSelected).
                 if (Pressed(ConsoleKey.Delete)) DeleteSelected();
             }
         }
@@ -735,58 +1030,129 @@ public class PriviewNetworkScene : Scene
             case Field.RotateSpeed:
                 if (o != null) o.RotateSpeed += dir * SpinStep;
                 break;
-            case Field.Color:
-                inst.Color = CycleColor(inst.Color, dir);
-                if (entry.Light != null) entry.Light.Rgb = ColorRgb.ToRgb(inst.Color);   // light emits the marker color
-                break;
+            case Field.ColorR: inst.Color = new Rgba32((byte)Math.Clamp(inst.Color.R + dir * ColorStep, 0, 255), inst.Color.G, inst.Color.B, inst.Color.A); SyncColorDerived(entry); break;
+            case Field.ColorG: inst.Color = new Rgba32(inst.Color.R, (byte)Math.Clamp(inst.Color.G + dir * ColorStep, 0, 255), inst.Color.B, inst.Color.A); SyncColorDerived(entry); break;
+            case Field.ColorB: inst.Color = new Rgba32(inst.Color.R, inst.Color.G, (byte)Math.Clamp(inst.Color.B + dir * ColorStep, 0, 255), inst.Color.A); SyncColorDerived(entry); break;
+            case Field.ColorA: inst.Color = new Rgba32(inst.Color.R, inst.Color.G, inst.Color.B, (byte)Math.Clamp(inst.Color.A + dir * ColorStep, 0, 255)); SyncColorDerived(entry); break;
             case Field.Radius:
                 if (inst is Sphere s) s.R = MathF.Max(0.01f, s.R + dir * RadiusStep);
                 break;
+            case Field.Collides:
+                if (!_world.Physics.CollisionEnabled) break;                          // world collision off -> locked off
+                inst.Collides = !inst.Collides;                                       // N or M toggles it
+                if (entry.Platform != null) entry.Platform.Collides = inst.Collides;  // platform: persist on the live config
+                break;
+            case Field.Gravity:
+                if (!_world.Physics.GravityEnabled) break;                            // world gravity off -> locked off
+                inst.Gravity = !inst.Gravity;                                         // N or M toggles it
+                if (!inst.Gravity) _fallVel.Remove(inst);                             // stop tracking velocity once it can't fall
+                if (entry.Platform != null) entry.Platform.Gravity = inst.Gravity;    // platform: persist on the live config
+                break;
             case Field.Power:
                 if (entry.Light != null) entry.Light.LightPower = MathF.Max(0f, entry.Light.LightPower + dir * PowerStep);
+                break;
+            case Field.ClrInf:
+                if (entry.Light != null)
+                    entry.Light.ColorInfluence = Math.Clamp(entry.Light.ColorInfluence + dir * InfluenceStep, 0f, 1f);
                 break;
             case Field.Kind:
                 if (entry.Light != null)
                 {
                     int n = Enum.GetValues<LightKind>().Length;
                     entry.Light.Kind = (LightKind)((((int)entry.Light.Kind + dir) % n + n) % n);
-                    // Morph the marker mesh (cube <-> cone <-> square) to match the new kind.
-                    ReplaceMarker(entry, BuildLightMarker(entry.Light.Kind, entry.Light.Direction, entry.Light.AreaSize));
+                    // Morph the marker mesh (cube <-> cone <-> shaped panel) to match the new kind.
+                    ReplaceMarker(entry, BuildLightMarker(entry.Light.Kind, entry.Light.Direction, entry.Light.AreaSize, entry.Light.ConeShape, entry.Light.ConeAngleDeg, entry.Light.AreaShape, entry.Light.BeamCount));
                 }
                 break;
             case Field.DirX: AdjustDirection(entry, new Vector3(dir * DirStep, 0f, 0f)); break;
             case Field.DirY: AdjustDirection(entry, new Vector3(0f, dir * DirStep, 0f)); break;
             case Field.DirZ: AdjustDirection(entry, new Vector3(0f, 0f, dir * DirStep)); break;
             case Field.ConeAngle:
-                if (entry.Light != null) entry.Light.ConeAngleDeg = Math.Clamp(entry.Light.ConeAngleDeg + dir * ConeStep, 1f, 89f);
+                if (entry.Light != null)
+                {
+                    entry.Light.ConeAngleDeg = Math.Clamp(entry.Light.ConeAngleDeg + dir * ConeStep, 1f, 89f);
+                    ReplaceMarker(entry, BuildLightMarker(entry.Light.Kind, entry.Light.Direction, entry.Light.AreaSize, entry.Light.ConeShape, entry.Light.ConeAngleDeg, entry.Light.AreaShape, entry.Light.BeamCount));
+                }
                 break;
             case Field.AreaSize:
                 if (entry.Light != null)
                 {
                     entry.Light.AreaSize = MathF.Max(0.05f, entry.Light.AreaSize + dir * AreaStep);
                     if (entry.Light.Kind == LightKind.Area && entry.Instance is Object3d am)
-                    { am.Scale = entry.Light.AreaSize; am.UpdateGeometry(); }   // square marker tracks the area size
+                    { am.Scale = entry.Light.AreaSize; am.UpdateGeometry(); }   // shaped marker tracks the area size
+                }
+                break;
+            case Field.AreaShape:
+                if (entry.Light != null)
+                {
+                    int n = Enum.GetValues<ConeShapeKind>().Length;
+                    entry.Light.AreaShape = (ConeShapeKind)((((int)entry.Light.AreaShape + dir) % n + n) % n);
+                    ReplaceMarker(entry, BuildLightMarker(entry.Light.Kind, entry.Light.Direction, entry.Light.AreaSize,
+                        entry.Light.ConeShape, entry.Light.ConeAngleDeg, entry.Light.AreaShape, entry.Light.BeamCount));
                 }
                 break;
             case Field.Spin:
                 if (entry.Light != null) entry.Light.SpinSpeed += dir * LightSpinStep;
                 break;
             case Field.Beams:
-                if (entry.Light != null) entry.Light.BeamCount = Math.Clamp(entry.Light.BeamCount + dir, 1, 8);
+                if (entry.Light != null)
+                {
+                    entry.Light.BeamCount = Math.Clamp(entry.Light.BeamCount + dir, 1, 8);
+                    // Always rebuild: this swaps mesh TYPE both ways (1 -> baked fan, many -> single cone).
+                    ReplaceMarker(entry, BuildLightMarker(entry.Light.Kind, entry.Light.Direction, entry.Light.AreaSize,
+                        entry.Light.ConeShape, entry.Light.ConeAngleDeg, entry.Light.AreaShape, entry.Light.BeamCount));
+                }
                 break;
             case Field.Shape:
                 if (entry.Light != null)
                 {
                     int n = Enum.GetValues<ConeShapeKind>().Length;
                     entry.Light.ConeShape = (ConeShapeKind)((((int)entry.Light.ConeShape + dir) % n + n) % n);
+                    ReplaceMarker(entry, BuildLightMarker(entry.Light.Kind, entry.Light.Direction, entry.Light.AreaSize, entry.Light.ConeShape, entry.Light.ConeAngleDeg, entry.Light.AreaShape, entry.Light.BeamCount));
                 }
+                break;
+            case Field.PlatShape:
+                if (entry.Platform != null)
+                {
+                    int idx = Array.IndexOf(PlatformShapes, entry.Platform.Shape?.Trim().ToLowerInvariant());
+                    if (idx < 0) idx = 0;
+                    int n = PlatformShapes.Length;
+                    entry.Platform.Shape = PlatformShapes[(((idx + dir) % n) + n) % n];
+                    RebuildFloor(entry);
+                }
+                break;
+            case Field.PlatSize:
+                if (entry.Platform != null) { entry.Platform.Size = MathF.Max(PlatformMin, entry.Platform.Size + dir * PlatformStep); RebuildFloor(entry); }
+                break;
+            case Field.PlatWidth:
+                if (entry.Platform != null) { entry.Platform.Width = MathF.Max(PlatformMin, entry.Platform.Width + dir * PlatformStep); RebuildFloor(entry); }
+                break;
+            case Field.PlatDepth:
+                if (entry.Platform != null) { entry.Platform.Depth = MathF.Max(PlatformMin, entry.Platform.Depth + dir * PlatformStep); RebuildFloor(entry); }
                 break;
         }
     }
 
+    // Rebuilds the live floor mesh from the (just-mutated) PlatformConfig: a shape/size change
+    // swaps the geometry in place, keeping the entry selectable. Mirrors BuildPlatform's floor
+    // build (a shadow caster, NOT a _models entry) — not ReplaceMarker (markers are visual-only).
+    private void RebuildFloor(EditEntry entry)
+    {
+        if (entry.Platform == null) return;
+        Object3d fresh = CreatePlatform(entry.Platform);
+        fresh.Position = entry.Instance.Position;   // a shape/size change must keep the floor where it was moved to
+        fresh.Color = ParseColor(entry.Platform.Color, new Rgba32(255, 255, 0));
+        ApplyPhysicsFlags(fresh, entry.Platform.Collides, entry.Platform.Gravity);
+        fresh.UpdateGeometry();
+        if (entry.Instance is IDisplays oldDisp) RemoveDisplaysObject(oldDisp);
+        AddDisplaysObject(fresh);          // default castsShadow:true, same as BuildPlatform
+        entry.Instance = fresh;
+        _floor = fresh;
+    }
+
     // Nudges one light's Direction by delta and re-normalizes (kept a unit vector; falls back to
     // straight down if it collapses to zero), then re-aims the marker to match.
-    private static void AdjustDirection(EditEntry entry, Vector3 delta)
+    private void AdjustDirection(EditEntry entry, Vector3 delta)
     {
         if (entry.Light == null) return;
         Vector3 d = entry.Light.Direction + delta;
@@ -794,23 +1160,44 @@ public class PriviewNetworkScene : Scene
         OrientLightMarker(entry);
     }
 
-    // Re-aims a light's marker along its current Direction (no-op for a point light: its cube stays
-    // axis-aligned). Only the orientation changes; the mesh is left as-is.
-    private static void OrientLightMarker(EditEntry entry)
+    // Re-aims a light's marker along its current Direction. A multi-beam spot bakes each beam's aim
+    // into the mesh (no single LocalRotate), so a direction change must REBUILD it; every other marker
+    // just updates LocalRotate. No-op for a point light (its cube stays axis-aligned).
+    private void OrientLightMarker(EditEntry entry)
     {
-        if (entry.Light == null || entry.Light.Kind == LightKind.Point) return;
-        if (entry.Instance is Object3d m) { m.LocalRotate = DirToEuler(entry.Light.Direction); m.UpdateGeometry(); }
+        if (entry.Light == null || entry.Instance is not Object3d m) return;
+        if (entry.Light.Kind == LightKind.Spot && entry.Light.BeamCount > 1)   // baked fan -> re-bake for new dir
+        {
+            ReplaceMarker(entry, BuildLightMarker(entry.Light.Kind, entry.Light.Direction, entry.Light.AreaSize,
+                entry.Light.ConeShape, entry.Light.ConeAngleDeg, entry.Light.AreaShape, entry.Light.BeamCount));
+            return;
+        }
+        if (entry.Light.Kind == LightKind.Point) return;
+        m.LocalRotate = DirToEuler(entry.Light.Direction); m.UpdateGeometry();
     }
 
-    private static ConsoleColor CycleColor(ConsoleColor c, int dir)
+    // Carries a freshly-edited instance color to its derivatives: a light emits its marker's color,
+    // and a platform persists its color as hex (so save/sync pick it up without a floor rebuild).
+    private static void SyncColorDerived(EditEntry entry)
     {
-        int n = Enum.GetValues<ConsoleColor>().Length;   // 16
-        return (ConsoleColor)((((int)c + dir) % n + n) % n);
+        if (entry.Light != null) entry.Light.Rgb = entry.Instance.Color.ToUnit();
+        if (entry.Platform != null) entry.Platform.Color = ToHex(entry.Instance.Color);
     }
 
     private void DeleteSelected()
     {
         if (_selected < 0 || _selected >= _editables.Count) return;
+
+        // The platform "deletes" by disabling (so the removal persists on save/sync) + dropping the floor.
+        var sel = _editables[_selected];
+        if (string.Equals(sel.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase))
+        {
+            _world.Platform.Enabled = false;
+            RemoveEntryAt(_selected);
+            _floor = null;
+            if (_online && _isServer) BroadcastWorldSettings();   // push the disable to connected clients
+            return;
+        }
 
         int id = _editables[_selected].Descriptor.Id;   // capture before removal (for the broadcast)
         RemoveEntryAt(_selected);
@@ -852,6 +1239,21 @@ public class PriviewNetworkScene : Scene
         spawnPos.Y = 0f; // ground level
 
         string label = _spawnTypes[_spawnIndex];
+
+        // The platform is a SINGLE-INSTANCE object: spawn re-enables + rebuilds it (restoring its last
+        // config Shape/Size/Color), or just selects the existing one. (No spawn broadcast — out of scope.)
+        if (string.Equals(label, "platform", StringComparison.OrdinalIgnoreCase))
+        {
+            int existing = _editables.FindIndex(e =>
+                string.Equals(e.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase));
+            if (existing >= 0) { _selected = existing; _fieldIndex = 0; return; }   // already one — just select it
+            _world.Platform.Enabled = true;
+            BuildPlatform();                          // appends the platform entry + sets _floor
+            if (_editables.Count > 0) { _selected = _editables.Count - 1; _fieldIndex = 0; }
+            if (_online && _isServer) BroadcastWorldSettings();   // push the re-enable to connected clients
+            return;
+        }
+
         // The built-in types (primitives + light) keep their label as the Type; anything else is a
         // library mesh.
         bool isBuiltIn = label is "cube" or "sphere" or "cylinder" or "cone" or "pyramid" or "light";
@@ -881,18 +1283,39 @@ public class PriviewNetworkScene : Scene
                 Id = descriptor.Id,
                 ObjectJson = JsonSerializer.Serialize(descriptor),
             };
+
+            string? objText = null;
             if (string.Equals(descriptor.Type, "mesh", StringComparison.OrdinalIgnoreCase)
                 && !string.IsNullOrWhiteSpace(descriptor.Mesh))
             {
                 string path = Path.Combine(AppPaths.ModelsFolder, descriptor.Mesh + ".obj");
-                try
-                {
-                    packet.MeshName = descriptor.Mesh;
-                    packet.MeshObjText = File.ReadAllText(path);
-                }
+                try { objText = File.ReadAllText(path); }
                 catch (Exception ex) { Logger.Error($"Spawn: failed reading mesh '{descriptor.Mesh}' at {path}", ex); }
             }
-            _netManager?.SendPacket(packet, _myNetId);
+
+            // LARGE mesh: stream it as chunks (paced a few per frame in Update) BEFORE the spawn, so
+            // real-time packets interleave; the trailing spawn carries MeshName but EMPTY text (the
+            // mesh is already on disk by then). SMALL mesh (or none): inline exactly as today.
+            if (objText != null && objText.Length > MeshChunkThreshold)
+            {
+                string name = descriptor.Mesh!;
+                int total = (objText.Length + MeshChunkSize - 1) / MeshChunkSize;
+                for (int i = 0; i < total; i++)
+                {
+                    int start = i * MeshChunkSize;
+                    string data = objText.Substring(start, Math.Min(MeshChunkSize, objText.Length - start));
+                    int index = i;   // capture per iteration
+                    _outgoing.Enqueue(() => _netManager?.SendPacket(
+                        new MeshChunkPacket { MeshName = name, Index = index, Total = total, Data = data }, _myNetId));
+                }
+                packet.MeshName = name;   // MeshObjText stays empty; chunks already delivered the mesh
+                _outgoing.Enqueue(() => _netManager?.SendPacket(packet, _myNetId));
+            }
+            else
+            {
+                if (objText != null) { packet.MeshName = descriptor.Mesh!; packet.MeshObjText = objText; }
+                _netManager?.SendPacket(packet, _myNetId);
+            }
         }
     }
 
@@ -911,13 +1334,24 @@ public class PriviewNetworkScene : Scene
     /// writing to disk. Used by SaveWorld and by OnWorldRequested, so a client connecting
     /// mid-edit gets the live state (with live ids), not the stale last-saved _world.
     /// </summary>
-    private WorldConfig BuildLiveWorldConfig() => new WorldConfig
+    private WorldConfig BuildLiveWorldConfig()
     {
-        Name = _world.Name,
-        Graphics = _world.Graphics,
-        Platform = _world.Platform,
-        Objects = _editables.Select(e => FromInstance(e.Descriptor, e.Instance, e.Light)).ToList(),
-    };
+        // The platform is excluded from FromInstance, so sync its live floor position here — this is
+        // the SINGLE place the moved floor's position flows back into the config for save/sync.
+        if (_floor != null) _world.Platform.Position = FromVec(_floor.Position);
+        return new WorldConfig
+        {
+            Name = _world.Name,
+            Graphics = _world.Graphics,
+            Physics = _world.Physics,     // gravity + collision world switches persist on save/sync
+            Platform = _world.Platform,   // the live platform (mutated in place) rides along for save/sync
+            // EXCLUDE the platform entry: it is an extra selectable, not an Object — it must never leak
+            // into the saved/synced object list (it carries through Platform above instead).
+            Objects = _editables
+                .Where(e => !string.Equals(e.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase))
+                .Select(e => FromInstance(e.Descriptor, e.Instance, e.Light)).ToList(),
+        };
+    }
 
     // Edge-triggered key press (true only on the frame the key transitions to down).
     private bool Pressed(ConsoleKey key)
@@ -1048,15 +1482,20 @@ public class PriviewNetworkScene : Scene
     {
         Field.PosX => "Pos X", Field.PosY => "Pos Y", Field.PosZ => "Pos Z",
         Field.RotX => "Rot X", Field.RotY => "Rot Y", Field.RotZ => "Rot Z",
-        Field.Scale => "Scale", Field.RotateSpeed => "Spin", Field.Color => "Color",
-        Field.Radius => "Radius", Field.Power => "Power",
+        Field.Scale => "Scale", Field.RotateSpeed => "Spin",
+        Field.ColorR => "R", Field.ColorG => "G", Field.ColorB => "B", Field.ColorA => "A",
+        Field.Radius => "Radius", Field.Power => "Power", Field.ClrInf => "Influence",
         Field.Kind => "Kind", Field.DirX => "Dir X", Field.DirY => "Dir Y", Field.DirZ => "Dir Z",
-        Field.ConeAngle => "Cone", Field.AreaSize => "Size", Field.Spin => "Spin",
+        Field.ConeAngle => "Cone", Field.AreaSize => "Size", Field.AreaShape => "Shape", Field.Spin => "Spin",
         Field.Beams => "Beams", Field.Shape => "Shape",
+        Field.PlatShape => "Shape", Field.PlatSize => "Size",
+        Field.PlatWidth => "Width", Field.PlatDepth => "Depth",
+        Field.Collides => "Collide",
+        Field.Gravity => "Gravity",
         _ => f.ToString()
     };
 
-    private static string FieldValue(Field f, EditEntry entry)
+    private string FieldValue(Field f, EditEntry entry)
     {
         var inst = entry.Instance;
         var o = inst as Object3d;
@@ -1070,18 +1509,31 @@ public class PriviewNetworkScene : Scene
             Field.RotZ => inst.LocalRotate.Z.ToString("F2"),
             Field.Scale => (o?.Scale ?? 1f).ToString("F2"),
             Field.RotateSpeed => (o?.RotateSpeed ?? 0f).ToString("F2"),
-            Field.Color => inst.Color.ToString(),
+            Field.ColorR => inst.Color.R.ToString(),
+            Field.ColorG => inst.Color.G.ToString(),
+            Field.ColorB => inst.Color.B.ToString(),
+            Field.ColorA => inst.Color.A.ToString(),
             Field.Radius => (inst as Sphere)?.R.ToString("F2") ?? "-",
             Field.Power => (entry.Light?.LightPower ?? entry.Descriptor.Power).ToString("F0"),
+            Field.ClrInf => (entry.Light?.ColorInfluence ?? 0f).ToString("F2"),
             Field.Kind => entry.Light != null ? LightKindToString(entry.Light.Kind) : "-",
             Field.DirX => (entry.Light?.Direction.X ?? 0f).ToString("F2"),
             Field.DirY => (entry.Light?.Direction.Y ?? 0f).ToString("F2"),
             Field.DirZ => (entry.Light?.Direction.Z ?? 0f).ToString("F2"),
             Field.ConeAngle => (entry.Light?.ConeAngleDeg ?? 0f).ToString("F0"),
             Field.AreaSize => (entry.Light?.AreaSize ?? 0f).ToString("F2"),
+            Field.AreaShape => entry.Light != null ? ConeShapeToString(entry.Light.AreaShape) : "-",
             Field.Spin => (entry.Light?.SpinSpeed ?? 0f).ToString("F2"),
             Field.Beams => (entry.Light?.BeamCount ?? 1).ToString(),
             Field.Shape => entry.Light != null ? ConeShapeToString(entry.Light.ConeShape) : "-",
+            Field.PlatShape => entry.Platform?.Shape ?? "-",
+            Field.PlatSize => entry.Platform?.Size.ToString("F1") ?? "-",
+            Field.PlatWidth => entry.Platform?.Width.ToString("F1") ?? "-",
+            Field.PlatDepth => entry.Platform?.Depth.ToString("F1") ?? "-",
+            // Collide/Gravity show their effective state; "locked" makes clear the world switch
+            // forces it off (you can't enable it until the world's master switch is on).
+            Field.Collides => !_world.Physics.CollisionEnabled ? "Off (locked)" : (inst.Collides ? "On" : "Off"),
+            Field.Gravity  => !_world.Physics.GravityEnabled   ? "Off (locked)" : (inst.Gravity  ? "On" : "Off"),
             _ => ""
         };
     }
@@ -1089,6 +1541,10 @@ public class PriviewNetworkScene : Scene
     // Inspection/test accessor: the live editable entries (each pairs a descriptor with its
     // instance, plus a Light for "light" objects). Read-only.
     public IReadOnlyList<EditEntry> EditableEntries => _editables;
+
+    // Inspection/test accessor: the world config built from the CURRENT live instances (the same
+    // projection SaveWorld/OnWorldRequested use), WITHOUT writing to disk.
+    public WorldConfig LiveWorldSnapshot() => BuildLiveWorldConfig();
     
     
     private void HandleGameInput(float dt)
@@ -1123,9 +1579,15 @@ public class PriviewNetworkScene : Scene
         if (Input.IsGetKey(ConsoleKey.S)) _myCamera.Position -= forward * moveSpeed * dt;
         if (Input.IsGetKey(ConsoleKey.D)) _myCamera.Position += right * moveSpeed * dt;
         if (Input.IsGetKey(ConsoleKey.A)) _myCamera.Position -= right * moveSpeed * dt;
-        if (Input.IsGetKey(ConsoleKey.Spacebar)) _myCamera.Position.Y += moveSpeed * dt;
-        if (Input.IsGetKey(ConsoleKey.C))        _myCamera.Position.Y -= moveSpeed * dt;
-        
+        // F1 toggles free-fly / walk. Vertical Space/C only fly when NOT walking; in walk mode Space
+        // jumps (handled in StepPlayerPhysics, which reads it edge-triggered).
+        if (Pressed(ConsoleKey.F1)) _flyMode = !_flyMode;
+        if (!PlayerWalking)
+        {
+            if (Input.IsGetKey(ConsoleKey.Spacebar)) _myCamera.Position.Y += moveSpeed * dt;
+            if (Input.IsGetKey(ConsoleKey.C))        _myCamera.Position.Y -= moveSpeed * dt;
+        }
+
         if (Input.IsGetKey(ConsoleKey.OemPlus)) _mainLight.LightPower += moveSpeed * 50 * dt;
         if (Input.IsGetKey(ConsoleKey.OemMinus)) _mainLight.LightPower -= moveSpeed* 50  * dt;
 
@@ -1135,6 +1597,15 @@ public class PriviewNetworkScene : Scene
 
     private void OnTransformReceived(TransformPacket packet, int senderId)
     {
+        // Server is a hub: re-broadcast a peer's transform to all clients (the original sender ignores
+        // its own echo via senderId==_myNetId), and remember which connection this netId came in on so
+        // a disconnect can map it back.
+        if (_isServer && _netManager != null)
+        {
+            _netManager.SendPacket(packet, senderId);
+            _connToNet[_netManager.LastSenderConnId] = senderId;
+        }
+
         if (senderId == _myNetId) return;
 
         if (!_remotePlayers.ContainsKey(senderId))
@@ -1151,11 +1622,37 @@ public class PriviewNetworkScene : Scene
     private void CreateRemotePlayer(int netId)
     {
         Object3d newPlayerCube = CreateCube();
-        ConsoleColor[] colors = { ConsoleColor.Red, ConsoleColor.Green, ConsoleColor.Blue, ConsoleColor.Yellow, ConsoleColor.Cyan, ConsoleColor.Magenta };
-        newPlayerCube.Color = colors[netId % colors.Length];
-        
+        Rgba32[] palette = { new Rgba32(255, 0, 0), new Rgba32(0, 255, 0), new Rgba32(0, 0, 255), new Rgba32(255, 255, 0), new Rgba32(0, 255, 255), new Rgba32(255, 0, 255) };
+        newPlayerCube.Color = palette[netId % palette.Length];
+        newPlayerCube.Collides = false;   // a remote-player avatar never blocks the local camera
+        newPlayerCube.Gravity = false;    // remote avatars are driven by network transforms, never local gravity
+
         _remotePlayers.Add(netId, newPlayerCube);
         AddDisplaysObject(newPlayerCube);
+    }
+
+    // Drops a peer's avatar (server on disconnect; client on a PlayerLeft notice). No-op if unknown.
+    private void RemoveRemotePlayer(int netId)
+    {
+        if (!_remotePlayers.TryGetValue(netId, out var cube)) return;
+        RemoveDisplaysObject(cube);
+        _remotePlayers.Remove(netId);
+    }
+
+    // Server, main thread (via ProcessEvents): a connection dropped — remove its avatar and tell the
+    // other clients to drop it too.
+    private void OnClientDisconnectedServer(int connId)
+    {
+        if (!_connToNet.TryGetValue(connId, out int netId)) return;
+        _connToNet.Remove(connId);
+        RemoveRemotePlayer(netId);
+        _netManager?.SendPacket(new PlayerLeftPacket { NetId = netId }, _myNetId);
+    }
+
+    // Client (and harmless on a server): a peer left — drop its avatar.
+    private void OnPlayerLeft(PlayerLeftPacket packet, int senderId)
+    {
+        RemoveRemotePlayer(packet.NetId);
     }
     
     private void HandleChatInput()
@@ -1196,6 +1693,9 @@ public class PriviewNetworkScene : Scene
     
     private void OnChatReceived(ChatPacket packet, int senderId)
     {
+        // Server is a hub: re-broadcast to all clients (the original sender ignores its own echo below).
+        if (_isServer && _netManager != null) _netManager.SendPacket(packet, senderId);
+        if (senderId == _myNetId) return;   // our own relayed echo — already shown locally when sent
         AddChatMessage(packet.Message);
     }
 
@@ -1235,7 +1735,8 @@ public class PriviewNetworkScene : Scene
         // so a client joining mid-edit sees exactly what the server has now.
         var live = BuildLiveWorldConfig();
         var sync = WorldSync.Pack(live, AppPaths.ModelsFolder);
-        _netManager?.SendPacket(sync, _myNetId);
+        // Answer ONLY the requester — broadcasting would rebuild every already-connected client's world.
+        _netManager?.SendPacketTo(_netManager.LastSenderConnId, sync, _myNetId);
         Logger.Info($"Sent world '{live.Name}' to client {senderId} ({sync.MeshTexts.Count} mesh file(s)).");
     }
 
@@ -1293,8 +1794,64 @@ public class PriviewNetworkScene : Scene
         if (_editables[idx].Light is Light light)
         {
             ApplyLightFields(light, o, _editables[idx].Instance.Position);
-            ReplaceMarker(_editables[idx], BuildLightMarker(light.Kind, light.Direction, light.AreaSize));
+            ReplaceMarker(_editables[idx], BuildLightMarker(light.Kind, light.Direction, light.AreaSize, light.ConeShape, light.ConeAngleDeg, light.AreaShape, light.BeamCount));
         }
+    }
+
+    // Server: push the live PlatformConfig (+ GraphicsConfig) to connected clients. Called on every
+    // platform change (move/shape/size/color via the dirty-broadcast block, plus delete/spawn).
+    private void BroadcastWorldSettings()
+    {
+        if (_floor != null) _world.Platform.Position = FromVec(_floor.Position);   // capture live floor pos (as BuildLiveWorldConfig does)
+        _netManager?.SendPacket(new WorldSettingsPacket
+        {
+            PlatformJson = JsonSerializer.Serialize(_world.Platform),
+            GraphicsJson = JsonSerializer.Serialize(_world.Graphics),
+        }, _myNetId);
+    }
+
+    // Client: apply a server settings delta. Runs on the main thread (via ProcessEvents), so rebuilding
+    // the platform here is safe.
+    private void OnWorldSettingsReceived(WorldSettingsPacket packet, int senderId)
+    {
+        try
+        {
+            var opts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            _world.Platform = JsonSerializer.Deserialize<PlatformConfig>(packet.PlatformJson, opts) ?? _world.Platform;
+            _world.Graphics = JsonSerializer.Deserialize<GraphicsConfig>(packet.GraphicsJson, opts) ?? _world.Graphics;
+        }
+        catch (Exception ex) { Logger.Error("WorldSettings: bad JSON", ex); return; }
+
+        // apply graphics (idempotent — mirrors ApplyReceivedWorld step 4)
+        EnableShadows = _world.Graphics.Shadows;
+        Object3d.UseBvh = _world.Graphics.Bvh;
+        bool wantOwn = !_world.Graphics.DisableCameraLight;
+        if (wantOwn && !_ownLightEnabled) AddLight(_mainLight);
+        if (!wantOwn && _ownLightEnabled) RemoveLight(_mainLight);
+        _ownLightEnabled = wantOwn;
+
+        // rebuild the platform from the new config (drop the old floor+entry, rebuild if Enabled)
+        int idx = _editables.FindIndex(e => string.Equals(e.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase));
+        if (idx >= 0) RemoveEntryAt(idx);
+        _floor = null;
+        BuildPlatform();   // builds floor + entry if Enabled; no-op if disabled
+    }
+
+    // Client: buffer a streamed mesh chunk; once all Total parts are present, concat + write the mesh
+    // to disk. The trailing spawn WorldEditPacket (Op 1, empty MeshObjText) then builds it from disk.
+    private void OnMeshChunkReceived(MeshChunkPacket packet, int senderId)
+    {
+        if (!_meshChunks.TryGetValue(packet.MeshName, out var buf) || buf.parts.Length != packet.Total)
+        {
+            buf = (packet.Total, new string[packet.Total]);
+            _meshChunks[packet.MeshName] = buf;
+        }
+        if (packet.Index < 0 || packet.Index >= buf.total) return;   // out-of-range guard
+        buf.parts[packet.Index] = packet.Data;
+
+        if (buf.parts.Any(p => p == null)) return;   // still waiting on parts
+        MaterializeMesh(packet.MeshName, string.Concat(buf.parts));
+        _meshChunks.Remove(packet.MeshName);
     }
 
     // Writes one received mesh to received/<name>.obj (idempotent overwrite). Shared by the 4b
@@ -1325,7 +1882,7 @@ public class PriviewNetworkScene : Scene
         _editables.Clear();
         _models.Clear();
         _selected = -1;
-        if (_floor != null) { RemoveDisplaysObject(_floor); _floor = null; }
+        _floor = null;   // the floor is an editable entry now; the loop above already removed its display
 
         // 3) Build the received world (BuildWorldObject loads meshes from _modelsFolder == received/).
         _world = world;
@@ -1455,6 +2012,84 @@ public class PriviewNetworkScene : Scene
             tris.Add((bc, B(s), B(s + 1)));     // base cap (-Y)
         }
         return BuildFlat(verts, tris);
+    }
+
+    // Raw geometry for a spot-marker cone whose base CROSS-SECTION reflects the spot's ConeShape: apex
+    // at (0,+1,0), base polygon at y=-1 sized by baseRadius, plus a base cap — same structure/winding
+    // as CreateCone. Circle = 16-seg ring; Square = 4 corners; Triangle = equilateral, vertex up (+Z),
+    // circumradius baseRadius (matching the engine's triangle cone). Exposed (verts+tris, 1-based) so
+    // the beam-fan can bake multiple oriented copies into one mesh.
+    private static void ConeMarkerGeometry(ConeShapeKind shape, float baseRadius,
+                                           out List<Vector3> verts, out List<(int, int, int)> tris)
+    {
+        verts = new List<Vector3>();
+        switch (shape)
+        {
+            case ConeShapeKind.Square:
+                verts.Add(new Vector3(-baseRadius, -1f, -baseRadius));
+                verts.Add(new Vector3( baseRadius, -1f, -baseRadius));
+                verts.Add(new Vector3( baseRadius, -1f,  baseRadius));
+                verts.Add(new Vector3(-baseRadius, -1f,  baseRadius));
+                break;
+            case ConeShapeKind.Triangle:
+                for (int s = 0; s < 3; s++)   // first vertex at +Z (a = π/2), then +120°
+                {
+                    float a = MathF.PI / 2f + MathF.Tau * s / 3f;
+                    verts.Add(new Vector3(baseRadius * MathF.Cos(a), -1f, baseRadius * MathF.Sin(a)));
+                }
+                break;
+            default:   // Circle
+                for (int s = 0; s < 16; s++)
+                {
+                    float a = MathF.Tau * s / 16;
+                    verts.Add(new Vector3(baseRadius * MathF.Cos(a), -1f, baseRadius * MathF.Sin(a)));
+                }
+                break;
+        }
+
+        int n = verts.Count;
+        int apex = verts.Count + 1; verts.Add(new Vector3(0,  1f, 0));
+        int bc = verts.Count + 1; verts.Add(new Vector3(0, -1f, 0));   // base centre
+
+        int B(int s) => (s % n) + 1;
+
+        tris = new List<(int, int, int)>();
+        for (int s = 0; s < n; s++)
+        {
+            tris.Add((B(s), apex, B(s + 1)));   // side
+            tris.Add((bc, B(s), B(s + 1)));     // base cap (-Y)
+        }
+    }
+
+    private static Object3d BuildConeMarker(ConeShapeKind shape, float baseRadius)
+    {
+        ConeMarkerGeometry(shape, baseRadius, out var v, out var t);
+        return BuildFlat(v, t);
+    }
+
+    // A multi-beam spot marker: BeamCount cones fanned about the aim exactly like SpotTerm's lighting
+    // fan. Each beam's orientation is BAKED into the verts (vert.Rotate uses the same X->Y->Z order as
+    // Object3d's LocalRotate), so a single mesh shows beams pointing in different world directions;
+    // LocalRotate stays Zero and uniform Scale commutes with the baked rotation.
+    private static Object3d BuildSpotFanMarker(Vector3 dir, int beams, ConeShapeKind coneShape, float coneAngleDeg)
+    {
+        beams = Math.Max(2, beams);
+        bool nearVertical = MathF.Abs(dir.Norm().Y) > 0.99f;
+        float baseRadius = Math.Clamp(2f * MathF.Tan(coneAngleDeg * MathF.PI / 180f), 0.2f, 3f);
+        ConeMarkerGeometry(coneShape, baseRadius, out var cone, out var coneTris);
+        var verts = new List<Vector3>(); var tris = new List<(int, int, int)>();
+        for (int k = 0; k < beams; k++)
+        {
+            float ang = k * (MathF.Tau / beams);
+            Vector3 axis = (nearVertical ? dir.Rotate(new Vector3(ang, 0, 0)) : dir.Rotate(new Vector3(0, ang, 0))).Norm();
+            Vector3 euler = DirToEuler(axis);
+            int off = verts.Count;
+            foreach (var v in cone) verts.Add(v.Rotate(euler));            // bake each beam's orientation
+            foreach (var (a, b, c) in coneTris) tris.Add((a + off, b + off, c + off));   // 1-based, shift by vert offset
+        }
+        var m = BuildFlat(verts, tris);
+        m.Scale = LightMarkerScale;       // uniform scale commutes with the baked rotation; LocalRotate stays Zero
+        return m;
     }
 
     // Unit-ish pyramid: square base ±1 at y=-1, apex at (0,1,0).

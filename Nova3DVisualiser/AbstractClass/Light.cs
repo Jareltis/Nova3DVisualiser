@@ -21,6 +21,9 @@ public class Light (Vector3 position, float lightPower) : GameObject(position, V
     public float SpinSpeed = 0f;                           // rad/sec: sweeps Direction about world Y (ignored for Point)
     public int BeamCount = 1;                              // Spot: cones fanned evenly about the aim (>=1; 1 == today)
     public ConeShapeKind ConeShape = ConeShapeKind.Circle; // Spot: cone cross-section shape
+    public ConeShapeKind AreaShape = ConeShapeKind.Square; // Area: emitter cross-section
+    public float ColorInfluence = 0.6f;                    // 0 = surface filters the light fully (true albedo);
+                                                           // 1 = the light's color shows regardless of albedo
 
     private const float Bias = 0.01f;        // shadow-ray self-occlusion bias (matches the old epsilon)
     private const float DirRefDistSq = 64f;  // Directional: fixed mild attenuation (no real distance)
@@ -157,9 +160,9 @@ public class Light (Vector3 position, float lightPower) : GameObject(position, V
         return s * s * (3f - 2f * s);
     }
 
-    // A square emitter (normal = Direction, half-extent = AreaSize) sampled on a fixed 2x2 grid:
-    // each sample is an independently occluded point term, so the average gives area falloff + soft
-    // shadows. Sample count is capped at 4 for performance.
+    // An emitter (normal = Direction, half-extent = AreaSize) sampled on a fixed 4-point set: each
+    // sample is an independently occluded point term, so the average gives area falloff + soft
+    // shadows. AreaShape picks the 4 sample offsets; Square (the 4 corners) is the original.
     private float AreaTerm(RenderData rd, List<IDisplays> objs, IDisplaysManagerAsync mgr, bool shadows)
     {
         Vector3 n = Direction.Norm();
@@ -168,11 +171,14 @@ public class Light (Vector3 position, float lightPower) : GameObject(position, V
         Vector3 t2 = Vector3.Cross(n, t1).Norm();
         float h = AreaSize;
 
+        (float du, float dv)[] offs = AreaShape switch
+        {
+            ConeShapeKind.Circle   => new[] { (h, 0f), (-h, 0f), (0f, h), (0f, -h) },          // disc: axis points
+            ConeShapeKind.Triangle => new[] { (0f, h), (0.8660254f*h, -0.5f*h), (-0.8660254f*h, -0.5f*h), (0f, 0f) }, // verts + centroid
+            _                      => new[] { (-h, -h), (h, -h), (-h, h), (h, h) },            // Square — today
+        };
         float sum = 0f;
-        sum += PointTerm(Position + t1 * (-h) + t2 * (-h), rd, objs, mgr, shadows);
-        sum += PointTerm(Position + t1 * ( h) + t2 * (-h), rd, objs, mgr, shadows);
-        sum += PointTerm(Position + t1 * (-h) + t2 * ( h), rd, objs, mgr, shadows);
-        sum += PointTerm(Position + t1 * ( h) + t2 * ( h), rd, objs, mgr, shadows);
+        foreach (var (du, dv) in offs) sum += PointTerm(Position + t1 * du + t2 * dv, rd, objs, mgr, shadows);
         return sum * 0.25f;
     }
 

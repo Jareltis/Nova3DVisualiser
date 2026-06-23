@@ -28,4 +28,20 @@ public class DisplayManagerAsync : IDisplaysManagerAsync
         }
         return closestData;
     }
+
+    public List<RenderData> FindSortedIntersections(Ray ray, List<IDisplays> displays)
+    {
+        var hits = new List<RenderData>();
+
+        foreach (var display in displays)
+        {
+            if (display.BoundingSphereMissed(ray.RayStart, ray.RayDirection)) continue;
+
+            var currentData = display.GetRenderData(ray);
+            if (currentData.Intersection > -1) hits.Add(currentData);
+        }
+
+        hits.Sort((a, b) => a.Intersection.CompareTo(b.Intersection));   // front-to-back
+        return hits;
+    }
 }

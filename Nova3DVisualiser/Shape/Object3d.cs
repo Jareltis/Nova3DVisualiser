@@ -21,6 +21,9 @@ public class Object3d : GameObject, IDisplays
     private Vector3 _worldCenter;                // bbox center in world space (per frame)
     private float _worldRadius;                  // bounding radius in world space (per frame)
 
+    public Vector3 WorldMin { get; private set; }   // world-space AABB (per frame) — used as a collider
+    public Vector3 WorldMax { get; private set; }
+
     public float Scale = 1f;
     public float RotateSpeed = 0f;
 
@@ -30,6 +33,73 @@ public class Object3d : GameObject, IDisplays
 
     public int FaceCount => _faces.Count;
     public bool HasBvh => _bvh != null;
+
+    // GPU-snapshot accessors: the per-frame world vertices, the face list, and the combined rotation.
+    // Read-only views — the engine still owns the geometry.
+    public Vector3[] WorldVertices => _worldVertices;
+    public IReadOnlyList<Triangle> Faces => _faces;
+    public Vector3 TotalRotation => LocalRotate + GlobalRotate;
+    public Vector3[] LocalVertices => _localVertices;
+
+    // ---- GPU two-level BVH: the mesh's LOCAL-space triangles + a flattened, stackless BVH, built
+    // ONCE and cached (geometry is static in local space). The GPU snapshot uploads these; the kernel
+    // traverses them in the object's local space. Built over ALL faces regardless of the CPU BVH
+    // threshold (a BVH only changes speed, not the closest-hit result, so parity is preserved). ----
+    private SnapFace[]? _gpuFaces;
+    private SnapBvhNode[]? _gpuNodes;
+    private int[]? _gpuTriIdx;
+
+    public SnapFace[] GpuFaces { get { EnsureGpuBvh(); return _gpuFaces!; } }
+    public SnapBvhNode[] GpuNodes { get { EnsureGpuBvh(); return _gpuNodes!; } }
+    public int[] GpuTriIdx { get { EnsureGpuBvh(); return _gpuTriIdx!; } }
+
+    private void EnsureGpuBvh()
+    {
+        if (_gpuFaces != null) return;
+
+        _gpuFaces = new SnapFace[_faces.Count];
+        for (int i = 0; i < _faces.Count; i++)
+        {
+            Triangle t = _faces[i];
+            _gpuFaces[i] = new SnapFace { I0 = t.I0, I1 = t.I1, I2 = t.I2, N0 = t.N0, N1 = t.N1, N2 = t.N2 };
+        }
+
+        var indices = new List<int>(_faces.Count);
+        for (int i = 0; i < _faces.Count; i++) indices.Add(i);
+        BvhNode root = BvhNode.Build(indices, _faces, _localVertices, 0);
+
+        var nodes = new List<SnapBvhNode>();
+        var triIdx = new List<int>();
+        FlattenBvh(root, -1, nodes, triIdx);
+        _gpuNodes = nodes.ToArray();
+        _gpuTriIdx = triIdx.ToArray();
+    }
+
+    // Pre-order DFS flatten with exit links: left child is always the next node (index+1), so a node
+    // only needs its miss/after-leaf jump (Exit). Left child's Exit = the right child's index; the
+    // right child's Exit = this node's Exit.
+    private static int FlattenBvh(BvhNode n, int exit, List<SnapBvhNode> nodes, List<int> triIdx)
+    {
+        int idx = nodes.Count;
+        nodes.Add(default);   // reserve this slot; children are appended after it
+
+        if (n.Tris != null)   // leaf
+        {
+            int start = triIdx.Count;
+            foreach (int ti in n.Tris) triIdx.Add(ti);
+            nodes[idx] = new SnapBvhNode { Min = n.Min, Max = n.Max, Exit = exit, TriStart = start, TriCount = n.Tris.Length };
+            return idx;
+        }
+
+        nodes[idx] = new SnapBvhNode { Min = n.Min, Max = n.Max, Exit = exit, TriStart = 0, TriCount = 0 };
+        int leftSize = CountNodes(n.Left!);
+        int rightIndex = idx + 1 + leftSize;
+        FlattenBvh(n.Left!, rightIndex, nodes, triIdx);   // left's exit = where the right subtree starts
+        FlattenBvh(n.Right!, exit, nodes, triIdx);        // right's exit = this node's exit
+        return idx;
+    }
+
+    private static int CountNodes(BvhNode n) => n.Tris != null ? 1 : 1 + CountNodes(n.Left!) + CountNodes(n.Right!);
 
     public Object3d(Vector3[] vertex, Vector3[] normals, FacingInfo[] facingInfos) : base(Vector3.Zero, Vector3.Zero)
     {
@@ -107,6 +177,18 @@ public class Object3d : GameObject, IDisplays
         {
             _worldVertices[i] = (_localVertices[i] * Scale).Rotate(totalRot) + Position;
         });
+
+        // World AABB: sequential min/max over the just-filled world verts (Vector3 has no Min/Max).
+        Vector3 wmin = _worldVertices[0];
+        Vector3 wmax = _worldVertices[0];
+        for (int i = 1; i < _worldVertices.Length; i++)
+        {
+            Vector3 v = _worldVertices[i];
+            wmin.X = MathF.Min(wmin.X, v.X); wmin.Y = MathF.Min(wmin.Y, v.Y); wmin.Z = MathF.Min(wmin.Z, v.Z);
+            wmax.X = MathF.Max(wmax.X, v.X); wmax.Y = MathF.Max(wmax.Y, v.Y); wmax.Z = MathF.Max(wmax.Z, v.Z);
+        }
+        WorldMin = wmin;
+        WorldMax = wmax;
 
         _worldCenter = (_localCenter * Scale).Rotate(totalRot) + Position;
         _worldRadius = _boundingRadius * Scale;

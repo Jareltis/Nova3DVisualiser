@@ -11,9 +11,13 @@ public struct Rgb24(byte r, byte g, byte b)
     public byte B = b;
 
     public static readonly Rgb24 Black = new Rgb24(0, 0, 0);
+    public static readonly Rgb24 White = new Rgb24(255, 255, 255);
 
     /// <summary>From a 0..1 RGB vector (clamped, rounded).</summary>
     public static Rgb24 FromUnit(Vector3 v) => new Rgb24(ToByte(v.X), ToByte(v.Y), ToByte(v.Z));
+
+    /// <summary>To a 0..1 RGB vector.</summary>
+    public Vector3 ToUnit() => new Vector3(R / 255f, G / 255f, B / 255f);
 
     private static byte ToByte(float f) => (byte)Math.Clamp((int)(f * 255f + 0.5f), 0, 255);
 
