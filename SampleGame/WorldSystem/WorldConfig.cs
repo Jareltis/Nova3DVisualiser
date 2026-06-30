@@ -24,8 +24,8 @@ public class GraphicsConfig
     public bool DisableCameraLight { get; set; } = false;
     // Which renderer draws this world: "cpu" (default — the multithreaded CPU raytracer) or "gpu"
     // (NVIDIA via ILGPU). Chosen at world load; if "gpu" but no usable GPU is present, the app logs a
-    // notice and falls back to "cpu". The GPU path is the fast subset (opaque closest-hit,
-    // point/directional/circular-spot, hard shadows) — see Nova3DVisualiser.Gpu.
+    // notice and falls back to "cpu". The GPU path is at full parity with the CPU renderer
+    // (transparency, all light kinds, alpha-correct shadows) — see Nova3DVisualiser.Gpu.
     public string Renderer { get; set; } = "cpu";
 }
 
@@ -41,6 +41,9 @@ public class PhysicsConfig
     public bool GravityEnabled { get; set; } = false;
     public float GravityStrength { get; set; } = 9.8f;
     public bool CollisionEnabled { get; set; } = true;
+    // Bounciness of a landing object: 0 = no bounce (dead stop, the original behavior), 1 = elastic
+    // (rebounds at the full impact speed). The object settles once a bounce falls below a small floor.
+    public float Restitution { get; set; } = 0f;
 }
 
 public class PlatformConfig
@@ -76,10 +79,14 @@ public class WorldObject
     public Vec3Config Rotation { get; set; } = new();
     public float Scale { get; set; } = 1f;            // uniform, matches Object3d.Scale
     public string Color { get; set; } = "White";
+    public float ColorFade { get; set; } = 0f;        // "colour transparency" / paleness 0..1: 0 = true colour, 1 = washed out to white (separate from the alpha channel = object transparency)
     public string Anchor { get; set; } = "Bottom";    // mesh only: Bottom | Center | Origin
     public float RotateSpeed { get; set; } = 0f;      // continuous spin about Y
     public bool Collides { get; set; } = true;        // collider participation (camera + as a support); markers/avatars are false. Effective only when world Collision is on.
     public bool Gravity { get; set; } = false;        // is this object pulled down by world gravity (opt-in). Effective only when world Gravity is on.
+    public string Collider { get; set; } = "aabb";    // collider shape for meshes/primitives: "aabb" (world box, default) | "obb" (oriented box)
+    public float Mass { get; set; } = 1f;             // impulse-solver mass (heavier = shoved less); >0
+    public float Restitution { get; set; } = -1f;     // per-object bounciness 0..1; <0 = inherit world PhysicsConfig.Restitution
     public float Radius { get; set; } = 1f;           // sphere only
     public float Power { get; set; } = 500f;          // light only: engine Light.LightPower
     // ---- light-only rich fields (ignored for other types) ----

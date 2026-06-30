@@ -15,6 +15,8 @@ public class Light (Vector3 position, float lightPower) : GameObject(position, V
     // unconfigured Light behaves exactly as before.
     public LightKind Kind = LightKind.Point;
     public Vector3 Rgb = new Vector3(1f, 1f, 1f);          // RGB emission (0..1); white => today's look
+    // Emission after paling by ColorFade (the GameObject "colour transparency"): lerped toward white.
+    public Vector3 EffectiveRgb => ColorFade <= 0f ? Rgb : Rgb + (new Vector3(1f, 1f, 1f) - Rgb) * (ColorFade >= 1f ? 1f : ColorFade);
     public Vector3 Direction = new Vector3(0f, -1f, 0f);   // aim (normalized) for Directional/Spot/Area
     public float ConeAngleDeg = 30f;                       // Spot: half-angle of the cone (degrees)
     public float AreaSize = 1f;                            // Area: half-extent of the square emitter
@@ -26,6 +28,7 @@ public class Light (Vector3 position, float lightPower) : GameObject(position, V
                                                            // 1 = the light's color shows regardless of albedo
 
     private const float Bias = 0.01f;        // shadow-ray self-occlusion bias (matches the old epsilon)
+    private const float MinVis = 1e-3f;      // alpha-shadow: transmittance at/below this counts as fully blocked
     private const float DirRefDistSq = 64f;  // Directional: fixed mild attenuation (no real distance)
 
     // Sweeps Direction about world Y by SpinSpeed*dt. No-op for a point light or zero speed.
@@ -63,8 +66,9 @@ public class Light (Vector3 position, float lightPower) : GameObject(position, V
         float ndl = rd.Normal * l;
         if (ndl <= 0f) return 0f;                          // surface faces away from this light
 
-        if (shadows && Occluded(rd, l, dist, objs, mgr)) return 0f;
-        return ndl * (LightPower / (dist * dist + 1f));
+        float vis = shadows ? ShadowTransmittance(rd, l, dist, objs, mgr) : 1f;
+        if (vis <= 0f) return 0f;                          // fully blocked
+        return ndl * (LightPower / (dist * dist + 1f)) * vis;
     }
 
     // Parallel rays along -Direction (a sun): no real distance attenuation, occlusion out to far.
@@ -74,8 +78,9 @@ public class Light (Vector3 position, float lightPower) : GameObject(position, V
         float ndl = rd.Normal * l;
         if (ndl <= 0f) return 0f;
 
-        if (shadows && Occluded(rd, l, 1e4f, objs, mgr)) return 0f;
-        return ndl * (LightPower / (DirRefDistSq + 1f));   // mild constant attenuation
+        float vis = shadows ? ShadowTransmittance(rd, l, 1e4f, objs, mgr) : 1f;
+        if (vis <= 0f) return 0f;
+        return ndl * (LightPower / (DirRefDistSq + 1f)) * vis;   // mild constant attenuation
     }
 
     // A spot throws BeamCount cones whose axes are the aim fanned evenly about world Y (or world X if
@@ -182,11 +187,22 @@ public class Light (Vector3 position, float lightPower) : GameObject(position, V
         return sum * 0.25f;
     }
 
-    // True if an occluder blocks the segment from the (biased) shaded point toward the light.
-    private static bool Occluded(RenderData rd, Vector3 l, float maxDist, List<IDisplays> objs, IDisplaysManagerAsync mgr)
+    // Light transmittance along the shadow segment: 1 = fully lit, 0 = fully blocked. An OPAQUE occluder
+    // blocks completely (full shadow); TRANSPARENT occluders attenuate the light by their alpha, one
+    // per object front-to-back — mirroring the primary render's per-object transparency, so a shadow
+    // cast through glass is correspondingly lighter. (Replaces the old binary occlusion test.)
+    private static float ShadowTransmittance(RenderData rd, Vector3 l, float maxDist, List<IDisplays> objs, IDisplaysManagerAsync mgr)
     {
         Ray shadowRay = new Ray(rd.IntersectionPoint + rd.Normal * Bias, l);
-        RenderData hit = mgr.FindClosestIntersection(shadowRay, objs);
-        return hit.Intersection > -1f && hit.Intersection < maxDist;
+        float t = 1f;
+        foreach (var hit in mgr.FindSortedIntersections(shadowRay, objs))
+        {
+            if (hit.Intersection <= -1f || hit.Intersection >= maxDist) continue;
+            float a = hit.Color.AUnit;
+            if (a >= 1f) return 0f;                        // opaque occluder -> full shadow
+            t *= 1f - a;
+            if (t <= MinVis) return 0f;                    // effectively blocked
+        }
+        return t;
     }
 }

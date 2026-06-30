@@ -23,6 +23,7 @@ public class Object3d : GameObject, IDisplays
 
     public Vector3 WorldMin { get; private set; }   // world-space AABB (per frame) — used as a collider
     public Vector3 WorldMax { get; private set; }
+    public Vector3 LocalCenter => _localCenter;      // local bbox center (moves with ApplyAnchor) — used to build the OBB collider
 
     public float Scale = 1f;
     public float RotateSpeed = 0f;
@@ -222,7 +223,7 @@ public class Object3d : GameObject, IDisplays
             {
                 // t is the world-space distance parameter; recompute the world hit point from it.
                 Vector3 worldHit = ray.RayStart + ray.RayDirection * hit.Intersection;
-                return new RenderData(hit.Intersection, hit.Normal, worldHit, this.Color);
+                return new RenderData(hit.Intersection, hit.Normal, worldHit, this.EffectiveColor);
             }
             return RenderData.NoRender;
         }
@@ -243,7 +244,7 @@ public class Object3d : GameObject, IDisplays
         }
         if (closestData.Intersection > -1)
         {
-            closestData.Color = this.Color;
+            closestData.Color = this.EffectiveColor;
         }
         return closestData;
     }

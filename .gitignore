@@ -20,3 +20,7 @@ SampleGame/models/
 
 # Worlds
 SampleGame/worlds/
+
+# Local planning notes (not for the repo)
+BACKLOG.md
+TESTING.md

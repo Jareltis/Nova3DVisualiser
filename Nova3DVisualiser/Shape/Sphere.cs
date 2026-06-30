@@ -34,6 +34,6 @@ public class Sphere(Vector3 position, Vector3 localRotate, float r = 1) : GameOb
         Vector3 intersectionPoint = ray.GetIntersectionPoint(intersection);
         Vector3 normal = (intersectionPoint - Position).Norm();
 
-        return new RenderData(intersection, normal, intersectionPoint, this.Color);
+        return new RenderData(intersection, normal, intersectionPoint, this.EffectiveColor);
     }
 }

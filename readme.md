@@ -2,7 +2,7 @@
 
 A real-time 3D engine that renders to the terminal as ASCII art, written in C# / .NET 8. It is a CPU raytracer: every frame it traces rays into the scene, maps brightness to a character gradient, and (on truecolor terminals) tints each cell with 24-bit RGB, drawing the result directly in the console.
 
-It ships with a multiplayer sample app that has a full **in-scene editor**, a **world system** (each scene is one JSON file you can create, save, and reload), a **rich colored-lighting** pipeline, an optional **physics** layer (a walking first-person character, collision, and gravity), and basic TCP networking with chat.
+It ships with a multiplayer sample app that has a full **in-scene editor**, a **world system** (each scene is one JSON file you can create, save, and reload), a **rich colored-lighting** pipeline, a **real rigid-body physics** layer (a walking first-person character plus believable gravity — angle-of-incidence, rolling, bouncing, friction, mass and 3D spin), and basic TCP networking with chat.
 
 ---
 
@@ -12,6 +12,7 @@ It ships with a multiplayer sample app that has a full **in-scene editor**, a **
 - **CPU or GPU renderer, chosen per world.** The default is the multithreaded CPU raytracer. A world can instead select the **GPU** renderer (NVIDIA, via [ILGPU](https://ilgpu.net/) → CUDA — also runs on any OpenCL device), which casts every primary, shadow and lighting ray on the graphics card. It is at **full feature parity** with the CPU path: front-to-back transparency, every light kind (point / directional / spot / area), spot beam fans, circle/square/triangle cone shapes, and area soft shadows — validated pixel-for-pixel by the `gputest` self-test. It uses the same **two-level BVH** acceleration as the CPU (per-mesh local-space BVH, built once and uploaded once; the kernel transforms each ray into the object's space and traverses a stackless flattened tree), so heavy meshes stay fast. If a world asks for GPU but no usable GPU is present, it transparently falls back to the CPU renderer. Pick it in the **Create world** dialog (**Renderer: CPU / GPU**).
 - CPU raytracing rendered to ASCII via a brightness gradient.
 - **Truecolor output**: each cell carries a 24-bit RGB color (`Rgb24`) emitted as ANSI escape codes, so the picture is no longer limited to the 16 console colors. On terminals without truecolor the nearest console color is used.
+- **Two kinds of transparency**: every object has both **object transparency** — the color's **alpha** channel, which makes it see-through (overlapping transparent surfaces composite **front-to-back** via depth peeling, and a transparent object casts a correspondingly lighter shadow) — and **color paleness** (the **Pale** value), a *separate* knob that washes the surface's own color toward white while the object stays fully solid and casts a full shadow.
 - Floating-point lighting pipeline with per-channel **Reinhard tone mapping**, an ambient term, and an adjustable exposure.
 - Smooth (per-vertex-normal) shading, with a Blender-friendly OBJ loader (n-gon fan triangulation, negative/relative indices, geometric-normal fallback).
 - **BVH acceleration** for high-poly meshes, built once in local space and traversed with the ray transformed per frame, so it works even with animated/spinning models.
@@ -21,7 +22,7 @@ It ships with a multiplayer sample app that has a full **in-scene editor**, a **
 - **Diff rendering**: each frame only the console cells that actually changed are rewritten (with ANSI cursor jumps), instead of repainting the whole screen. A still camera writes almost nothing, which removes the top-to-bottom "tearing" and raises the frame rate.
 
 ### Lighting
-Nova has a full multi-light system. Every light is shadow-tested **independently** and contributes additively, so a surface shadowed from one light is still lit by another (no single dominant shadow). Light kinds:
+Nova has a full multi-light system. Every light is shadow-tested **independently** and contributes additively, so a surface shadowed from one light is still lit by another (no single dominant shadow). Shadows are **alpha-correct**: an opaque object casts a full shadow, while a transparent one casts a correspondingly lighter shadow (the shadow ray accumulates each transparent occluder's alpha). Light kinds:
 
 - **Point** — omnidirectional, with inverse-square falloff.
 - **Directional** — a parallel "sun" with a constant mild attenuation.
@@ -36,23 +37,30 @@ Per-light extras:
 - **Spot cone shape** — the cone cross-section can be **Circle**, **Square**, or **Triangle**.
 
 ### Physics (optional, per world)
-Two independent world-level switches, both set when you create a world (and editable in the JSON):
+Nova has a small but **real rigid-body physics** layer — believable gravity with angle-of-incidence, inertia, rolling, bouncing and spin, not a scripted fall. Two world-level master switches, both set when you create a world (and editable in the JSON):
 
-- **Collision** *(on by default)* — the master switch for solid objects. When on, the **player** (a 0.35-unit camera bubble) is pushed out of the floor and any object marked as a collider, so you can't walk or fly through them. Each object has its own **Collide** flag; when the world switch is **off**, every object's Collide is forced off and locked.
-- **Gravity** *(off by default)* — when on, the **player becomes a walking character**: gravity pulls the camera down, it stands on the floor/objects, **Space** jumps, and **F1** toggles a free-fly mode for building. Each object also has its own **Gravity** flag (opt-in) so you can make individual meshes, primitives, spheres — even a light or the platform — fall and rest on the highest collider beneath them. When the world switch is **off**, every object's Gravity is forced off and locked.
+- **Collision** *(on by default)* — the master switch for solid objects. The **player** (a camera bubble) is pushed out of the floor and any collider, so you can't walk or fly through them. Each mesh can use a fast **AABB** box collider or an **OBB** oriented box that hugs a tilted shape (box-box contacts use a full 3D Separating-Axis test). Each object has its own **Collide** flag; when the world switch is **off**, every object's Collide is forced off and locked.
+- **Gravity** *(off by default)* — turns on the simulation:
+  - The **player becomes a walking character**: gravity pulls the camera down, it stands on surfaces, **Space** jumps, and **F1** toggles a free-fly mode for building.
+  - Any object can opt into **Gravity** — meshes, primitives, spheres, even a light or the platform fall and rest on whatever is beneath them.
+  - A falling **ball collides with the real surface** it lands on — the actual triangles of a pyramid / ramp / mesh, **not its bounding box** — so it **rolls down a slope with real momentum** (faster on steeper inclines), coasts to a stop on the flat, and **bounces** by its restitution. A falling mesh likewise rests on the real surface under it.
+  - **Restitution (Bounce)** is set per-world (Create dialog) and per-object: `0` = dead stop, `1` = perfectly elastic. On a contact the two surfaces' bounciness **combine**, so a springy ball on a dead floor differs from one on a "trampoline" wall.
+  - **Friction, mass and 3D rotation**: objects shed speed to friction, a heavier object is shoved less (per-object **Mass**), and an off-centre hit makes a body **tumble** — full 3D spin with a proper inertia tensor and drift-free quaternion orientation.
+  - The simulation **substeps** internally, so it behaves the same whether the terminal renders at 60 FPS or only a few, with safety rails so nothing flies off.
 
-Object gravity is simulated **locally by the authority/solo** (it is not streamed per-frame); the player's own gravity runs locally for every peer, so nothing desyncs.
+Object physics is simulated **by the authority/solo** and the resulting positions **and spin** are streamed to clients (everyone sees objects fall, roll and settle); the player's own gravity runs locally for every peer, so nothing desyncs.
 
 ### World system & editor
 - A **world** is a single `worlds/<name>.json` file that owns the whole scene: graphics toggles, the platform, and every object's full transform (position/rotation/scale/color/anchor and, for lights, kind/direction/cone/beams/shape/etc.).
 - `models/` is a **pure mesh library** — just `<name>.obj` files. The world references a mesh by name and supplies its placement.
 - An **in-scene editor** (toggled with `Tab`) lets you spawn, move, rotate, scale, recolor, and delete objects live, then save back to JSON.
-- Built-in spawn types: `cube`, `sphere`, `cylinder`, `cone`, `pyramid`, `light`, plus every mesh in `models/`.
+- Built-in spawn types: `cube`, `sphere`, `cylinder`, `cone`, `pyramid`, `ramp` (a wedge with a sloped top — great for rolling), `light`, plus every mesh in `models/`.
 - **Platform shapes**: square, rectangle, or circle, with configurable size/color.
+- **Live graphics toggles**: flip **shadows** (`F2`), **BVH acceleration** (`F3`), the **camera headlight** (`F4`), and the **floor platform** (`F6`) right in the scene — no need to recreate the world. On a server these changes sync to every client.
 
 ### Networking
-- Basic TCP server/client with a shared scene and in-app chat.
-- The **server is the world authority**: it sends the full world to joining clients, then streams live edit deltas. Clients can fly around and inspect, but only the authority mutates the shared world.
+- A basic TCP server/client with a shared scene and in-app chat. **Multiple clients** can join one server, and each player sees the others as a small moving **avatar**.
+- The **server is the world authority**: it sends the full world to joining clients — large meshes are split into **chunks** for reliable transfer — then streams live edit deltas, graphics-setting changes, and physics (object positions **and spin**). Clients can fly around and inspect, but only the authority mutates the shared world.
 
 ### Other
 - Timestamped file logging.
@@ -79,7 +87,7 @@ A small Terminal.Gui wizard runs before the render loop:
 1. **Session mode** — local solo, or online.
 2. **Network role** (online only) — host a **Server** or join as a **Client**.
 3. **World** — **Create** a new world or **Load** a saved one (`worlds/*.json`).
-   - **Create** lets you set the world name, toggles (**Shadows**, **BVH acceleration**, **Extra fixed light**, **Disable camera light**, **Include platform**), the **Renderer** (**CPU** / **GPU (NVIDIA)**), the **platform shape** (Square / Rectangle / Circle) and its size/width/depth, and the **physics** switches (**Gravity** + its strength, **Collision**).
+   - **Create** lets you set the world name, toggles (**Shadows**, **BVH acceleration**, **Extra fixed light**, **Disable camera light**, **Include platform**), the **Renderer** (**CPU** / **GPU (NVIDIA)**), the **platform shape** (Square / Rectangle / Circle) and its size/width/depth, and the **physics** switches (**Gravity** + its strength + **Bounce** restitution 0–1, **Collision**).
 4. **Network** (online only) — listen port (server) or server IP + port (client).
 
 A client that joins a server downloads the host's world automatically.
@@ -116,7 +124,7 @@ The editor shows a center crosshair and a properties panel for the selected obje
 | Key | Action |
 | --- | --- |
 | **Tab** | Toggle the editor |
-| **G** | Cycle the spawn type (cube / sphere / cylinder / cone / pyramid / light / any `models/` mesh) |
+| **G** | Cycle the spawn type (cube / sphere / cylinder / cone / pyramid / ramp / light / any `models/` mesh) |
 | **Enter** | Spawn the current type in front of the camera *(authority only)* |
 | **F** | Aim-select: pick the object under the crosshair |
 | **[** / **]** | Select previous / next object |
@@ -126,6 +134,10 @@ The editor shows a center crosshair and a properties panel for the selected obje
 | **J** / **L** | Move the selected object along −X / +X *(authority only)* |
 | **U** / **O** | Move the selected object up / down (+Y / −Y) *(authority only)* |
 | **Delete** | Delete the selected object *(authority only)* |
+| **F2** | Toggle shadows on/off *(authority only, live-synced)* |
+| **F3** | Toggle the BVH acceleration on/off *(authority only, live-synced)* |
+| **F4** | Toggle the camera headlight on/off *(authority only, live-synced)* |
+| **F6** | Toggle the floor platform on/off *(authority only, live-synced)* |
 | **F5** | Save the world back to `worlds/<name>.json` *(authority only)* |
 
 > In an online session, only the **authority** (the server, or a local solo session) can spawn/move/edit/delete/save. A connected client can open the editor to **select and inspect** objects, but its changes never affect the shared world.
@@ -141,16 +153,16 @@ The editor shows a center crosshair and a properties panel for the selected obje
 ### The properties panel (edited with `,` `.` `N` `M`)
 The list of editable fields depends on the selected object's type:
 
-- **Mesh / cube / cylinder / cone / pyramid** — Pos X/Y/Z, Rot X/Y/Z, Scale, Spin (auto-rotate speed), Color, **Collide**, **Gravity**.
-- **Sphere** — Pos X/Y/Z, Radius, Color, **Collide**, **Gravity**.
-- **Platform** — Pos X/Y/Z, Shape/Size (or Width × Depth), Color, **Collide**, **Gravity**.
-- **Light** — Pos X/Y/Z, Power, Color, **Kind**, then per kind, then **Gravity**:
+- **Mesh / cube / cylinder / cone / pyramid / ramp** — Pos X/Y/Z, Rot X/Y/Z, Scale, Spin (auto-rotate speed), **R / G / B / A** (color + object transparency), **Pale** (color paleness), **Collide**, **Gravity**, **Collider**, **Mass**, **Bounce**.
+- **Sphere** — Pos X/Y/Z, Radius, **R / G / B / A**, **Pale**, **Collide**, **Gravity**, **Mass**, **Bounce**.
+- **Platform** — Pos X/Y/Z, Shape/Size (or Width × Depth), **R / G / B / A**, **Pale**, **Collide**, **Gravity**.
+- **Light** — Pos X/Y/Z, Power, **Influence**, **R / G / B / A**, **Pale**, **Kind**, then per kind, then **Gravity**:
   - *Point*: nothing extra.
   - *Directional*: Dir X/Y/Z, Spin.
   - *Spot*: Dir X/Y/Z, Cone (half-angle), **Beams** (1–8 fanned cones), **Shape** (Circle / Square / Triangle), Spin.
   - *Area*: Dir X/Y/Z, Size (half-extent), Spin.
 
-`Color` cycles through the 16 named console colors; for a light it also sets the color it emits. **Collide** / **Gravity** are on/off toggles (N or M flips them); they read `Off (locked)` and can't be turned on when the world's Collision / Gravity switch is off.
+Color is edited as four **R / G / B / A** channels (0–255 each): full 24-bit color plus an **A** (alpha) channel that is the **object transparency** (how see-through it is). A separate **Pale** value (0–1) is the **color transparency** — it washes the surface's own color toward white *without* affecting see-through or shadow. For a light, R/G/B set the color it emits, **Pale** fades that emission toward white, and **Influence** controls how strongly the color tints surfaces. **Collide** / **Gravity** are on/off toggles (N or M flips them); they read `Off (locked)` and can't be turned on when the world's Collision / Gravity switch is off. **Collider** toggles a mesh's collider shape between **AABB** (a fast world-axis box) and **OBB** (an oriented box that rotates with the object, hugging its true shape — better for tilted/elongated meshes). **Mass** weights the physics impulse solver — a heavier object is shoved less when a lighter one collides with it. **Bounce** is the object's restitution (`0` = dead, `1` = perfectly elastic); it shows `world (X)` when it inherits the world's Bounce, and on a contact the two surfaces' bounce values combine.
 
 ---
 
@@ -177,23 +189,28 @@ A world object looks like this:
   "gravity": false
 }
 ```
-- `type` — `mesh`, `cube`, `sphere`, `cylinder`, `cone`, `pyramid`, or `light`.
+- `type` — `mesh`, `cube`, `sphere`, `cylinder`, `cone`, `pyramid`, `ramp`, or `light`.
 - `mesh` — the `models/` file name (without `.obj`), for `type: "mesh"`.
 - `position` — world position in units (Y is the vertical axis).
 - `rotation` — initial rotation in radians.
 - `scale` — uniform scale.
-- `color` — a .NET `ConsoleColor` name (e.g. `Red`, `Cyan`, `Yellow`).
+- `color` — a hex string `#RRGGBB` (or `#RRGGBBAA` with alpha = **object** transparency), an `R,G,B` / `R,G,B,A` triple, or a .NET `ConsoleColor` name (e.g. `Red`). Saved back as hex.
+- `colorFade` — **color** transparency / paleness, 0–1 (default `0`): washes the object's colour toward white, independent of the alpha (`A` = object transparency, `colorFade` = colour transparency).
 - `anchor` — how the mesh sits at its position: `bottom` (base on the floor, default), `center` (geometric center), or `origin` (raw OBJ origin).
 - `rotateSpeed` — auto-spin around the vertical axis, in radians per second (0 = static).
-- `collides` — is this object solid to the player (effective only when the world's `physics.collisionEnabled` is true). Default `true`.
+- `collides` — is this object solid (effective only when the world's `physics.collisionEnabled` is true). Default `true`.
 - `gravity` — is this object pulled down by world gravity (effective only when `physics.gravityEnabled` is true). Default `false`.
+- `collider` — a mesh's collider shape: `"aabb"` (world-axis box, default) or `"obb"` (oriented box that rotates with it).
+- `mass` — impulse-solver mass (default `1`); a heavier object is shoved less in a collision.
+- `restitution` — bounciness 0–1; `-1` (default) inherits the world's `physics.restitution`.
 
 A `light` object additionally uses: `power`, `lightKind` (`point`/`directional`/`spot`/`area`), `direction`, `coneAngle`, `beamCount`, `coneShape` (`circle`/`square`/`triangle`), `lightSize`, and `lightSpin`.
 
 The world file also has a top-level `physics` block with the master switches:
 ```json
-"physics": { "gravityEnabled": false, "gravityStrength": 9.8, "collisionEnabled": true }
+"physics": { "gravityEnabled": false, "gravityStrength": 9.8, "collisionEnabled": true, "restitution": 0.0 }
 ```
+(`restitution` is the world's default Bounce, 0–1; individual objects can override it.)
 
 Edit a model or a world JSON and just re-run — no rebuild required.
 
@@ -211,7 +228,7 @@ Nova3DVisualiser is a modified and extended version of **Neo3dEngine** by **Ivan
 - Original engine © Ivan Sobolev, licensed under GPL-3.0.
 - Modifications and new features © Jareltis, 2026.
 
-Major changes from the original include: the renamed engine; a rewritten floating-point, **colored** lighting pipeline with per-channel tone mapping and **24-bit truecolor** output; a full multi-light system (point / directional / spot / area, colored emission, light spin, multi-beam spots, and circle/square/triangle cone shapes); smooth shading and a Blender-robust OBJ loader; a JSON **world system** with an **in-scene editor** and live network sync; an optional **physics** layer (a walking first-person character, per-object collision, and per-object gravity, with world-level master switches); **diff rendering** of the console; folder-based mesh loading with anchoring; BVH acceleration; bounding-sphere culling for primary and shadow rays; a shadow toggle; timestamped logging; and main-loop improvements (quit key, FPS cap, high-resolution delta time).
+Major changes from the original include: the renamed engine; a rewritten floating-point, **colored** lighting pipeline with per-channel tone mapping and **24-bit truecolor** output; a full multi-light system (point / directional / spot / area, colored emission, light spin, multi-beam spots, and circle/square/triangle cone shapes); smooth shading and a Blender-robust OBJ loader; a JSON **world system** with an **in-scene editor** and live network sync; a **real rigid-body physics** layer (a walking first-person character; gravity where a ball collides with the real mesh surface and rolls down slopes with momentum; per-object collision with AABB/OBB colliders and full 3D Separating-Axis contacts; per-object restitution, mass, friction and 3D tumbling with drift-free quaternion orientation; frame-rate-independent substepping; all under world-level master switches); **diff rendering** of the console; folder-based mesh loading with anchoring; BVH acceleration; bounding-sphere culling for primary and shadow rays; a shadow toggle; timestamped logging; and main-loop improvements (quit key, FPS cap, high-resolution delta time).
 
 ## License
 This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**. Because it is derived from Neo3dEngine (GPL-3.0), Nova3DVisualiser is and must remain GPL-3.0. See the [LICENSE](LICENSE) file for the full text.

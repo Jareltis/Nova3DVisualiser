@@ -126,7 +126,7 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
             CachedObj e = _cObjList[k];
             Object3d o = e.Obj;
             Vector3 rot = o.TotalRotation;
-            Rgba32 c = o.Color;
+            Rgba32 c = o.EffectiveColor;
             objects[k] = new SnapObject
             {
                 Position = o.Position,
@@ -147,7 +147,7 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
         foreach (var d in _allDisplays)
         {
             if (d is not Sphere sp) continue;
-            Rgba32 c = sp.Color;
+            Rgba32 c = sp.EffectiveColor;
             spheres.Add(new SnapSphere
             {
                 Center = sp.Position, Radius = sp.R,
@@ -173,7 +173,7 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
             {
                 Kind = kind,
                 Position = l.Position,
-                Rgb = l.Rgb,
+                Rgb = l.EffectiveRgb,
                 Power = l.LightPower,
                 Direction = l.Direction.Norm(),
                 ConeCosOuter = outer,
@@ -276,9 +276,10 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
             float tR = albedo.X + light.ColorInfluence * (1f - albedo.X);
             float tG = albedo.Y + light.ColorInfluence * (1f - albedo.Y);
             float tB = albedo.Z + light.ColorInfluence * (1f - albedo.Z);
-            lr += tR * (light.Rgb.X * term) * Exposure;
-            lg += tG * (light.Rgb.Y * term) * Exposure;
-            lb += tB * (light.Rgb.Z * term) * Exposure;
+            Vector3 erg = light.EffectiveRgb;                       // emission paled by the light's ColorFade
+            lr += tR * (erg.X * term) * Exposure;
+            lg += tG * (erg.Y * term) * Exposure;
+            lb += tB * (erg.Z * term) * Exposure;
         }
         // Reinhard tone map per channel → [0,1).
         return new Vector3(lr / (lr + 1f), lg / (lg + 1f), lb / (lb + 1f));

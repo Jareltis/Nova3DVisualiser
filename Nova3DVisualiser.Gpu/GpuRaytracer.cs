@@ -184,6 +184,7 @@ public sealed class GpuRaytracer : IDisposable
     // ===================== device code =====================
 
     private const float Bias = 0.01f;
+    private const float MinVis = 1e-3f;   // alpha-shadow: transmittance at/below this counts as fully blocked
     private const float DirRefDistSq = 64f;
     private const float Tau = 6.2831853f;
     private const int MaxLayers = 32;   // transparency depth-peel cap (bounds the per-ray layer loop)
@@ -434,8 +435,11 @@ public sealed class GpuRaytracer : IDisposable
             float lx = -L.Direction.X, ly = -L.Direction.Y, lz = -L.Direction.Z;
             float ndl = hit.Nx * lx + hit.Ny * ly + hit.Nz * lz;
             if (ndl <= 0f) return 0f;
-            if (g.EnableShadows == 1 && Occluded(g, hx, hy, hz, hit, lx, ly, lz, 1e4f, verts, faces, nodes, triIdx, objects, spheres)) return 0f;
-            return ndl * (L.Power / (DirRefDistSq + 1f));
+            float visD = g.EnableShadows == 1
+                ? ShadowTransmittance(g, hx, hy, hz, hit, lx, ly, lz, 1e4f, verts, faces, nodes, triIdx, objects, spheres)
+                : 1f;
+            if (visD <= 0f) return 0f;
+            return ndl * (L.Power / (DirRefDistSq + 1f)) * visD;
         }
 
         if (L.Kind == 3) return AreaTerm(g, L, hit, hx, hy, hz, verts, faces, nodes, triIdx, objects, spheres);
@@ -460,8 +464,11 @@ public sealed class GpuRaytracer : IDisposable
         float ux = ox / dist, uy = oy / dist, uz = oz / dist;
         float ndl = hit.Nx * ux + hit.Ny * uy + hit.Nz * uz;
         if (ndl <= 0f) return 0f;
-        if (g.EnableShadows == 1 && Occluded(g, hx, hy, hz, hit, ux, uy, uz, dist, verts, faces, nodes, triIdx, objects, spheres)) return 0f;
-        return ndl * (power / (dist * dist + 1f));
+        float vis = g.EnableShadows == 1
+            ? ShadowTransmittance(g, hx, hy, hz, hit, ux, uy, uz, dist, verts, faces, nodes, triIdx, objects, spheres)
+            : 1f;
+        if (vis <= 0f) return 0f;
+        return ndl * (power / (dist * dist + 1f)) * vis;
     }
 
     private static float SpotConeMax(SnapLight L, float hx, float hy, float hz)
@@ -557,14 +564,17 @@ public sealed class GpuRaytracer : IDisposable
         return sum * 0.25f;
     }
 
-    // True if any shadow-casting mesh (two-level BVH) or sphere blocks the (biased) segment toward the
-    // light. Early-outs on the first occluder within maxDist.
-    private static bool Occluded(GpuGlobals g, float hx, float hy, float hz, GpuHit hit,
+    // Light transmittance along the (biased) segment toward the light: 1 = fully lit, 0 = fully blocked.
+    // An OPAQUE shadow-caster (alpha >= 1) blocks completely; TRANSPARENT ones attenuate by their alpha,
+    // one per object/sphere — the exact analog of the CPU Light.ShadowTransmittance, so a shadow cast
+    // through glass is correspondingly lighter. Order-independent (a product + an opaque short-circuit).
+    private static float ShadowTransmittance(GpuGlobals g, float hx, float hy, float hz, GpuHit hit,
         float lx, float ly, float lz, float maxDist,
         ArrayView<Vector3> verts, ArrayView<SnapFace> faces, ArrayView<SnapBvhNode> nodes, ArrayView<int> triIdx,
         ArrayView<SnapObject> objects, ArrayView<SnapSphere> spheres)
     {
         float ox = hx + hit.Nx * Bias, oy = hy + hit.Ny * Bias, oz = hz + hit.Nz * Bias;
+        float t = 1f;
 
         for (int o = 0; o < g.ObjectCount; o++)
         {
@@ -581,7 +591,12 @@ public sealed class GpuRaytracer : IDisposable
             float ldy = (ob.ColY.X * lx + ob.ColY.Y * ly + ob.ColY.Z * lz) * ob.InvScale;
             float ldz = (ob.ColZ.X * lx + ob.ColZ.Y * ly + ob.ColZ.Z * lz) * ob.InvScale;
 
-            if (AnyHit(ob, lsx, lsy, lsz, ldx, ldy, ldz, maxDist, verts, faces, nodes, triIdx)) return true;
+            if (AnyHit(ob, lsx, lsy, lsz, ldx, ldy, ldz, maxDist, verts, faces, nodes, triIdx))
+            {
+                if (ob.A >= 1f) return 0f;                 // opaque occluder -> full shadow
+                t *= 1f - ob.A;
+                if (t <= MinVis) return 0f;
+            }
         }
 
         for (int s = 0; s < g.SphereCount; s++)
@@ -589,9 +604,14 @@ public sealed class GpuRaytracer : IDisposable
             SnapSphere sp = spheres[s];
             if (sp.CastsShadow == 0) continue;
             GpuHit h = HitSphere(sp, ox, oy, oz, lx, ly, lz);
-            if (h.T > 0f && h.T < maxDist) return true;
+            if (h.T > 0f && h.T < maxDist)
+            {
+                if (sp.A >= 1f) return 0f;
+                t *= 1f - sp.A;
+                if (t <= MinVis) return 0f;
+            }
         }
-        return false;
+        return t;
     }
 
     // Stackless any-hit over one mesh's local BVH: returns on the first face hit with 0 < t < maxDist.

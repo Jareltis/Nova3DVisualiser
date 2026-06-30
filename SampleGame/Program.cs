@@ -432,6 +432,7 @@ class Program
         var cbGravity = new CheckBox("Gravity", false) { X = 1, Y = 14 };
         var cbCollision = new CheckBox("Collision", true) { X = 20, Y = 14 };
         var gravityField = new TextField("9.8") { X = 22, Y = 15, Width = 8 };
+        var restitutionField = new TextField("0") { X = 39, Y = 15, Width = 6 };
 
         var create = new Button("Create", is_default: true);
         var back = new Button("Back");
@@ -471,6 +472,7 @@ class Program
                     GravityEnabled = cbGravity.Checked,
                     GravityStrength = float.TryParse(gravityField.Text?.ToString(), out var g) ? g : 9.8f,
                     CollisionEnabled = cbCollision.Checked,
+                    Restitution = Math.Clamp(ParseFloatOr(restitutionField.Text, 0f), 0f, 1f),
                 },
             };
             WorldManager.Save(w);
@@ -490,7 +492,8 @@ class Program
             new Label("Size (square/circle):") { X = 1, Y = 11 }, sizeField,
             new Label("Rect W x D:") { X = 1, Y = 12 }, widthField, depthField,
             new Label("Physics (Space toggles):") { X = 1, Y = 13 }, cbGravity, cbCollision,
-            new Label("Gravity strength:") { X = 1, Y = 15 }, gravityField);
+            new Label("Gravity strength:") { X = 1, Y = 15 }, gravityField,
+            new Label("Bounce:") { X = 31, Y = 15 }, restitutionField);
         RunStepDialog(dialog);
 
         world = built;
@@ -720,6 +723,11 @@ class Program
         Console.WriteLine($"Platform geometry: square faces={square.FaceCount}, rectangle faces={rect.FaceCount}, circle faces={disc.FaceCount}");
         if (rect.FaceCount <= 0 || disc.FaceCount <= 0 || square.FaceCount <= 0)
         { Console.WriteLine("WORLD TEST FAILED: a platform shape built with no faces."); return; }
+
+        // Ramp (wedge) primitive: a triangular prism — bottom(2) + slope(2) + back wall(2) + 2 end caps = 8 faces.
+        var ramp = PriviewNetworkScene.CreateRamp();
+        Console.WriteLine($"Ramp geometry: faces={ramp.FaceCount} (want 8)");
+        if (ramp.FaceCount != 8) { Console.WriteLine($"WORLD TEST FAILED: ramp should have 8 faces, got {ramp.FaceCount}."); return; }
 
         Console.WriteLine("WORLD TEST PASSED");
     }
@@ -1337,16 +1345,16 @@ class Program
             Name = "synctest",
             Graphics = new GraphicsConfig { Shadows = true, Bvh = false, ExtraLight = true, DisableCameraLight = true, Renderer = "gpu" },
             Platform = new PlatformConfig { Enabled = true, Size = 12f, Color = "Cyan", Collides = false, Gravity = true, Position = new Vec3Config { X = 1.5f, Y = -0.5f, Z = 2.5f } },
-            Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 12.5f, CollisionEnabled = false },
+            Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 12.5f, CollisionEnabled = false, Restitution = 0.4f },
             Objects = new List<WorldObject>
             {
                 new WorldObject { Id = 10, Type = "mesh", Mesh = "monkey",
                     Position = new Vec3Config { X = 1f, Y = 2f, Z = 3f },
                     Rotation = new Vec3Config { X = 0.1f, Y = 0.2f, Z = 0.3f },
-                    Scale = 1.5f, Color = "Red", Anchor = "Center", RotateSpeed = 0.5f, Radius = 1f },
+                    Scale = 1.5f, Color = "Red", Anchor = "Center", RotateSpeed = 0.5f, Radius = 1f, Collider = "obb" },
                 new WorldObject { Id = 11, Type = "cube",
                     Position = new Vec3Config { X = -1f, Y = 0f, Z = 2f },
-                    Scale = 2f, Color = "Green", Collides = false, Gravity = true },
+                    Scale = 2f, Color = "Green", Collides = false, Gravity = true, Mass = 3.5f, Restitution = 0.8f, ColorFade = 0.5f },
                 new WorldObject { Id = 12, Type = "sphere",
                     Position = new Vec3Config { X = 4f, Y = 1f, Z = -2f },
                     Radius = 2.5f, Color = "Blue" },
@@ -1355,7 +1363,7 @@ class Program
                     Power = 800f, Color = "Magenta", LightKind = "spot",
                     Direction = new Vec3Config { X = 0.5f, Y = -1f, Z = 0.25f },
                     ConeAngle = 22f, LightSize = 1.5f, LightSpin = 0.75f,
-                    BeamCount = 3, ConeShape = "triangle", ColorInfluence = 0.85f },
+                    BeamCount = 3, ConeShape = "triangle", ColorInfluence = 0.85f, ColorFade = 0.4f },
                 new WorldObject { Id = 14, Type = "light",
                     Position = new Vec3Config { X = -3f, Y = 5f, Z = -1f },
                     Power = 650f, Color = "Cyan", LightKind = "area",
@@ -1459,6 +1467,33 @@ class Program
             if (!chunkOk) { Fail("MeshChunk packet round-trip lost fields."); return; }
         }
 
+        // PhysicsSync delta: round-trip the compact position batch (id + pos + velY per entry).
+        {
+            var ps = new PhysicsSyncPacket
+            {
+                Ids = new[] { 7, 42 },
+                Positions = new[] { new Vector3(1f, 2f, 3f), new Vector3(-4f, 5.5f, 6f) },
+                VelY = new[] { -9.8f, 0f },
+                Rotations = new[] { new Vector3(0.1f, 0.2f, 0.3f), new Vector3(-0.4f, 0.5f, -0.6f) },
+                AngVel = new[] { new Vector3(1.5f, -2.5f, 0.5f), new Vector3(0f, 3f, -1f) },
+            };
+            byte[] pbytes;
+            using (var ms = new MemoryStream())
+            {
+                using (var w = new BinaryWriter(ms)) ps.Serialize(w);
+                pbytes = ms.ToArray();
+            }
+            var recv = new PhysicsSyncPacket();
+            using (var r = new BinaryReader(new MemoryStream(pbytes))) recv.Deserialize(r);
+            bool psOk = recv.Ids.Length == 2 && recv.Ids[0] == 7 && recv.Ids[1] == 42
+                && Math.Abs(recv.Positions[1].Y - 5.5f) < 1e-5f && Math.Abs(recv.VelY[0] - (-9.8f)) < 1e-5f
+                && recv.VelY[1] == 0f
+                && Math.Abs(recv.Rotations[0].Y - 0.2f) < 1e-5f && Math.Abs(recv.Rotations[1].Z - (-0.6f)) < 1e-5f
+                && Math.Abs(recv.AngVel[0].X - 1.5f) < 1e-5f && Math.Abs(recv.AngVel[1].Y - 3f) < 1e-5f;
+            Console.WriteLine($"PhysicsSync round-trip: {pbytes.Length} bytes, n={recv.Ids.Length}, pos1.Y={recv.Positions[1].Y:F2}, vel0={recv.VelY[0]:F2}, rot0.Y={recv.Rotations[0].Y:F2}, angvel0.X={recv.AngVel[0].X:F2} -> {(psOk ? "ok" : "BAD")}");
+            if (!psOk) { Fail("PhysicsSync packet round-trip lost fields."); return; }
+        }
+
         // Split/reassemble: cut a long string into MeshChunkSize pieces, reassemble by Index, compare.
         {
             const int chunkSize = 16384;   // mirrors PriviewNetworkScene.MeshChunkSize
@@ -1502,6 +1537,7 @@ class Program
         if (a.Physics.GravityEnabled != b.Physics.GravityEnabled) return "physics gravity-enabled differs";
         if (!Eq(a.Physics.GravityStrength, b.Physics.GravityStrength)) return "physics gravity-strength differs";
         if (a.Physics.CollisionEnabled != b.Physics.CollisionEnabled) return "physics collision-enabled differs";
+        if (!Eq(a.Physics.Restitution, b.Physics.Restitution)) return "physics restitution differs";
         if (a.Objects.Count != b.Objects.Count) return $"object count {a.Objects.Count} != {b.Objects.Count}";
 
         for (int i = 0; i < a.Objects.Count; i++)
@@ -1523,6 +1559,10 @@ class Program
             if (!Eq(x.Radius, y.Radius)) return $"object[{i}].Radius differs";
             if (x.Collides != y.Collides) return $"object[{i}].Collides {x.Collides} != {y.Collides}";
             if (x.Gravity != y.Gravity) return $"object[{i}].Gravity {x.Gravity} != {y.Gravity}";
+            if (x.Collider != y.Collider) return $"object[{i}].Collider '{x.Collider}' != '{y.Collider}'";
+            if (!Eq(x.Mass, y.Mass)) return $"object[{i}].Mass {x.Mass} != {y.Mass}";
+            if (!Eq(x.Restitution, y.Restitution)) return $"object[{i}].Restitution {x.Restitution} != {y.Restitution}";
+            if (!Eq(x.ColorFade, y.ColorFade)) return $"object[{i}].ColorFade {x.ColorFade} != {y.ColorFade}";
             if (!Eq(x.Power, y.Power)) return $"object[{i}].Power differs";
             // ---- light-only rich fields ----
             if (x.LightKind != y.LightKind) return $"object[{i}].LightKind '{x.LightKind}' != '{y.LightKind}'";
@@ -1599,6 +1639,100 @@ class Program
             ok &= t;
         }
 
+        // 5) OBB with identity axes == AABB (a non-rotated box must resolve identically to ResolveSphereVsAabb).
+        {
+            Vector3 ax = new(1f, 0f, 0f), ay = new(0f, 1f, 0f), az = new(0f, 0f, 1f), half = new(1f, 1f, 1f), center = new(0f, 0f, 0f);
+            Vector3 inc = new(1.2f, 0.5f, -0.3f);
+            Vector3 aabb = PriviewNetworkScene.ResolveSphereVsAabb(inc, r, bmin, bmax);
+            Vector3 obb = PriviewNetworkScene.ResolveSphereVsObb(inc, r, center, ax, ay, az, half);
+            bool t = (obb - aabb).Length() < eps;
+            Console.WriteLine($"  obb-identity: obb=({obb.X:F3},{obb.Y:F3},{obb.Z:F3}) vs aabb=({aabb.X:F3},{aabb.Y:F3},{aabb.Z:F3}) -> {(t ? "ok" : "BAD")}");
+            ok &= t;
+        }
+
+        // 6) OBB in a ROTATED frame (unit box turned 45° in the XZ plane): a point just past its +X
+        // local face is pushed out ALONG that local axis to face+r; a far point is returned unchanged.
+        {
+            const float s = 0.70710678f;                       // cos/sin 45°
+            Vector3 ax = new(s, 0f, s), ay = new(0f, 1f, 0f), az = new(-s, 0f, s), half = new(1f, 1f, 1f), center = new(0f, 0f, 0f);
+            Vector3 inc = ax * 1.1f;                            // local ex=1.1 (just past the face at 1.0), within r
+            Vector3 outc = PriviewNetworkScene.ResolveSphereVsObb(inc, r, center, ax, ay, az, half);
+            Vector3 want = ax * (1f + r);                       // pushed to face + r along the local X axis
+            bool faceOk = (outc - want).Length() < eps;
+            Vector3 farc = ax * (1f + r + 0.5f);                // clear of the face -> unchanged
+            Vector3 outf = PriviewNetworkScene.ResolveSphereVsObb(farc, r, center, ax, ay, az, half);
+            bool freeOk = (outf - farc).Length() < eps;
+            Console.WriteLine($"  obb-rotated: face-push dist-from-want={(outc - want).Length():F4}, free-unchanged={freeOk} -> {(faceOk && freeOk ? "ok" : "BAD")}");
+            ok &= faceOk && freeOk;
+        }
+
+        // 7) ResolveAabbHorizontal (phase-1 object separation): an overlapping pair is pushed along the
+        // least-penetration horizontal axis and the push clears the overlap; pairs apart on X/Z OR on Y
+        // resolve to zero (Y apart = not touching, so the horizontal solver leaves them alone).
+        {
+            Vector3 aMin = new(-1f, -1f, -1f), aMax = new(1f, 1f, 1f);
+            // b overlaps a, more on X (0.5) than on Z (0.2) -> push along Z by 0.2 (the smaller axis).
+            Vector3 bMin = new(0.5f, -1f, 0.8f), bMax = new(2.5f, 1f, 2.8f);
+            Vector3 push = PriviewNetworkScene.ResolveAabbHorizontal(aMin, aMax, bMin, bMax);
+            bool axisOk = push.X == 0f && Math.Abs(push.Z - (-0.2f)) < eps;
+            float aMaxZ2 = aMax.Z + push.Z;                    // a's +Z edge after the push
+            bool cleared = aMaxZ2 <= bMin.Z + eps;             // now just touching, no longer penetrating
+            // Apart on Y only (overlap XZ) -> not touching -> zero.
+            Vector3 yMin = new(0.5f, 5f, 0.5f), yMax = new(1.5f, 7f, 1.5f);
+            Vector3 pY = PriviewNetworkScene.ResolveAabbHorizontal(aMin, aMax, yMin, yMax);
+            // Fully separated -> zero.
+            Vector3 pFar = PriviewNetworkScene.ResolveAabbHorizontal(aMin, aMax, new Vector3(5f, -1f, 5f), new Vector3(7f, 1f, 7f));
+            bool zeros = pY.X == 0f && pY.Z == 0f && pFar.X == 0f && pFar.Z == 0f;
+            // RESTING on a wide floor: a small box dips 0.01 into a huge thin slab -> the vertical overlap is
+            // the SMALLEST axis -> a stacking contact -> NO horizontal push (else it's ejected sideways off
+            // the floor, the playground-pyramid runaway). A genuine side hit (Y not least) still pushes.
+            Vector3 fMin = new(-30f, -0.5f, -30f), fMax = new(30f, 0f, 30f);
+            Vector3 pRest = PriviewNetworkScene.ResolveAabbHorizontal(new Vector3(5f, -0.01f, 5f), new Vector3(7f, 2f, 7f), fMin, fMax);
+            bool restNoPush = pRest.X == 0f && pRest.Z == 0f;
+            Console.WriteLine($"  aabb-horiz: push=({push.X:F2},{push.Z:F2}) (want 0,-0.20), cleared={cleared}, y/far-zero={zeros}, rest-no-push={restNoPush} -> {(axisOk && cleared && zeros && restNoPush ? "ok" : "BAD")}");
+            ok &= axisOk && cleared && zeros && restNoPush;
+        }
+
+        // 8) SatRect2D (OBB-OBB contact, XZ): two axis-aligned unit squares offset 0.8 on X give the
+        // same axis-aligned MTV as the AABB path (normal +X, depth 0.2); a fully separated pair reports
+        // no hit; a 45°-rotated square overlapping an axis-aligned one is detected with a unit normal.
+        {
+            Vector3 eAx = new(0.5f, 0f, 0f), eAz = new(0f, 0f, 0.5f);   // axis-aligned unit square (half 0.5)
+            var (hit1, nx1, nz1, d1) = PriviewNetworkScene.SatRect2D(
+                new Vector3(0f, 0f, 0f), eAx, eAz, new Vector3(0.8f, 0f, 0f), eAx, eAz);
+            bool axisOk = hit1 && Math.Abs(nx1 - 1f) < eps && Math.Abs(nz1) < eps && Math.Abs(d1 - 0.2f) < eps;
+
+            var (hit2, _, _, _) = PriviewNetworkScene.SatRect2D(
+                new Vector3(0f, 0f, 0f), eAx, eAz, new Vector3(2f, 0f, 0f), eAx, eAz);   // far apart -> no hit
+
+            const float h = 0.35355339f;                                 // 0.5·cos45
+            Vector3 rBx = new(h, 0f, h), rBz = new(-h, 0f, h);           // square rotated 45°
+            var (hit3, nx3, nz3, d3) = PriviewNetworkScene.SatRect2D(
+                new Vector3(0f, 0f, 0f), eAx, eAz, new Vector3(0.7f, 0f, 0f), rBx, rBz);
+            float nlen3 = MathF.Sqrt(nx3 * nx3 + nz3 * nz3);
+            bool rotOk = hit3 && d3 > 0f && Math.Abs(nlen3 - 1f) < eps;
+
+            // Full 3D SatBox3D: same axis-aligned MTV (normal +X, depth 0.2); a vertical offset separates
+            // with a +Y normal (which the 2D XZ test could never see); a 45°-about-Z box still overlaps with
+            // a unit normal; a far pair reports no hit.
+            Vector3 hU = new(0.5f, 0.5f, 0.5f);
+            Vector3 AX = new(1f, 0f, 0f), AY = new(0f, 1f, 0f), AZ = new(0f, 0f, 1f);
+            var (b3hit, b3n, b3d) = PriviewNetworkScene.SatBox3D(Vector3.Zero, AX, AY, AZ, hU, new Vector3(0.8f, 0f, 0f), AX, AY, AZ, hU);
+            bool b3Axis = b3hit && Math.Abs(b3n.X - 1f) < eps && Math.Abs(b3n.Y) < eps && Math.Abs(b3n.Z) < eps && Math.Abs(b3d - 0.2f) < eps;
+            var (b3vh, b3vn, b3vd) = PriviewNetworkScene.SatBox3D(Vector3.Zero, AX, AY, AZ, hU, new Vector3(0f, 0.8f, 0f), AX, AY, AZ, hU);
+            bool b3Vert = b3vh && Math.Abs(b3vn.Y - 1f) < eps && Math.Abs(b3vd - 0.2f) < eps;
+            var (b3fh, _, _) = PriviewNetworkScene.SatBox3D(Vector3.Zero, AX, AY, AZ, hU, new Vector3(3f, 0f, 0f), AX, AY, AZ, hU);
+            const float q = 0.70710678f;
+            Vector3 rAX = new(q, q, 0f), rAY = new(-q, q, 0f);     // axes rotated 45° about Z
+            var (b3rh, b3rn, b3rd) = PriviewNetworkScene.SatBox3D(Vector3.Zero, AX, AY, AZ, hU, new Vector3(0.9f, 0f, 0f), rAX, rAY, AZ, hU);
+            bool b3Rot = b3rh && b3rd > 0f && Math.Abs(b3rn.Length() - 1f) < eps;
+            bool box3dOk = b3Axis && b3Vert && !b3fh && b3Rot;
+
+            bool satOk = axisOk && !hit2 && rotOk && box3dOk;
+            Console.WriteLine($"  sat-obb: axis2d(n={nx1:F2},{nz1:F2} d={d1:F2}), rot2d|n|={nlen3:F2}, 3d(axis={b3Axis} vert={b3Vert} far={!b3fh} rot={b3Rot}) -> {(satOk ? "ok" : "BAD")}");
+            ok &= satOk;
+        }
+
         Console.WriteLine(ok ? "COLLISION TEST PASSED" : "COLLISION TEST FAILED");
     }
 
@@ -1648,6 +1782,366 @@ class Program
             bool t = overlap && !apartX && !apartZ;
             Console.WriteLine($"  xzoverlap: overlap={overlap} (want True), apartX={apartX} (want False), apartZ={apartZ} (want False) -> {(t ? "ok" : "BAD")}");
             ok &= t;
+        }
+
+        // 3b) Restitution: a fall with restitution>0 rebounds (downward velocity flips positive on
+        // impact) and then settles to rest as the bounces decay below BounceMin; restitution 0 never bounces.
+        {
+            float g = 9.8f, dt = 1f / 60f, support = 0f, rest = 0.6f;
+            float bottom = 5f, vel = 0f; bool bounced = false;
+            for (int i = 0; i < 700; i++)   // long enough to fall (~60 steps), bounce several times, then settle
+            {
+                float before = vel;
+                (bottom, vel) = PriviewNetworkScene.StepFallY(bottom, vel, dt, g, support, rest);
+                if (before < 0f && vel > 0f) bounced = true;     // impact reflected the velocity upward
+            }
+            bool settled = Math.Abs(bottom - support) < eps && Math.Abs(vel) < eps;
+            // control: restitution 0 must NEVER produce an upward rebound.
+            float b2 = 5f, v2 = 0f; bool bounced0 = false;
+            for (int i = 0; i < 200; i++) { float bv = v2; (b2, v2) = PriviewNetworkScene.StepFallY(b2, v2, dt, g, support, 0f); if (bv < 0f && v2 > 0f) bounced0 = true; }
+            bool t = bounced && settled && !bounced0;
+            Console.WriteLine($"  restitution: bounced={bounced}, settled(bottom={bottom:F4},vel={vel:F4})={settled}, no-bounce@0={!bounced0} -> {(t ? "ok" : "BAD")}");
+            ok &= t;
+        }
+
+        // 3c) StepFriction: a horizontal velocity decays monotonically toward 0 without flipping sign,
+        // and Y is left untouched. 3d) NormalImpulse: equal-mass elastic swaps the normal components;
+        // a wall reflects with restitution; a separating pair is unchanged.
+        {
+            float dt = 1f / 60f;
+            Vector3 v = new(3f, -5f, -2f); float prevSpeed = MathF.Sqrt(v.X * v.X + v.Z * v.Z); bool mono = true, signOk = true;
+            for (int i = 0; i < 600; i++)
+            {
+                v = PriviewNetworkScene.StepFriction(v, dt, 4f);
+                float sp = MathF.Sqrt(v.X * v.X + v.Z * v.Z);
+                if (sp > prevSpeed + 1e-6f) mono = false;
+                if (v.X < 0f || v.Z > 0f) signOk = false;        // started +X / -Z; must not overshoot past 0
+                prevSpeed = sp;
+            }
+            bool yKept = Math.Abs(v.Y - (-5f)) < 1e-6f;
+            bool frOk = mono && signOk && yKept && Math.Abs(v.X) < eps && Math.Abs(v.Z) < eps;
+            Console.WriteLine($"  friction: settled vX={v.X:F4} vZ={v.Z:F4} (->0), monotonic={mono}, no-overshoot={signOk}, Y-kept={yKept} -> {(frOk ? "ok" : "BAD")}");
+            ok &= frOk;
+
+            // elastic equal-mass: A=+4 toward B=0 -> they swap (A=0, B=+4); momentum conserved.
+            var (a1, b1) = PriviewNetworkScene.NormalImpulse(4f, 0f, 1f, 1f, 1f);
+            // inelastic (e=0): both end at the common velocity (+2).
+            var (a0, b0) = PriviewNetworkScene.NormalImpulse(4f, 0f, 1f, 1f, 0f);
+            // wall (B mass infinite, e=0.5): A reflects to -2, wall unchanged.
+            var (aw, bw) = PriviewNetworkScene.NormalImpulse(4f, 0f, 1f, float.PositiveInfinity, 0.5f);
+            // separating pair (A moving away, pA<pB): unchanged.
+            var (as_, bs) = PriviewNetworkScene.NormalImpulse(-1f, 2f, 1f, 1f, 1f);
+            // mass-asymmetric elastic: light A (m=1, +4) hits heavy B (m=3, 0) -> A=-2, B=+2; momentum 1*4 = 1*-2 + 3*2.
+            var (am, bm) = PriviewNetworkScene.NormalImpulse(4f, 0f, 1f, 3f, 1f);
+            float momBefore = 1f * 4f, momAfter = 1f * am + 3f * bm;
+            bool impOk = Math.Abs(a1) < eps && Math.Abs(b1 - 4f) < eps
+                       && Math.Abs(a0 - 2f) < eps && Math.Abs(b0 - 2f) < eps
+                       && Math.Abs(aw - (-2f)) < eps && bw == 0f
+                       && as_ == -1f && bs == 2f
+                       && Math.Abs(am - (-2f)) < eps && Math.Abs(bm - 2f) < eps && Math.Abs(momAfter - momBefore) < eps;
+            Console.WriteLine($"  impulse: elastic=({a1:F2},{b1:F2}) inelastic=({a0:F2},{b0:F2}) wall=({aw:F2}) sep=({as_:F2},{bs:F2}) mass=({am:F2},{bm:F2}) mom={momAfter:F2} -> {(impOk ? "ok" : "BAD")}");
+            ok &= impOk;
+        }
+
+        // 3e) BoxInertia = diagonal m(·)/12 tensor; AngularImpulse = (r × J) ÷ I (component-wise): a
+        // centered hit gives no spin; a horizontal impulse at a horizontal lever yaws (about Y); the same
+        // impulse at a VERTICAL lever pitches/rolls (about a horizontal axis); zero inertia => no spin.
+        {
+            Vector3 I = PriviewNetworkScene.BoxInertia(2f, 2f, 3f, 4f);       // (m(9+16),m(4+16),m(4+9))/12 = (4.166,3.333,2.166)
+            bool inertiaOk = Math.Abs(I.X - 2f * 25f / 12f) < 1e-3f && Math.Abs(I.Y - 2f * 20f / 12f) < 1e-3f && Math.Abs(I.Z - 2f * 13f / 12f) < 1e-3f;
+            Vector3 centered = PriviewNetworkScene.AngularImpulse(Vector3.Zero, new Vector3(0f, 0f, 6f), new Vector3(3f, 3f, 3f));
+            Vector3 yaw = PriviewNetworkScene.AngularImpulse(new Vector3(1f, 0f, 0f), new Vector3(0f, 0f, 6f), new Vector3(3f, 3f, 3f));   // (r×J)=(0,-6,0)/3 -> Y=-2
+            Vector3 pitch = PriviewNetworkScene.AngularImpulse(new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, 6f), new Vector3(3f, 3f, 3f)); // (r×J)=(6,0,0)/3 -> X=+2
+            Vector3 zeroI = PriviewNetworkScene.AngularImpulse(new Vector3(1f, 0f, 0f), new Vector3(0f, 0f, 6f), Vector3.Zero);
+            bool angOk = inertiaOk
+                && centered.X == 0f && centered.Y == 0f && centered.Z == 0f
+                && Math.Abs(yaw.Y - (-2f)) < eps && Math.Abs(yaw.X) < eps && Math.Abs(yaw.Z) < eps
+                && Math.Abs(pitch.X - 2f) < eps && Math.Abs(pitch.Y) < eps && Math.Abs(pitch.Z) < eps
+                && zeroI.X == 0f && zeroI.Y == 0f && zeroI.Z == 0f;
+            Console.WriteLine($"  rotation: I=({I.X:F2},{I.Y:F2},{I.Z:F2}), yaw.Y={yaw.Y:F2}(-2), pitch.X={pitch.X:F2}(+2), centered/zeroI=0 -> {(angOk ? "ok" : "BAD")}");
+            ok &= angOk;
+        }
+
+        // 3e2) Off-diagonal inertia tensor (AngularImpulseT): the SAME torque spins a body fast when it
+        // hits its LOW-inertia axis and slow when the body is rotated to present a HIGH-inertia axis.
+        // Anisotropic I=(1,5,5): a torque about world +X gives ω=6 when body-X is world-aligned, but only
+        // ω=1.2 when the body is turned 90° about Z (so its high-inertia Y axis now faces +X). World-aligned
+        // axes must reproduce AngularImpulse exactly (the tensor reduces to the diagonal case).
+        {
+            Vector3 Ia = new(1f, 5f, 5f);
+            Vector3 tA = PriviewNetworkScene.AngularImpulseT(new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, 6f),
+                new Vector3(1f, 0f, 0f), new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, 1f), Ia);          // body axes = world
+            Vector3 tR = PriviewNetworkScene.AngularImpulseT(new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, 6f),
+                new Vector3(0f, 1f, 0f), new Vector3(-1f, 0f, 0f), new Vector3(0f, 0f, 1f), Ia);          // body turned 90° about Z
+            bool tensorOk = Math.Abs(tA.X - 6f) < eps && Math.Abs(tA.Y) < eps && Math.Abs(tA.Z) < eps
+                         && Math.Abs(tR.X - 1.2f) < 1e-3f && Math.Abs(tR.Y) < eps && Math.Abs(tR.Z) < eps;
+            Console.WriteLine($"  inertia-tensor: aligned ωx={tA.X:F2}(6), rotated ωx={tR.X:F2}(1.2) -> {(tensorOk ? "ok" : "BAD")}");
+            ok &= tensorOk;
+        }
+
+        // 3f) Quaternion orientation: Euler -> Quat -> Euler round-trips (away from gimbal lock); a unit
+        // angular velocity integrated for time T rotates by exactly ω·T (drift-free) and the quaternion
+        // stays unit-norm even integrating about two axes (where naive Euler integration would drift).
+        {
+            Vector3 e = new(0.3f, 0.5f, -0.2f);
+            var rt = PriviewNetworkScene.EulerFromQuat(PriviewNetworkScene.QuatFromEuler(e));
+            bool rtOk = Math.Abs(rt.X - e.X) < 1e-3f && Math.Abs(rt.Y - e.Y) < 1e-3f && Math.Abs(rt.Z - e.Z) < 1e-3f;
+
+            // integrate ω=(0,2,0) for T=0.5 -> yaw 1.0 rad.
+            var q = PriviewNetworkScene.Quat.Identity; float dt = 1f / 600f;
+            for (int i = 0; i < 300; i++) q = PriviewNetworkScene.IntegrateQuat(q, new Vector3(0f, 2f, 0f), dt);
+            var eY = PriviewNetworkScene.EulerFromQuat(q);
+            bool spinOk = Math.Abs(eY.Y - 1.0f) < 1e-2f && Math.Abs(eY.X) < 1e-2f && Math.Abs(eY.Z) < 1e-2f;
+
+            // two-axis integration must keep the quaternion unit-norm (drift-free).
+            var q2 = PriviewNetworkScene.Quat.Identity;
+            for (int i = 0; i < 600; i++) q2 = PriviewNetworkScene.IntegrateQuat(q2, new Vector3(1.5f, -1f, 0.7f), dt);
+            float norm2 = MathF.Sqrt(q2.X * q2.X + q2.Y * q2.Y + q2.Z * q2.Z + q2.W * q2.W);
+            bool normOk = Math.Abs(norm2 - 1f) < 1e-4f;
+
+            bool quatOk = rtOk && spinOk && normOk;
+            Console.WriteLine($"  quaternion: roundtrip={rtOk}, spinY={eY.Y:F3}(1.000), unit-norm={norm2:F5} -> {(quatOk ? "ok" : "BAD")}");
+            ok &= quatOk;
+        }
+
+        // 3g) LerpAngle (rotation sync): eases along the SHORTEST arc — lerping from +3.0 toward -3.0
+        // (≈ across the ±π seam) moves the SHORT way (magnitude grows past π / wraps), not back through 0.
+        {
+            float half = PriviewNetworkScene.LerpAngle(3.0f, -3.0f, 0.5f);   // shortest delta ≈ +0.283, half -> ~3.14
+            float midNoWrap = 3.0f + (-3.0f - 3.0f) * 0.5f;                  // naive lerp would give 0 (the long way)
+            bool shortArc = MathF.Abs(half) > 3.0f && Math.Abs(midNoWrap) < eps;   // short arc leaves |angle|>3; naive collapses to 0
+            float plain = PriviewNetworkScene.LerpAngle(0.2f, 0.8f, 0.5f);   // no wrap -> simple midpoint 0.5
+            bool lerpOk = shortArc && Math.Abs(plain - 0.5f) < eps;
+            Console.WriteLine($"  lerpangle: seam={half:F3}(|>3|), plain={plain:F3}(0.5) -> {(lerpOk ? "ok" : "BAD")}");
+            ok &= lerpOk;
+        }
+
+        // 3h) ReflectVelocity (sphere bounce off a surface normal): a flat (up) normal gives the usual
+        // vertical bounce (horizontal kept); a 45° slope deflects a straight-down drop SIDEWAYS; a velocity
+        // moving away from the surface is unchanged.
+        {
+            Vector3 flat = PriviewNetworkScene.ReflectVelocity(new Vector3(1f, -5f, 0f), new Vector3(0f, 1f, 0f), 0.5f);
+            bool flatOk = Math.Abs(flat.X - 1f) < eps && Math.Abs(flat.Y - 2.5f) < eps && Math.Abs(flat.Z) < eps;   // velY -> -e·velY=+2.5, X kept
+            const float s = 0.70710678f;
+            Vector3 slope = PriviewNetworkScene.ReflectVelocity(new Vector3(0f, -5f, 0f), new Vector3(s, s, 0f), 0.5f);
+            bool slopeOk = slope.X > 0.5f && slope.Y > -5f;                                                          // gains sideways +X, vertical eased
+            Vector3 away = PriviewNetworkScene.ReflectVelocity(new Vector3(0f, 5f, 0f), new Vector3(0f, 1f, 0f), 0.5f);
+            bool awayOk = away.X == 0f && away.Y == 5f && away.Z == 0f;                                              // moving away -> unchanged
+            bool refOk = flatOk && slopeOk && awayOk;
+            Console.WriteLine($"  reflect: flat=({flat.X:F2},{flat.Y:F2}), slope.X={slope.X:F2}(>0 sideways), away-unchanged={awayOk} -> {(refOk ? "ok" : "BAD")}");
+            ok &= refOk;
+        }
+
+        // 3i) SphereContactResponse (the stability fix): a REAL impact bounces; a GENTLE contact only
+        // slides (its speed must NOT grow — this is what stops the slope runaway); a separating velocity
+        // is unchanged. The no-energy-gain property is checked even on a slope with restitution=1.
+        {
+            const float bm = 0.6f, s = 0.70710678f;
+            Vector3 up = new(0f, 1f, 0f), slopeN = new(s, s, 0f);
+            // real impact (fast into a flat floor) -> bounces up.
+            var impact = PriviewNetworkScene.SphereContactResponse(new Vector3(0f, -5f, 0f), up, 0.5f, bm);
+            bool impactOk = impact.Y > 0f;
+            // gentle contact (slow into floor) -> vertical removed, no bounce.
+            var graze = PriviewNetworkScene.SphereContactResponse(new Vector3(1f, -0.2f, 0f), up, 1f, bm);
+            bool grazeOk = Math.Abs(graze.Y) < eps && Math.Abs(graze.X - 1f) < eps;
+            // CRITICAL: a gentle contact on a slope with restitution=1 must NOT increase speed (no runaway).
+            Vector3 vIn = new(0.3f, -0.3f, 0f);
+            var slopeGraze = PriviewNetworkScene.SphereContactResponse(vIn, slopeN, 1f, bm);
+            float inMag = MathF.Sqrt(vIn.X * vIn.X + vIn.Y * vIn.Y + vIn.Z * vIn.Z);
+            float outMag = MathF.Sqrt(slopeGraze.X * slopeGraze.X + slopeGraze.Y * slopeGraze.Y + slopeGraze.Z * slopeGraze.Z);
+            bool noGain = outMag <= inMag + 1e-4f;
+            // separating velocity -> unchanged.
+            var sep = PriviewNetworkScene.SphereContactResponse(new Vector3(0f, 5f, 0f), up, 1f, bm);
+            bool sepOk = sep.Y == 5f;
+            bool scrOk = impactOk && grazeOk && noGain && sepOk;
+            Console.WriteLine($"  sphere-contact: impact.Y={impact.Y:F2}(>0), graze=({graze.X:F2},{graze.Y:F2}), slope no-gain={outMag:F3}<={inMag:F3}, sep={sep.Y:F1} -> {(scrOk ? "ok" : "BAD")}");
+            ok &= scrOk;
+        }
+
+        // 4) StepInterpolate (client position sync): with velY=0 the current position eases toward a
+        // fixed target and converges (monotonic shrinking error); with velY<0 it dead-reckons the
+        // ongoing fall, so the target keeps descending and the eased current tracks it downward.
+        {
+            float dt = 1f / 60f, rate = 12f;
+            // converge: cur=(0,5,0) toward tgt=(0,0,0), no velocity.
+            Vector3 cur = new(0f, 5f, 0f), tgt = new(0f, 0f, 0f);
+            float prevErr = MathF.Abs(cur.Y - tgt.Y); bool monotonic = true;
+            for (int i = 0; i < 240; i++)
+            {
+                (cur, tgt) = PriviewNetworkScene.StepInterpolate(cur, tgt, 0f, dt, rate);
+                float err = MathF.Abs(cur.Y - tgt.Y);
+                if (err > prevErr + 1e-6f) monotonic = false;
+                prevErr = err;
+            }
+            bool conv = monotonic && MathF.Abs(cur.Y) < 1e-2f;
+            Console.WriteLine($"  interp-converge: cur.Y={cur.Y:F4} (want ~0), monotonic={monotonic} -> {(conv ? "ok" : "BAD")}");
+            ok &= conv;
+
+            // dead-reckon: velY=-6, target starts at 0 and must descend ~velY*elapsed; cur tracks near it.
+            Vector3 c2 = new(0f, 0f, 0f), t2 = new(0f, 0f, 0f);
+            int steps = 120; float velY = -6f;
+            for (int i = 0; i < steps; i++) (c2, t2) = PriviewNetworkScene.StepInterpolate(c2, t2, velY, dt, rate);
+            float expected = velY * steps * dt;                 // target's extrapolated Y
+            bool fell = t2.Y < -1e-2f && MathF.Abs(t2.Y - expected) < 1e-2f && MathF.Abs(c2.Y - t2.Y) < 0.5f;
+            Console.WriteLine($"  interp-deadreckon: tgt.Y={t2.Y:F3} (want {expected:F3}), cur.Y={c2.Y:F3} (tracks) -> {(fell ? "ok" : "BAD")}");
+            ok &= fell;
+        }
+
+        // 4b) COMBINE-RESTITUTION: a contact's bounciness is the geometric mean of the two bodies'
+        // restitutions, so two elastic surfaces stay elastic, a dead one (0) kills the rebound, and a
+        // negative ("inherit world") input clamps to 0 in the raw combine (callers resolve it first).
+        {
+            float c11 = PriviewNetworkScene.CombineRestitution(1f, 1f);
+            float c10 = PriviewNetworkScene.CombineRestitution(1f, 0f);
+            float c55 = PriviewNetworkScene.CombineRestitution(0.5f, 0.5f);
+            float cNeg = PriviewNetworkScene.CombineRestitution(-1f, 0.5f);
+            bool cok = MathF.Abs(c11 - 1f) < 1e-4f && c10 < 1e-4f && MathF.Abs(c55 - 0.5f) < 1e-4f && cNeg < 1e-4f;
+            Console.WriteLine($"  combine-restitution: (1,1)={c11:F2} (1,0)={c10:F2} (.5,.5)={c55:F2} (-1,.5)={cNeg:F2} -> {(cok ? "ok" : "BAD")}");
+            ok &= cok;
+        }
+
+        // 4c) CLOSEST-POINT-ON-TRIANGLE (the heart of real sphere-vs-mesh contact): a point above the face
+        // projects straight down onto it; a point beyond a vertex clamps to that vertex; a point past an edge
+        // clamps onto the edge. Triangle in the y=0 plane: A(0,0,0) B(1,0,0) C(0,0,1).
+        {
+            Vector3 a = new(0f, 0f, 0f), b = new(1f, 0f, 0f), cc = new(0f, 0f, 1f);
+            Vector3 above = PriviewNetworkScene.ClosestPointOnTriangle(new Vector3(0.25f, 5f, 0.25f), a, b, cc);   // inside -> projects to (0.25,0,0.25)
+            Vector3 vert = PriviewNetworkScene.ClosestPointOnTriangle(new Vector3(-2f, 0f, -2f), a, b, cc);        // beyond A -> A
+            Vector3 edge = PriviewNetworkScene.ClosestPointOnTriangle(new Vector3(0.5f, 0f, -1f), a, b, cc);       // past AB -> (0.5,0,0)
+            bool cptOk = MathF.Abs(above.X - 0.25f) < eps && MathF.Abs(above.Y) < eps && MathF.Abs(above.Z - 0.25f) < eps
+                      && vert.Length() < eps
+                      && MathF.Abs(edge.X - 0.5f) < eps && MathF.Abs(edge.Y) < eps && MathF.Abs(edge.Z) < eps;
+            Console.WriteLine($"  closest-point: above=({above.X:F2},{above.Y:F2},{above.Z:F2}), vert=({vert.X:F2},{vert.Y:F2},{vert.Z:F2}), edge=({edge.X:F2},{edge.Y:F2},{edge.Z:F2}) -> {(cptOk ? "ok" : "BAD")}");
+            ok &= cptOk;
+        }
+
+        // 5) STABILITY SIM (the runaway regression): drop a sphere onto a STATIC pyramid (gravity on,
+        // restitution 0.5) and step the real authority physics for ~10 s. The sphere must come to rest on
+        // the pyramid/floor and STAY at sane coordinates — never fly off to hundreds of units or sink away.
+        {
+            var simWorld = new WorldConfig
+            {
+                Name = "stability-sim",
+                Graphics = new GraphicsConfig { Shadows = false },
+                Platform = new PlatformConfig { Enabled = true, Shape = "square", Size = 40f, Color = "Gray", Position = new Vec3Config { X = 0f, Y = 0f, Z = 0f } },
+                Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 9.8f, CollisionEnabled = true, Restitution = 0.5f },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 0, Type = "pyramid", Color = "White",
+                        Position = new Vec3Config { X = 0f, Y = 0f, Z = 0f }, Scale = 1f, Collides = true, Gravity = false },
+                    new WorldObject { Id = 1, Type = "sphere", Color = "Red", Radius = 1f,
+                        Position = new Vec3Config { X = 0.2f, Y = 8f, Z = 0.1f }, Collides = true, Gravity = true },
+                },
+            };
+            var sim = new PriviewNetworkScene(new DisplayManagerAsync(), simWorld, isServer: false, "127.0.0.1", 0, online: false);
+            sim.Start();
+            float dt = 1f / 60f;
+            for (int i = 0; i < 600; i++) sim.StepPhysicsForTest(dt);
+
+            var ballEntry = sim.EditableEntries.FirstOrDefault(en => en.Instance is Sphere);
+            var p = ballEntry?.Instance.Position ?? new Vector3(9999f, 9999f, 9999f);
+            // Stayed near the drop column horizontally, settled above the floor, never escaped or sank.
+            bool boundedXZ = MathF.Abs(p.X) < 15f && MathF.Abs(p.Z) < 15f;   // a real elastic bounce off a slope legitimately travels a few units; a runaway goes to hundreds
+            bool boundedY = p.Y > -5f && p.Y < 20f;
+            // ROLLED downhill: tangential gravity slid the ball off the apex (proves sideways motion works)
+            // while staying bounded (the runaway it replaces would have flung it to hundreds of units).
+            float rollDist = MathF.Sqrt((p.X - 0.2f) * (p.X - 0.2f) + (p.Z - 0.1f) * (p.Z - 0.1f));
+            bool rolled = rollDist > 0.5f;
+            bool simOk = ballEntry != null && boundedXZ && boundedY && rolled;
+            Console.WriteLine($"  stability-sim: ball after 600 steps at ({p.X:F2},{p.Y:F2},{p.Z:F2}) -> rolled={rolled} (dist {rollDist:F2}), boundedXZ={boundedXZ}, boundedY={boundedY} -> {(simOk ? "ok" : "BAD")}");
+            ok &= simOk;
+        }
+
+        // 6) MESH SLIDE SIM: a falling CUBE must rest on the pyramid's REAL face (ray-traced footprint,
+        // StepMeshGravity), slide downhill via tangential gravity, and settle — bounded, never floating on
+        // its bounding box at the apex or running away. Mirrors stability-sim but for a mesh.
+        {
+            var simWorld = new WorldConfig
+            {
+                Name = "mesh-slide-sim",
+                Graphics = new GraphicsConfig { Shadows = false },
+                Platform = new PlatformConfig { Enabled = true, Shape = "square", Size = 40f, Color = "Gray", Position = new Vec3Config { X = 0f, Y = 0f, Z = 0f } },
+                Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 9.8f, CollisionEnabled = true, Restitution = 0.3f },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 0, Type = "pyramid", Color = "White",
+                        Position = new Vec3Config { X = 0f, Y = 0f, Z = 0f }, Scale = 2f, Collides = true, Gravity = false },
+                    new WorldObject { Id = 1, Type = "cube", Color = "Red",
+                        Position = new Vec3Config { X = 0.6f, Y = 8f, Z = 0.2f }, Scale = 1f, Collides = true, Gravity = true },
+                },
+            };
+            var sim = new PriviewNetworkScene(new DisplayManagerAsync(), simWorld, isServer: false, "127.0.0.1", 0, online: false);
+            sim.Start();
+            float dt = 1f / 60f;
+            for (int i = 0; i < 600; i++) sim.StepPhysicsForTest(dt);
+
+            var cubeEntry = sim.EditableEntries.FirstOrDefault(en => en.Descriptor.Id == 1);
+            var p = cubeEntry?.Instance.Position ?? new Vector3(9999f, 9999f, 9999f);
+            bool boundedXZ = MathF.Abs(p.X) < 12f && MathF.Abs(p.Z) < 12f;
+            bool boundedY = p.Y > -5f && p.Y < 20f;
+            float slid = MathF.Sqrt((p.X - 0.6f) * (p.X - 0.6f) + (p.Z - 0.2f) * (p.Z - 0.2f));   // moved off the drop column
+            bool moved = slid > 0.3f;
+            bool meshOk = cubeEntry != null && boundedXZ && boundedY && moved;
+            Console.WriteLine($"  mesh-slide-sim: cube after 600 steps at ({p.X:F2},{p.Y:F2},{p.Z:F2}) -> slid={moved} (dist {slid:F2}), boundedXZ={boundedXZ}, boundedY={boundedY} -> {(meshOk ? "ok" : "BAD")}");
+            ok &= meshOk;
+        }
+
+        // 7) MYWORLD REPRO (the reported runaway): a falling sphere (restitution 0) dropped ONTO a DYNAMIC,
+        // 45°/45°-rotated cube over a big floor — exactly the user's myworld, for BOTH collider shapes. The
+        // ball must NOT be flung to huge coordinates. Tracks the max horizontal radius reached by ANY object.
+        foreach (string cubeShape in new[] { "aabb", "obb" })
+        {
+            var w = new WorldConfig
+            {
+                Name = "myworld-repro",
+                Graphics = new GraphicsConfig { Shadows = false },
+                Platform = new PlatformConfig { Enabled = true, Shape = "square", Size = 200f, Color = "Gray", Position = new Vec3Config { X = 0f, Y = 0f, Z = 0f } },
+                Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 10f, CollisionEnabled = true, Restitution = 0.5f },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 2, Type = "cube", Color = "#7777FF",
+                        Position = new Vec3Config { X = -0.048719168f, Y = 1.4142137f, Z = -3.2081192f },
+                        Rotation = new Vec3Config { X = 0.7853982f, Y = 0.7853982f, Z = 0f },
+                        Scale = 1f, Collides = true, Gravity = true, Collider = cubeShape, Restitution = -1f },
+                    new WorldObject { Id = 4, Type = "sphere", Color = "White", Radius = 1f,
+                        Position = new Vec3Config { X = 0.5f, Y = 10f, Z = -3.2081192f },   // OFF-CENTRE onto the tilted cube so it rolls off (not the unstable dead-centre balance)
+                        Scale = 1f, Collides = true, Gravity = true, Restitution = 0f },
+                },
+            };
+            // Sweep frame times (an ASCII raytracer steps by the REAL frame time). For EACH: the ball must
+            // stay bounded (no fling) AND move SMOOTHLY — the per-frame step at 60 FPS must be small (a
+            // teleport off the bounding box would be a big jump). Now the ball hits the cube's REAL faces,
+            // so it rolls off instead of being ejected from the box.
+            bool boundedAll = true;
+            foreach (float dt in new[] { 1f / 60f, 1f / 15f, 1f / 8f, 1f / 4f, 1f / 2f, 1f })
+            {
+                var sim = new PriviewNetworkScene(new DisplayManagerAsync(), w, isServer: false, "127.0.0.1", 0, online: false);
+                sim.Start();
+                Vector3 prev = sim.EditableEntries.FirstOrDefault(en => en.Instance is Sphere)?.Instance.Position ?? Vector3.Zero;
+                float maxR = 0f, maxStep = 0f;
+                int steps = (int)(10f / dt);                    // ~10 s of sim regardless of dt
+                for (int i = 0; i < steps; i++)
+                {
+                    sim.StepPhysicsForTest(dt);
+                    var cur = sim.EditableEntries.FirstOrDefault(en => en.Instance is Sphere)?.Instance.Position ?? prev;
+                    float step = (cur - prev).Length(); if (step > maxStep) maxStep = step;
+                    prev = cur;
+                    foreach (var en in sim.EditableEntries)
+                    {
+                        var pp = en.Instance.Position;
+                        float rr = MathF.Sqrt(pp.X * pp.X + pp.Z * pp.Z);
+                        if (rr > maxR) maxR = rr;
+                    }
+                }
+                var ball = sim.EditableEntries.FirstOrDefault(en => en.Instance is Sphere);
+                var bp = ball?.Instance.Position ?? new Vector3(9999f, 9999f, 9999f);
+                bool bounded = MathF.Abs(bp.X) < 20f && MathF.Abs(bp.Z) < 20f && bp.Y > -5f && bp.Y < 30f && maxR < 50f;
+                bool smooth = dt > 1f / 60f + 1e-4f || maxStep < 0.5f;   // no teleport: assert the smooth-step only at 60 FPS (substep makes a big-dt call coarser)
+                bool good = bounded && smooth;
+                Console.WriteLine($"  myworld-repro [{cubeShape}] dt=1/{1f / dt:F0}: ball end ({bp.X:F2},{bp.Y:F2},{bp.Z:F2}), maxR={maxR:F1}, maxStep={maxStep:F2} -> {(good ? "ok" : "BAD")}");
+                boundedAll &= good;
+            }
+            ok &= boundedAll;
         }
 
         Console.WriteLine(ok ? "PHYSICS TEST PASSED" : "PHYSICS TEST FAILED");
@@ -1716,6 +2210,7 @@ class Program
             hi.Scale = 1.8f;
             hi.LocalRotate = new Vector3(0.4f, 0.7f, 0.2f);
             hi.Color = new Rgba32(200, 180, 60);
+            hi.ColorFade = 0.5f;   // exercise colour-paleness: baked into both the CPU shade and the GPU snapshot
             hi.UpdateGeometry();
             hi.BuildAcceleration();
             AddDisplaysObject(hi);
@@ -1728,7 +2223,7 @@ class Program
             {
                 Kind = LightKind.Spot, Direction = new Vector3(0.3f, -1f, 0f).Norm(),
                 ConeAngleDeg = 35f, BeamCount = 2, ConeShape = ConeShapeKind.Square,
-                Rgb = new Vector3(0.7f, 0.8f, 1f),
+                Rgb = new Vector3(0.7f, 0.8f, 1f), ColorFade = 0.4f,   // pale the emission (parity check)
             });
 
             AddLight(new Light(new Vector3(6f, 6f, -4f), 400f)
