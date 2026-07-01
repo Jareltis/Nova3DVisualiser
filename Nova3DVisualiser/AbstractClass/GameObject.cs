@@ -28,6 +28,13 @@ public abstract class GameObject(Vector3 position, Vector3 localRotate)
     // so an object bounces exactly as before until given its own value. On contact the two bodies'
     // restitutions combine, so a bouncy ball vs a dead wall (or a springy one) behaves realistically.
     public float Restitution = -1f;
+    // Per-object Coulomb friction coefficient μ (>=0) for the impulse solver. On contact the two bodies'
+    // frictions combine (geometric mean), so a slick object slides where a grippy one sticks. Default 0.5.
+    public float Friction = 0.5f;
+    // Per-object rolling-friction coefficient (>=0): a bounded resistance to SPIN while in contact, so a
+    // rolling ball slows and stops (and a tumble damps) instead of rolling forever. Small default (0.05) so
+    // it never freezes legitimate motion; combined per contact (geometric mean).
+    public float RollingFriction = 0.05f;
 
     // "Colour transparency" / PALENESS, 0..1 — independent of the alpha channel. 0 = the object's true
     // colour; 1 = washed out to white. It fades ONLY the RGB shown in shading; the alpha (which is the

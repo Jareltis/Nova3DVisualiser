@@ -44,6 +44,9 @@ public class PhysicsConfig
     // Bounciness of a landing object: 0 = no bounce (dead stop, the original behavior), 1 = elastic
     // (rebounds at the full impact speed). The object settles once a bounce falls below a small floor.
     public float Restitution { get; set; } = 0f;
+    // (An older per-world "engine" switch selecting "legacy" vs "impulse" was retired in Stage 7b — there is
+    // now a single impulse-based rigid-body constraint solver, SampleGame/Physics/, see PHYSICS.md. A world
+    // JSON that still carries a stale "engine" key loads fine: System.Text.Json ignores the unmapped member.)
 }
 
 public class PlatformConfig
@@ -87,6 +90,8 @@ public class WorldObject
     public string Collider { get; set; } = "aabb";    // collider shape for meshes/primitives: "aabb" (world box, default) | "obb" (oriented box)
     public float Mass { get; set; } = 1f;             // impulse-solver mass (heavier = shoved less); >0
     public float Restitution { get; set; } = -1f;     // per-object bounciness 0..1; <0 = inherit world PhysicsConfig.Restitution
+    public float Friction { get; set; } = 0.5f;       // per-object Coulomb friction μ (>=0); combined per contact (geometric mean)
+    public float RollingFriction { get; set; } = 0.05f; // per-object rolling-friction (>=0); bounded resistance to spin so a rolling ball stops
     public float Radius { get; set; } = 1f;           // sphere only
     public float Power { get; set; } = 500f;          // light only: engine Light.LightPower
     // ---- light-only rich fields (ignored for other types) ----

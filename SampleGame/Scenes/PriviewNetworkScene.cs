@@ -8,6 +8,7 @@ using Nova3DVisualiser.Network;
 using Nova3DVisualiser.Shape;
 using Nova3DVisualiser.StaticClass;
 using SampleGame.NetworkPackets;
+using SampleGame.Physics;
 using SampleGame.Worlds;
 using System.Globalization;
 using System.Text.Json;
@@ -94,6 +95,9 @@ public class PriviewNetworkScene : Scene
     private const float MassStep = 0.5f;                 // per-object mass adjust per N/M press
     private const float MassMin = 0.1f;                  // smallest mass (never zero/negative)
     private const float RestStep = 0.1f;                 // per-object restitution (bounce) adjust per N/M press
+    private const float FrictionStep = 0.1f;             // per-object friction (μ) adjust per N/M press
+    private const float FrictionMax = 2f;                // clamp for the friction editor field
+    private const float RollFrictionStep = 0.02f;        // per-object rolling-friction adjust per N/M press
     private const float ColorFadeStep = 0.1f;            // per-object colour paleness adjust per N/M press
     private static readonly string[] PlatformShapes = { "square", "rectangle", "circle" };   // ordered for PlatShape cycle
     private const float LightMarkerScale = 0.3f;         // size of the small cube that marks a light
@@ -105,7 +109,7 @@ public class PriviewNetworkScene : Scene
     // Properties-panel editable fields (read-only Type/Mesh are not in here).
     private enum Field { PosX, PosY, PosZ, RotX, RotY, RotZ, Scale, RotateSpeed, ColorR, ColorG, ColorB, ColorA, Radius,
                          Power, ClrInf, Kind, DirX, DirY, DirZ, ConeAngle, AreaSize, AreaShape, Spin, Beams, Shape,
-                         PlatShape, PlatSize, PlatWidth, PlatDepth, Collides, Gravity, Collider, Mass, Restitution, ColorFade }
+                         PlatShape, PlatSize, PlatWidth, PlatDepth, Collides, Gravity, Collider, Mass, Restitution, Friction, RollingFriction, ColorFade }
     private int _fieldIndex = 0;
 
     // Editable fields for the selected entry. A light's set depends on its Kind: every light shows
@@ -115,7 +119,7 @@ public class PriviewNetworkScene : Scene
     {
         string type = e.Descriptor.Type ?? "";
         if (type == "sphere")
-            return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.Radius, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Collides, Field.Gravity, Field.Mass, Field.Restitution };
+            return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.Radius, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Collides, Field.Gravity, Field.Mass, Field.Restitution, Field.Friction, Field.RollingFriction };
         if (type == "platform")
         {
             // The floor moves like any object (Pos), then a shape-dependent size set + Color.
@@ -138,7 +142,7 @@ public class PriviewNetworkScene : Scene
             f.Add(Field.Gravity);   // a light has no collider, but it CAN be made to fall
             return f.ToArray();
         }
-        return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.Scale, Field.RotateSpeed, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Collides, Field.Gravity, Field.Collider, Field.Mass, Field.Restitution };
+        return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.Scale, Field.RotateSpeed, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Collides, Field.Gravity, Field.Collider, Field.Mass, Field.Restitution, Field.Friction, Field.RollingFriction };
     }
 
 
@@ -502,47 +506,6 @@ public class PriviewNetworkScene : Scene
         return a + ab * (vb * denom) + ac * (vc * denom);
     }
 
-    private const int MaxMeshCollideFaces = 512;   // above this a sphere falls back to the mesh's AABB (closest-point on the box) for cost
-
-    // Sphere (c,r) vs a mesh's REAL surface: the closest point over its triangles. Outputs the OUTWARD
-    // contact normal (surface -> centre) and penetration (>0 when overlapping). Low-poly meshes only (gated
-    // by MaxMeshCollideFaces); high-poly fall back to the AABB. THIS is what lets a ball sit/roll on a
-    // pyramid FACE instead of being ejected from its (much bigger) bounding box — no teleport.
-    private static bool SphereVsMesh(Vector3 c, float r, Object3d o, out Vector3 normal, out float pen)
-    {
-        normal = new Vector3(0f, 1f, 0f); pen = 0f;
-        var verts = o.WorldVertices;
-        float best = r * r; Vector3 bestQ = default; bool hit = false;
-        foreach (var f in o.Faces)
-        {
-            Vector3 q = ClosestPointOnTriangle(c, verts[f.I0], verts[f.I1], verts[f.I2]);
-            Vector3 d = c - q; float d2 = d * d;
-            if (d2 < best) { best = d2; bestQ = q; hit = true; }
-        }
-        if (!hit) return false;
-        float dist = MathF.Sqrt(best);
-        normal = dist > 1e-5f ? (c - bestQ) / dist : new Vector3(0f, 1f, 0f);
-        pen = r - dist;
-        return pen > 0f;
-    }
-
-    // Sphere vs an axis-aligned box (the high-poly fallback): closest point on the box -> outward normal + penetration.
-    private static bool SphereVsBox(Vector3 c, float r, Vector3 min, Vector3 max, out Vector3 normal, out float pen)
-    {
-        normal = new Vector3(0f, 1f, 0f); pen = 0f;
-        Vector3 q = new Vector3(Math.Clamp(c.X, min.X, max.X), Math.Clamp(c.Y, min.Y, max.Y), Math.Clamp(c.Z, min.Z, max.Z));
-        Vector3 d = c - q; float d2 = d * d;
-        if (d2 >= r * r) return false;
-        if (d2 > 1e-8f) { float dist = MathF.Sqrt(d2); normal = d / dist; pen = r - dist; return true; }
-        float dxp = max.X - c.X, dxn = c.X - min.X, dyp = max.Y - c.Y, dyn = c.Y - min.Y, dzp = max.Z - c.Z, dzn = c.Z - min.Z;
-        float m = MathF.Min(MathF.Min(MathF.Min(dxp, dxn), MathF.Min(dyp, dyn)), MathF.Min(dzp, dzn));   // least-penetrating axis
-        if (m == dxp) normal = new Vector3(1f, 0f, 0f); else if (m == dxn) normal = new Vector3(-1f, 0f, 0f);
-        else if (m == dyp) normal = new Vector3(0f, 1f, 0f); else if (m == dyn) normal = new Vector3(0f, -1f, 0f);
-        else if (m == dzp) normal = new Vector3(0f, 0f, 1f); else normal = new Vector3(0f, 0f, -1f);
-        pen = r + m;
-        return true;
-    }
-
     // Eject the camera's bubble out of every collidable scene object (a couple of passes catch
     // multiple simultaneous contacts). A sphere collider for Sphere, the world AABB for Object3d.
     private void ResolveCameraCollision()
@@ -593,14 +556,6 @@ public class PriviewNetworkScene : Scene
         if (_playerVelY > 0f && yAfter < yBefore - GroundEps) _playerVelY = 0f;
     }
 
-    // ---- Gravity physics (authority simulates, then streams positions to clients) ----
-    private readonly Dictionary<GameObject, float> _fallVel = new();        // per-object vertical velocity
-    private readonly Dictionary<GameObject, Vector3> _horizVel = new();      // per-object horizontal (X/Z) velocity
-    private readonly Dictionary<GameObject, Vector3> _angVel = new();        // per-object angular velocity (rad/s about world X/Y/Z)
-    private readonly Dictionary<GameObject, Quat> _orient = new();           // spinning object's orientation quaternion (source of truth while it spins)
-    private const float HorizFrictionPerSec = 4f;   // ground/air friction: fraction of horizontal speed shed per second
-    private const float AngFrictionPerSec = 4f;     // angular friction: fraction of spin shed per second
-
     // Server: ids whose physics moved them since the last sync flush (the "changed" set). Client:
     // per-id interpolation targets it eases the live instance toward. Authority streams a compact
     // PhysicsSyncPacket every PhysicsSyncEvery frames; clients dead-reckon + lerp so falling is smooth.
@@ -611,56 +566,7 @@ public class PriviewNetworkScene : Scene
     private const float PhysLerpRate = 12f;                            // client ease speed toward target (1/sec)
 
     // Client-side interpolation target for one synced object: last authoritative position + velocity.
-    private sealed class NetTarget { public Vector3 Pos; public float VelY; public Vector3 Rot; public Vector3 AngVel; }
-
-    // Do two AABBs overlap on the X/Z plane (Y ignored)? Picks out what sits under a falling object.
-    public static bool XZOverlap(Vector3 minA, Vector3 maxA, Vector3 minB, Vector3 maxB)
-        => minA.X <= maxB.X && maxA.X >= minB.X && minA.Z <= maxB.Z && maxA.Z >= minB.Z;
-
-    // Minimum HORIZONTAL (X or Z) translation to separate AABB 'a' from an overlapping AABB 'b': the
-    // delta to add to a's position so it just clears b along the least-penetrating horizontal axis.
-    // Vector3.Zero if the boxes don't actually intersect in 3D (Y is tested, not resolved — falling +
-    // resting stays the vertical solver's job). This is the phase-1 horizontal penetration resolver.
-    public static Vector3 ResolveAabbHorizontal(Vector3 aMin, Vector3 aMax, Vector3 bMin, Vector3 bMax)
-    {
-        if (aMin.X >= bMax.X || aMax.X <= bMin.X) return Vector3.Zero;   // separated on X
-        if (aMin.Z >= bMax.Z || aMax.Z <= bMin.Z) return Vector3.Zero;   // separated on Z
-        if (aMin.Y >= bMax.Y || aMax.Y <= bMin.Y) return Vector3.Zero;   // separated on Y -> not touching
-        float xPos = bMax.X - aMin.X, xNeg = aMax.X - bMin.X;            // push a in +X / -X to clear
-        float yPos = bMax.Y - aMin.Y, yNeg = aMax.Y - bMin.Y;            // vertical overlap (NOT pushed — gates resting)
-        float zPos = bMax.Z - aMin.Z, zNeg = aMax.Z - bMin.Z;            // push a in +Z / -Z to clear
-        float px = MathF.Min(xPos, xNeg), py = MathF.Min(yPos, yNeg), pz = MathF.Min(zPos, zNeg);
-        // If the VERTICAL overlap is the smallest, this is a resting/stacking contact (a mesh sitting on a
-        // wide floor barely overlaps it in Y) — the vertical fall solver owns it. A horizontal push here
-        // would be the FULL footprint overlap (tens of units) and eject the object sideways off the floor.
-        if (py <= px && py <= pz) return Vector3.Zero;
-        if (px <= pz) return new Vector3(xPos < xNeg ? px : -px, 0f, 0f);
-        return new Vector3(0f, 0f, zPos < zNeg ? pz : -pz);
-    }
-
-    // Exponential ground/air friction: shed a fraction of a HORIZONTAL velocity over dt (perSec =
-    // strength). Pure + testable: each component decays toward 0 without ever flipping sign; Y untouched.
-    public static Vector3 StepFriction(Vector3 vel, float dt, float perSec)
-    {
-        float k = MathF.Max(0f, 1f - perSec * dt);
-        return new Vector3(vel.X * k, vel.Y, vel.Z * k);
-    }
-
-    // Mass-weighted 1D normal-impulse collision response with restitution e. pA/pB are the two objects'
-    // velocity COMPONENTS along the contact normal pointing A->B (so pA>pB means A is closing on B);
-    // mA/mB are masses (use float.PositiveInfinity for an immovable wall). A separating/parallel pair
-    // (vRel<=0) is returned unchanged. Heavier bodies change velocity less; equal masses swap (e=1).
-    public static (float pA, float pB) NormalImpulse(float pA, float pB, float mA, float mB, float e)
-    {
-        float vRel = pA - pB;
-        if (vRel <= 0f) return (pA, pB);                 // already separating
-        float invA = (mA > 0f && !float.IsInfinity(mA)) ? 1f / mA : 0f;
-        float invB = (mB > 0f && !float.IsInfinity(mB)) ? 1f / mB : 0f;
-        float invSum = invA + invB;
-        if (invSum <= 0f) return (pA, pB);               // both immovable
-        float j = (1f + e) * vRel / invSum;              // impulse magnitude
-        return (pA - j * invA, pB + j * invB);
-    }
+    private sealed class NetTarget { public Vector3 Pos; public Vector3 Lin; public Vector3 Rot; public Vector3 AngVel; }
 
     // Combined coefficient of restitution for a contact between two bodies: the geometric mean
     // sqrt(eA·eB), so a rebound needs BOTH surfaces elastic — a dead/soft surface kills the bounce
@@ -679,33 +585,6 @@ public class PriviewNetworkScene : Scene
         mass * (sy * sy + sz * sz) / 12f,
         mass * (sx * sx + sz * sz) / 12f,
         mass * (sx * sx + sy * sy) / 12f);
-
-    // Angular-velocity change from an impulse applied at lever arm 'lever' (both 3D, from the center of
-    // mass): Δω = (lever × impulse) ÷ inertia, component-wise by the diagonal tensor. A centered hit
-    // (zero lever) or a zero/negative inertia component yields no spin on that axis. Pure + testable.
-    public static Vector3 AngularImpulse(Vector3 lever, Vector3 impulse, Vector3 inertia)
-    {
-        Vector3 t = Vector3.Cross(lever, impulse);
-        return new Vector3(
-            inertia.X > 0f ? t.X / inertia.X : 0f,
-            inertia.Y > 0f ? t.Y / inertia.Y : 0f,
-            inertia.Z > 0f ? t.Z / inertia.Z : 0f);
-    }
-
-    // Tensor-aware angular impulse for a ROTATED body. Its principal axes are (ax,ay,az) with body-frame
-    // principal moments 'inertia'. Δω = R·I⁻¹·Rᵀ·(lever × impulse): take the world torque, express it in
-    // the body frame (project on each axis = Vector3*Vector3 dot), divide by the principal moments, rotate
-    // back to world. This is the full OFF-DIAGONAL world inertia tensor for a tilted box; it reduces to
-    // AngularImpulse EXACTLY when the axes are world-aligned. Centered hit / zero moment => no spin. Pure+tested.
-    public static Vector3 AngularImpulseT(Vector3 lever, Vector3 impulse, Vector3 ax, Vector3 ay, Vector3 az, Vector3 inertia)
-    {
-        Vector3 tau = Vector3.Cross(lever, impulse);
-        float bx = tau * ax, by = tau * ay, bz = tau * az;     // torque in the body frame
-        bx = inertia.X > 0f ? bx / inertia.X : 0f;
-        by = inertia.Y > 0f ? by / inertia.Y : 0f;
-        bz = inertia.Z > 0f ? bz / inertia.Z : 0f;
-        return ax * bx + ay * by + az * bz;                    // back to world
-    }
 
     // ---- Quaternion orientation (drift-free SO(3) integration) ----
     // Phase 7 stores a spinning object's orientation as a unit quaternion (the source of truth) and
@@ -764,424 +643,131 @@ public class PriviewNetworkScene : Scene
         return QuatNorm(new Quat(q.X + dq.X * h, q.Y + dq.Y * h, q.Z + dq.Z * h, q.W + dq.W * h));
     }
 
-    // World AABB of a collidable instance (Object3d uses its per-frame AABB; a Sphere boxes its radius).
-    private static bool TryWorldAabb(GameObject inst, out Vector3 min, out Vector3 max)
-    {
-        if (inst is Object3d o) { min = o.WorldMin; max = o.WorldMax; return true; }
-        if (inst is Sphere s) { var r = new Vector3(s.R, s.R, s.R); min = s.Position - r; max = s.Position + r; return true; }
-        min = Vector3.Zero; max = Vector3.Zero; return false;
-    }
-
-    private const float BounceMin = 0.6f;   // a rebound below this speed (units/s) settles to rest (no infinite micro-bounces)
-
-    // Integrate one object's vertical fall for dt; if it would sink to/under supportTop while falling,
-    // rest it on the surface and REBOUND a fraction (restitution) of the impact speed. restitution 0
-    // reproduces the original dead-stop landing; a rebound below BounceMin settles to rest. Returns the
-    // new bottom-Y and velocity.
-    public static (float bottomY, float velY) StepFallY(float bottomY, float velY, float dt, float g, float supportTop, float restitution = 0f)
-    {
-        velY -= g * dt;
-        bottomY += velY * dt;
-        if (velY <= 0f && bottomY <= supportTop)
-        {
-            bottomY = supportTop;
-            float bounce = -velY * restitution;                  // reflect part of the impact speed upward
-            velY = bounce > BounceMin ? bounce : 0f;             // settle once the bounce is tiny
-        }
-        return (bottomY, velY);
-    }
-
-    // Reflect a velocity off a surface with unit normal n, keeping the TANGENTIAL component and reversing
-    // the NORMAL component scaled by restitution e: v' = v - (1+e)(v·n)n. Only reflects when moving INTO
-    // the surface (v·n < 0); otherwise returns v unchanged. Flat (up) normal → the usual vertical bounce;
-    // a SLOPE deflects the ball sideways (so it rolls off), which also feeds the horizontal solver.
-    public static Vector3 ReflectVelocity(Vector3 v, Vector3 n, float e)
-    {
-        float vn = v.X * n.X + v.Y * n.Y + v.Z * n.Z;
-        if (vn >= 0f) return v;
-        return v - n * ((1f + e) * vn);
-    }
-
-    // One-body contact response for a sphere meeting a surface with unit normal n. A REAL impact (speed
-    // into the surface beyond bounceMin) bounces with restitution; a GENTLE/resting contact just removes
-    // the into-surface component (slides along, NO energy added → stable); a SEPARATING velocity is left
-    // alone. The graze case never increases speed, which is what prevents the "bounce every frame on a
-    // slope" runaway. Stability-critical core of StepSphereGravity; pure + tested.
-    public static Vector3 SphereContactResponse(Vector3 vIn, Vector3 n, float restitution, float bounceMin)
-    {
-        float vn = vIn.X * n.X + vIn.Y * n.Y + vIn.Z * n.Z;
-        if (vn >= 0f) return vIn;                                          // separating -> unchanged
-        if (vn < -bounceMin) return ReflectVelocity(vIn, n, restitution);  // real impact -> bounce
-        return vIn - n * vn;                                               // gentle contact -> slide (project out normal)
-    }
-
-    private const float MaxHorizSpeed = 20f;     // safety clamp: caps horizontal speed so nothing runs away
-    private const float RunawayBound = 300f;     // a dynamic object past this is a runaway -> its velocity is killed
-    private const float MaxPushPerContact = 2f;  // safety clamp: a single contact can't teleport an object further than this (deep penetration -> fling guard)
-
-    // A falling SPHERE is a real rigid ball: gravity accelerates its full 3D velocity, then it collides with
-    // the REAL surface of every obstacle — the closest point on a mesh's TRIANGLES (SphereVsMesh), NOT its
-    // bounding box, so it sits/rolls on a pyramid FACE with no teleport; analytic vs another sphere. Each
-    // contact pops the ball out along the true surface normal and, via SphereContactResponse, removes the
-    // INTO-surface velocity (rest/slide) or bounces it (restitution) — a graze never ADDS energy, so a slope
-    // can't pump a runaway. Gravity's tangential part then drives a smooth roll DOWN the slope with real
-    // inertia; ground friction settles it on the flat. Velocity rides the existing _fallVel (Y) + _horizVel
-    // (XZ) so the sync/cleanup paths are unchanged; spheres are EXCLUDED from the box horizontal solver.
-    private void StepSphereGravity(EditEntry e, Sphere sph, float g, float dt)
-    {
-        Vector3 c0 = sph.Position; float r = sph.R;
-        Vector3 h = _horizVel.GetValueOrDefault(sph, Vector3.Zero);
-        Vector3 v = new Vector3(h.X, _fallVel.GetValueOrDefault(sph, 0f), h.Z);   // reconstruct full 3D velocity
-
-        v.Y -= g * dt;
-        Vector3 c = c0 + v * dt;
-
-        bool grounded = false;
-        for (int pass = 0; pass < 2; pass++)                          // two passes catch a corner touching two surfaces
-        {
-            foreach (var s2 in _editables)
-            {
-                if (ReferenceEquals(s2, e) || s2.Instance is not { Collides: true }) continue;
-                Vector3 n; float pen;
-                if (s2.Instance is Object3d mesh)
-                {
-                    bool hit = mesh.Faces.Count <= MaxMeshCollideFaces
-                        ? SphereVsMesh(c, r, mesh, out n, out pen)            // real triangles (no bounding-box teleport)
-                        : SphereVsBox(c, r, mesh.WorldMin, mesh.WorldMax, out n, out pen);   // high-poly fallback
-                    if (!hit) continue;
-                }
-                else if (s2.Instance is Sphere ss)
-                {
-                    Vector3 d = c - ss.Position; float dl = d.Length(); float rr = r + ss.R;
-                    if (dl >= rr) continue;
-                    n = dl > 1e-5f ? d / dl : new Vector3(0f, 1f, 0f); pen = rr - dl;
-                }
-                else continue;
-
-                if (pen > MaxPushPerContact) { Logger.Warning($"[physics] deep sphere contact id={e.Descriptor.Id}(sphere) vs id={s2.Descriptor.Id}({s2.Descriptor.Type}) pen={pen:F2} n=({n.X:F2},{n.Y:F2},{n.Z:F2}) -> clamped"); pen = MaxPushPerContact; }
-                c += n * pen;                                                   // pop out along the true surface normal
-                v = SphereContactResponse(v, n, CombineRestitution(RestitutionOf(sph), RestitutionOf(s2.Instance)), BounceMin);
-                if (n.Y > 0.5f) grounded = true;                               // resting on a roughly-upward surface
-            }
-        }
-
-        if (grounded) v = StepFriction(v, dt, HorizFrictionPerSec);            // ground drag so a slide settles on the flat
-        float sp = v.Length();
-        if (sp > MaxHorizSpeed) v = v * (MaxHorizSpeed / sp);                  // total-speed safety clamp
-
-        sph.Position = c;
-        _fallVel[sph] = v.Y;
-        _horizVel[sph] = new Vector3(v.X, 0f, v.Z);
-        if ((c - c0).Length() > 1e-6f && _online && _isServer) _physMoved.Add(e.Descriptor.Id);
-    }
-
-    // A falling MESH rests on the REAL surface beneath its FOOTPRINT — a downward ray at the base center
-    // + 4 corners, taking the HIGHEST contact so the box perches on its uphill edge instead of clipping
-    // into a slope — NOT its bounding box, so a cube lands on a ramp/pyramid face like the ball does. It
-    // then slides downhill by the TANGENTIAL component of gravity (finite steady speed vs friction, no
-    // runaway), exactly like StepSphereGravity. The box stays axis-aligned for now (no tip/topple — that
-    // needs landing torque, a noted follow-up); StepHorizontalPhysics integrates the slide + safety clamp.
-    private void StepMeshGravity(EditEntry e, Object3d o, float g, float dt)
-    {
-        Vector3 mn = o.WorldMin, mx = o.WorldMax;
-        float bottom = mn.Y, midY = (mn.Y + mx.Y) * 0.5f;
-        const float inset = 0.02f;
-        float x0 = mn.X + inset, x1 = mx.X - inset, z0 = mn.Z + inset, z1 = mx.Z - inset, cx = (mn.X + mx.X) * 0.5f, cz = (mn.Z + mx.Z) * 0.5f;
-        Span<Vector3> probes = stackalloc Vector3[5]
-        {
-            new Vector3(cx, midY, cz),
-            new Vector3(x0, midY, z0), new Vector3(x1, midY, z0),
-            new Vector3(x0, midY, z1), new Vector3(x1, midY, z1),
-        };
-
-        float supportTop = float.NegativeInfinity;
-        bool hasSupport = false;
-        Vector3 supportNormal = new Vector3(0f, 1f, 0f);
-        float supportRest = _world.Physics.Restitution;
-        foreach (var s2 in _editables)
-        {
-            if (ReferenceEquals(s2, e) || s2.Instance is not { Collides: true }) continue;
-            if (s2.Instance is Object3d mesh)
-            {
-                foreach (var p in probes)
-                {
-                    var rd = mesh.GetRenderData(new Ray(p, new Vector3(0f, -1f, 0f)));   // real surface point + normal under this probe
-                    if (rd.Intersection <= -1f) continue;
-                    float surfY = p.Y - rd.Intersection;
-                    if (surfY <= bottom + 0.25f && surfY > supportTop) { supportTop = surfY; hasSupport = true; supportNormal = rd.Normal; supportRest = RestitutionOf(s2.Instance); }
-                }
-            }
-            else if (s2.Instance is Sphere ss)
-            {
-                float sTop = ss.Position.Y + ss.R;
-                Vector3 sMin = ss.Position - new Vector3(ss.R, ss.R, ss.R), sMax = ss.Position + new Vector3(ss.R, ss.R, ss.R);
-                if (XZOverlap(mn, mx, sMin, sMax) && sTop <= bottom + 0.25f && sTop > supportTop) { supportTop = sTop; hasSupport = true; supportNormal = new Vector3(0f, 1f, 0f); supportRest = RestitutionOf(s2.Instance); }
-            }
-        }
-
-        float v = _fallVel.GetValueOrDefault(o, 0f);
-        var (newBottom, newV) = StepFallY(bottom, v, dt, g, hasSupport ? supportTop : float.NegativeInfinity, CombineRestitution(RestitutionOf(o), supportRest));
-        _fallVel[o] = newV;
-        float deltaY = newBottom - bottom;
-        if (MathF.Abs(deltaY) > 1e-6f)
-        {
-            o.Position.Y += deltaY;
-            o.UpdateGeometry();
-            SyncLightToMarker(e);   // if this is a (falling) light marker, keep its engine Light on it
-            if (_online && _isServer) _physMoved.Add(e.Descriptor.Id);
-        }
-
-        // Slide down a sloped support via tangential gravity (same stable model as StepSphereGravity).
-        if (hasSupport)
-        {
-            float nlen = supportNormal.Length();
-            if (nlen > 1e-6f)
-            {
-                Vector3 n = supportNormal / nlen;
-                Vector3 gTan = new Vector3(0f, -g, 0f) - n * (-g * n.Y);   // gravity minus its surface-normal component
-                _horizVel[o] = _horizVel.GetValueOrDefault(o, Vector3.Zero) + new Vector3(gTan.X * dt, 0f, gTan.Z * dt);
-            }
-        }
-    }
-
-    // Physics tick: SUBSTEP a large frame time so a slow render frame (the ASCII raytracer can dip to a
-    // few FPS) can't make a fast fall tunnel through a surface and explode. Each substep is <= MaxPhysicsStep
-    // seconds, so behavior is frame-rate INDEPENDENT and stable; substeps are capped so a monster frame
-    // (or a debugger pause) can't stall the loop. This is the single biggest stability guard for slow scenes.
-    private const float MaxPhysicsStep = 1f / 60f;   // largest dt a single physics integration is allowed
-    private const int MaxSubSteps = 8;               // cap substeps per frame (a >133 ms frame still advances, just coarser)
+    // Physics tick (authority/solo only): the impulse-based rigid-body constraint solver. It SUBSTEPS a large
+    // frame time internally (ImpulseWorld.Step: each substep <= 1/60 s, capped) so a slow render frame can't
+    // make a fast fall tunnel and explode — frame-rate INDEPENDENT. This is the sole object-dynamics engine.
     private void StepPhysics(float dt)
     {
         if (!CanEdit || !_world.Physics.GravityEnabled) return;
         if (dt <= 0f) return;
-        int sub = Math.Clamp((int)MathF.Ceiling(dt / MaxPhysicsStep), 1, MaxSubSteps);
-        float h = dt / sub;
-        for (int s = 0; s < sub; s++) StepPhysicsOnce(h);
+        StepImpulse(dt);
     }
 
-    // One gravity step (a single substep): every object whose effective Gravity is on (per-object flag AND
-    // the world switch — meshes, primitives, spheres, and even a platform or light if its flag is set) falls
-    // and rests on the highest COLLIDABLE surface beneath it. Authority/solo only; default OFF and opt-in
-    // per object — clients are view-only and never simulate, so they can't diverge.
-    private void StepPhysicsOnce(float dt)
+    // ---- impulse-solver runtime wiring (see PHYSICS.md). ----
+    // Simulates dynamic SPHERES and BOXES (any collidable dynamic Object3d as its OBB) against STATIC
+    // collidables (boxes + real triangle meshes) and each other; the platform is the primary support.
+    // Legacy mode ("legacy", the default) never reaches this path and is unchanged.
+    private ImpulseWorld? _impWorld;
+    private readonly Dictionary<GameObject, RigidBody> _impBodies = new();   // persistent dynamic-sphere bodies (velocity/sleep/warm-start state survives frames)
+
+    private void StepImpulse(float dt)
     {
-        float g = _world.Physics.GravityStrength;
-        // dynamic = objects with effective gravity on; supports = every OTHER collidable object.
+        var w = _impWorld ??= new ImpulseWorld();
+        w.Gravity = new Vector3(0f, -_world.Physics.GravityStrength, 0f);
+        w.Restitution = _world.Physics.Restitution;
+        w.Bodies.Clear();
+
+        // Dynamic bodies (Gravity + Collides) -> persistent RigidBodies (the solver owns their transform +
+        // velocity + sleep/warm-start state across frames). A sphere is a solver Sphere; any other collidable
+        // Object3d is simulated as its OBB (Stage 2: dynamic meshes are boxed; real-triangle dynamic meshes
+        // are Stage 5). Two-way dynamic-vs-dynamic is still inert (only dynamic-vs-static generates contacts).
+        var live = new HashSet<GameObject>();
         foreach (var e in _editables)
         {
-            if (e.Instance is not { Gravity: true }) continue;
-            // A falling SPHERE rests on the real surface beneath it (ray-traced) and bounces off its
-            // normal — handled separately so it sits on slopes/faces, not the bounding box.
-            if (e.Instance is Sphere sph) { StepSphereGravity(e, sph, g, dt); continue; }
-            // A falling MESH rests on the REAL surface under its footprint (ray-traced at base center +
-            // corners) and slides down slopes via tangential gravity — like the sphere — instead of
-            // floating on its bounding box.
-            if (e.Instance is Object3d o) StepMeshGravity(e, o, g, dt);
-        }
-
-        StepHorizontalPhysics(dt);   // integrate horizontal velocity, friction, then impulse-resolve contacts
-
-        // Safety backstop: any dynamic object that escaped to absurd coordinates is a runaway — kill all
-        // its velocities so it can't keep flying. Generous bound; legitimate scenes stay well inside.
-        foreach (var en in _editables)
-        {
-            if (en.Instance is not { Gravity: true }) continue;
-            var p = en.Instance.Position;
-            if (MathF.Abs(p.X) > RunawayBound || MathF.Abs(p.Z) > RunawayBound || MathF.Abs(p.Y) > RunawayBound)
+            var inst = e.Instance;
+            if (!(inst.Gravity && inst.Collides)) continue;
+            if (inst is Sphere sph)
             {
-                Logger.Warning($"[physics] RUNAWAY caught id={en.Descriptor.Id}({en.Descriptor.Type}) pos=({p.X:F0},{p.Y:F0},{p.Z:F0}) horizSpeed={_horizVel.GetValueOrDefault(en.Instance, Vector3.Zero).Length():F1} velY={_fallVel.GetValueOrDefault(en.Instance, 0f):F1} -> velocity zeroed");
-                _horizVel[en.Instance] = Vector3.Zero;
-                _fallVel[en.Instance] = 0f;
-                _angVel[en.Instance] = Vector3.Zero;
+                live.Add(inst);
+                if (!_impBodies.TryGetValue(inst, out var rb)) { rb = RigidBody.Sphere(sph.Position, sph.R, MathF.Max(1e-4f, inst.Mass)); _impBodies[inst] = rb; }
+                rb.Radius = sph.R;
+                rb.Restitution = inst.Restitution; rb.Friction = inst.Friction; rb.RollingFriction = inst.RollingFriction; rb.Tag = e;
+                w.Bodies.Add(rb);
             }
-        }
-    }
-
-    // Horizontal solver: each DYNAMIC collider carries an X/Z linear velocity AND a 3-axis angular
-    // velocity, both integrated each frame and shed by friction. On contact it gets a mass-weighted
-    // normal impulse (with combined per-object restitution) along the contact normal — FULL 3D SAT
-    // (SatBox3D, 15 axes) for OBB pairs, the axis-aligned MTV otherwise — and, because that impulse
-    // lands at an OFF-CENTER point, a 3D torque via the world inertia tensor (AngularImpulseT) that
-    // pitches/rolls/yaws the body. Penetration is corrected positionally; the response stays in the
-    // horizontal plane (vertical resting is StepFallY's job). Pure helpers (StepFriction / NormalImpulse /
-    // BoxInertia / AngularImpulse[T] / SatBox3D / ResolveAabbHorizontal) are tested. Authority/solo only;
-    // linear moves AND spin stream to clients via _physMoved (PhysicsSyncPacket carries position + angular velocity).
-    private void StepHorizontalPhysics(float dt)
-    {
-        // 1) Integrate + friction (linear X/Z and yaw) for every dynamic object.
-        foreach (var en in _editables)
-        {
-            if (en.Instance is not { Gravity: true, Collides: true } || en.Instance is Sphere) continue;   // spheres are integrated in StepSphereGravity (real-surface contacts)
-            var v = StepFriction(_horizVel.GetValueOrDefault(en.Instance, Vector3.Zero), dt, HorizFrictionPerSec);
-            float sp2 = v.X * v.X + v.Z * v.Z;                            // safety clamp: never let horizontal speed run away
-            if (sp2 > MaxHorizSpeed * MaxHorizSpeed) { float k = MaxHorizSpeed / MathF.Sqrt(sp2); v = new Vector3(v.X * k, v.Y, v.Z * k); }
-            _horizVel[en.Instance] = v;
-            Vector3 w = _angVel.GetValueOrDefault(en.Instance, Vector3.Zero) * MathF.Max(0f, 1f - AngFrictionPerSec * dt);
-            _angVel[en.Instance] = w;
-
-            bool moved = v.X != 0f || v.Z != 0f;
-            if (moved) en.Instance.Position += new Vector3(v.X * dt, 0f, v.Z * dt);
-            if (w.X * w.X + w.Y * w.Y + w.Z * w.Z > 1e-10f)
+            else if (inst is Object3d o)
             {
-                // Drift-free spin: integrate the orientation quaternion (the source of truth while
-                // spinning — lazily seeded from the current Euler), then write Euler back for rendering.
-                Quat q = _orient.TryGetValue(en.Instance, out var qc) ? qc : QuatFromEuler(en.Instance.LocalRotate);
-                q = IntegrateQuat(q, w, dt);
-                _orient[en.Instance] = q;
-                en.Instance.LocalRotate = EulerFromQuat(q);
-                moved = true;
-            }
-            else _orient.Remove(en.Instance);   // settled: drop it so a future spin re-seeds from LocalRotate (editor/RotateSpeed stay free)
-            if (moved)
-            {
-                if (en.Instance is Object3d oo) oo.UpdateGeometry();
-                SyncLightToMarker(en);
-                if (_online && _isServer) _physMoved.Add(en.Descriptor.Id);   // position rides the sync; rotation is local-only for now
-            }
-        }
-
-        // 2) Resolve contacts: find the separating normal + penetration (FULL 3D SAT via SatBox3D when
-        // either object is an OBB collider, else the axis-aligned AABB MTV), separate positionally, then
-        // apply the mass-weighted normal impulse + the off-center 3D torque (world inertia tensor). The
-        // response stays in the HORIZONTAL plane (vertical resting is StepFallY's job); n points en->obstacle.
-        for (int pass = 0; pass < 2; pass++)
-            foreach (var en in _editables)
-            {
-                if (en.Instance is not { Gravity: true, Collides: true } || en.Instance is Sphere) continue;   // spheres handled in StepSphereGravity
-                foreach (var s2 in _editables)
+                live.Add(inst);
+                Vector3 half = o.Size * (0.5f * o.Scale);
+                float mass = MathF.Max(1e-4f, inst.Mass);
+                if (!_impBodies.TryGetValue(inst, out var rb))
                 {
-                    if (ReferenceEquals(s2, en) || s2.Instance is not { Collides: true }) continue;
-                    if (s2.Instance is Sphere) continue;   // sphere contacts use the real surface (StepSphereGravity), not this box solver
-                    if (!TryWorldAabb(en.Instance, out var eMin, out var eMax)) continue;
-                    if (!TryWorldAabb(s2.Instance, out var sMin, out var sMax)) continue;
-
-                    bool useObb = (en.Instance is Object3d eob && eob.Collider == ColliderShape.Obb)
-                               || (s2.Instance is Object3d sob && sob.Collider == ColliderShape.Obb);
-
-                    Vector3 push, n, contact, cenE, cenS;
-
-                    if (useObb)
-                    {
-                        // Full 3D SAT (any orientation) gives the true contact normal + depth. We then
-                        // resolve along its HORIZONTAL projection (vertical resting stays StepFallY's job);
-                        // a near-vertical normal is a stacking contact -> skip so it doesn't fight the fall solver.
-                        var A = Box3D(en.Instance);
-                        var B = Box3D(s2.Instance);
-                        var (hit, N, depth3) = SatBox3D(A.c, A.ax, A.ay, A.az, A.half, B.c, B.ax, B.ay, B.az, B.half);
-                        if (!hit) continue;
-                        float hlen = MathF.Sqrt(N.X * N.X + N.Z * N.Z);
-                        if (hlen < 0.30f) continue;                            // ~vertical contact -> leave to the support/fall solver
-                        n = new Vector3(N.X / hlen, 0f, N.Z / hlen);           // unit horizontal contact normal (en->s2)
-                        push = n * -(depth3 / hlen);                           // clear the horizontal penetration along n
-                        cenE = A.c; cenS = B.c;
-                        contact = A.c + n * (MathF.Abs(A.ax * n) * A.half.X + MathF.Abs(A.ay * n) * A.half.Y + MathF.Abs(A.az * n) * A.half.Z);
-                    }
-                    else
-                    {
-                        push = ResolveAabbHorizontal(eMin, eMax, sMin, sMax);
-                        if (push.X == 0f && push.Z == 0f) continue;
-                        n = new Vector3(push.X != 0f ? -MathF.Sign(push.X) : 0f, 0f, push.Z != 0f ? -MathF.Sign(push.Z) : 0f);
-                        float contactY = (MathF.Max(eMin.Y, sMin.Y) + MathF.Min(eMax.Y, sMax.Y)) * 0.5f;
-                        contact = new Vector3((MathF.Max(eMin.X, sMin.X) + MathF.Min(eMax.X, sMax.X)) * 0.5f, contactY,
-                                              (MathF.Max(eMin.Z, sMin.Z) + MathF.Min(eMax.Z, sMax.Z)) * 0.5f);
-                        cenE = (eMin + eMax) * 0.5f; cenS = (sMin + sMax) * 0.5f;
-                    }
-
-                    // Safety: a single contact must never teleport an object across the map. A deep
-                    // penetration (a teleport from an editor move, or a huge frame) would otherwise give a
-                    // giant push and FLING it — clamp the push, and LOG the event so a live runaway is captured.
-                    float pushLen = push.Length();
-                    if (pushLen > MaxPushPerContact)
-                    {
-                        Logger.Warning($"[physics] deep contact id={en.Descriptor.Id}({en.Descriptor.Type}) vs id={s2.Descriptor.Id}({s2.Descriptor.Type}) |push|={pushLen:F2} n=({n.X:F2},{n.Y:F2},{n.Z:F2}) enPos=({en.Instance.Position.X:F1},{en.Instance.Position.Y:F1},{en.Instance.Position.Z:F1}) -> clamped to {MaxPushPerContact}");
-                        push = push * (MaxPushPerContact / pushLen);
-                    }
-
-                    // Positional separation (one-sided: the dynamic moves out of the obstacle).
-                    en.Instance.Position += push;
-                    if (en.Instance is Object3d oo) oo.UpdateGeometry();
-                    SyncLightToMarker(en);
-                    if (_online && _isServer) _physMoved.Add(en.Descriptor.Id);
-
-                    // Mass-weighted normal impulse (horizontal velocity only; vertical is the fall solver).
-                    bool otherDynamic = s2.Instance is { Gravity: true, Collides: true };
-                    var vE = _horizVel.GetValueOrDefault(en.Instance, Vector3.Zero);
-                    var vS = otherDynamic ? _horizVel.GetValueOrDefault(s2.Instance, Vector3.Zero) : Vector3.Zero;
-                    float pe = DotXZ(vE, n);                     // en's speed along the contact normal
-                    float ps = DotXZ(vS, n);                     // obstacle's
-                    float mS = otherDynamic ? s2.Instance.Mass : float.PositiveInfinity;   // static obstacle = immovable
-                    // Per-contact restitution combines BOTH bodies' bounciness — a static wall now contributes
-                    // its own (a springy "trampoline" wall vs a dead one), so the rebound is realistic.
-                    float e = CombineRestitution(RestitutionOf(en.Instance), RestitutionOf(s2.Instance));
-                    var (pe2, ps2) = NormalImpulse(pe, ps, en.Instance.Mass, mS, e);
-                    _horizVel[en.Instance] = vE + n * (pe2 - pe);
-                    if (otherDynamic) _horizVel[s2.Instance] = vS + n * (ps2 - ps);
-
-                    // 3D torque from the off-center impulse, via the WORLD inertia tensor (BodyAxes +
-                    // local-box principal moments). A horizontal hit landing off-axis or above/below the
-                    // center now pitches/rolls a TILTED box correctly, not just yaws (off-diagonal tensor).
-                    float jE = en.Instance.Mass * (pe2 - pe);                  // impulse magnitude on en along n
-                    var (eax, eay, eaz) = BodyAxes(en.Instance);
-                    Vector3 esz = LocalBoxSize(en.Instance);
-                    _angVel[en.Instance] = _angVel.GetValueOrDefault(en.Instance, Vector3.Zero)
-                        + AngularImpulseT(contact - cenE, n * jE, eax, eay, eaz, BoxInertia(en.Instance.Mass, esz.X, esz.Y, esz.Z));
-                    if (otherDynamic)
-                    {
-                        float jS = s2.Instance.Mass * (ps2 - ps);
-                        var (sax, say, saz) = BodyAxes(s2.Instance);
-                        Vector3 ssz = LocalBoxSize(s2.Instance);
-                        _angVel[s2.Instance] = _angVel.GetValueOrDefault(s2.Instance, Vector3.Zero)
-                            + AngularImpulseT(contact - cenS, n * jS, sax, say, saz, BoxInertia(s2.Instance.Mass, ssz.X, ssz.Y, ssz.Z));
-                    }
+                    Vector3 center = (o.LocalCenter * o.Scale).Rotate(o.LocalRotate) + o.Position;
+                    rb = RigidBody.DynamicBox(center, half, QuatFromEuler(o.LocalRotate), mass);
+                    _impBodies[inst] = rb;
                 }
+                else rb.SetBoxShape(half, mass);   // refresh shape/inertia (scale/mass may have been edited)
+                rb.Restitution = inst.Restitution; rb.Friction = inst.Friction; rb.RollingFriction = inst.RollingFriction; rb.Tag = e;
+                w.Bodies.Add(rb);
             }
-    }
-
-    // A dynamic object's 2D (XZ) collision footprint for the horizontal solver: an OBB collider is a
-    // YAWED rectangle (local X/Z half-extents, axes from the object's Y rotation); everything else is
-    // its world-AABB rectangle (axis-aligned). YMin/YMax gate vertical overlap. Center is the AABB
-    // center (== the box center for a pure yaw).
-    // Orthonormal body axes (X,Y,Z) of an instance, from its rotation — a mesh uses its TotalRotation,
-    // anything else is world-aligned. Feeds the OBB SAT box build and the world inertia tensor.
-    private static (Vector3 ax, Vector3 ay, Vector3 az) BodyAxes(GameObject inst)
-    {
-        if (inst is Object3d o)
-        {
-            Vector3 rot = o.TotalRotation;
-            return (new Vector3(1f, 0f, 0f).Rotate(rot), new Vector3(0f, 1f, 0f).Rotate(rot), new Vector3(0f, 0f, 1f).Rotate(rot));
         }
-        return (new Vector3(1f, 0f, 0f), new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, 1f));
-    }
+        // Prune bodies whose object was deleted / lost gravity.
+        if (_impBodies.Count != live.Count)
+            foreach (var k in _impBodies.Keys.Where(k => !live.Contains(k)).ToList()) _impBodies.Remove(k);
 
-    // Local box size (for the inertia tensor): a mesh's oriented box (Size·Scale), a sphere's bounding
-    // cube (2r). With BodyAxes this is the body-frame principal box fed to BoxInertia/AngularImpulseT.
-    private static Vector3 LocalBoxSize(GameObject inst)
-    {
-        if (inst is Object3d o) return o.Size * o.Scale;
-        if (inst is Sphere s) return new Vector3(2f * s.R, 2f * s.R, 2f * s.R);
-        return new Vector3(1f, 1f, 1f);
-    }
-
-    // Full 3D oriented box of an instance (center + 3 orthonormal axes + world half-extents). An OBB-
-    // collider mesh uses its true oriented box; everything else is its axis-aligned world-AABB box (so a
-    // box-vs-box SAT still works when only ONE side is an OBB). Mirrors Object3d's local->world transform.
-    private static (Vector3 c, Vector3 ax, Vector3 ay, Vector3 az, Vector3 half) Box3D(GameObject inst)
-    {
-        if (inst is Object3d o && o.Collider == ColliderShape.Obb)
+        // Static collidables -> fresh static bodies each frame (they carry no solver state). A gravity+collides
+        // object is a DYNAMIC body (added above); everything else that collides is a static support.
+        foreach (var e in _editables)
         {
-            var (ax, ay, az) = BodyAxes(o);
-            Vector3 center = (o.LocalCenter * o.Scale).Rotate(o.TotalRotation) + o.Position;
-            return (center, ax, ay, az, o.Size * (0.5f * o.Scale));
+            var inst = e.Instance;
+            if (!inst.Collides || inst.Gravity) continue;
+            if (inst is Sphere ss) w.Bodies.Add(RigidBody.StaticSphere(ss.Position, ss.R));
+            else if (inst is Object3d o) w.Bodies.Add(BuildStaticMeshBody(o));
         }
-        TryWorldAabb(inst, out var mn, out var mx);
-        return ((mn + mx) * 0.5f, new Vector3(1f, 0f, 0f), new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, 1f), (mx - mn) * 0.5f);
+
+        w.Step(dt);
+
+        // Write solved transforms back to the engine instances (+ mark for network sync).
+        foreach (var kv in _impBodies)
+        {
+            var go = kv.Key; var rb = kv.Value;
+            bool moved = false;
+            if (go is Sphere sph)
+            {
+                moved = (sph.Position - rb.Position).Length() > 1e-6f;
+                sph.Position = rb.Position;
+            }
+            else if (go is Object3d o)
+            {
+                Vector3 newRot = EulerFromQuat(rb.Orientation);
+                Vector3 newPos = rb.Position - (o.LocalCenter * o.Scale).Rotate(newRot);   // solver Position is the OBB centre; back out the anchor offset
+                moved = (newPos - o.Position).Length() > 1e-6f || (newRot - o.LocalRotate).Length() > 1e-5f;
+                o.Position = newPos;
+                o.LocalRotate = newRot;
+                o.UpdateGeometry();
+            }
+            if (moved && _online && _isServer && rb.Tag is EditEntry ee) _physMoved.Add(ee.Descriptor.Id);
+        }
+    }
+
+    // Build a STATIC support body from an Object3d. It carries the world triangles (the sphere-vs-mesh contact
+    // uses the REAL surface) AND a solid BOX VIEW (its world AABB, floored to a minimum downward thickness so a
+    // zero-thickness platform quad is still a solid support) that the dynamic-box manifold rests on. A rotated
+    // static mesh is boxed by its (loose) AABB — the real-triangle box-vs-mesh contact is Stage 5.
+    private static RigidBody BuildStaticMeshBody(Object3d o)
+    {
+        var wv = o.WorldVertices;
+        var verts = new Vector3[wv.Length];
+        System.Array.Copy(wv, verts, wv.Length);
+        var faces = o.Faces;
+        var tris = new int[faces.Count * 3];
+        for (int i = 0; i < faces.Count; i++) { var f = faces[i]; tris[i * 3] = f.I0; tris[i * 3 + 1] = f.I1; tris[i * 3 + 2] = f.I2; }
+        var body = RigidBody.StaticMesh(verts, tris);
+
+        const float MinThick = 0.5f;
+        Vector3 mn = o.WorldMin, mx = o.WorldMax;
+        if (mx.Y - mn.Y < MinThick) mn.Y = mx.Y - MinThick;              // extend downward, keep the top face
+        body.Position = (mn + mx) * 0.5f;
+        body.HalfExtents = (mx - mn) * 0.5f;
+        body.Orientation = Quat.Identity;
+        body.BoxView = true;
+        return body;
     }
 
     // Full 3D Separating-Axis-Theorem between two oriented boxes A and B (center, 3 orthonormal axes,
     // half-extents). Tests 15 axes — the 3 faces of each box + the 9 edge×edge cross products — and
     // returns overlap + the minimum-penetration UNIT normal (pointing A->B) + the penetration depth, or
     // hit=false at the first separating axis. Near-degenerate cross axes (parallel edges) are skipped;
-    // the face axes already cover those. Pure + tested. Supersedes the yaw-only XZ SatRect2D for OBB contacts.
+    // the face axes already cover those. Pure + tested. The impulse box-box manifold uses this normal.
     public static (bool hit, Vector3 normal, float depth) SatBox3D(
         Vector3 cA, Vector3 ax0, Vector3 ax1, Vector3 ax2, Vector3 hA,
         Vector3 cB, Vector3 bx0, Vector3 bx1, Vector3 bx2, Vector3 hB)
@@ -1214,38 +800,6 @@ public class PriviewNetworkScene : Scene
         return (true, best, minOv);
     }
 
-    private static float DotXZ(Vector3 a, Vector3 b) => a.X * b.X + a.Z * b.Z;
-
-    // 2D Separating-Axis-Theorem test between two XZ rectangles A and B, each given by its center and
-    // its two edge half-vectors (axis·halfExtent). Returns whether they overlap and, if so, the minimum-
-    // penetration separating normal (unit, pointing A->B) + the penetration depth. The candidate axes
-    // are the four edge directions; a non-positive projection overlap on any axis means they're apart.
-    public static (bool hit, float nx, float nz, float depth) SatRect2D(
-        Vector3 cA, Vector3 eAx, Vector3 eAz, Vector3 cB, Vector3 eBx, Vector3 eBz)
-    {
-        Span<Vector3> axes = stackalloc Vector3[4] { NormXZ(eAx), NormXZ(eAz), NormXZ(eBx), NormXZ(eBz) };
-        Vector3 dC = cB - cA;
-        float minOv = float.MaxValue, bnx = 0f, bnz = 0f;
-        for (int i = 0; i < 4; i++)
-        {
-            Vector3 L = axes[i];
-            if (L.X == 0f && L.Z == 0f) continue;               // degenerate (zero-extent edge)
-            float rA = MathF.Abs(DotXZ(eAx, L)) + MathF.Abs(DotXZ(eAz, L));
-            float rB = MathF.Abs(DotXZ(eBx, L)) + MathF.Abs(DotXZ(eBz, L));
-            float d = DotXZ(dC, L);
-            float ov = rA + rB - MathF.Abs(d);
-            if (ov <= 0f) return (false, 0f, 0f, 0f);           // separating axis found -> no contact
-            if (ov < minOv) { minOv = ov; float s = d < 0f ? -1f : 1f; bnx = L.X * s; bnz = L.Z * s; }
-        }
-        return (true, bnx, bnz, minOv);
-    }
-
-    private static Vector3 NormXZ(Vector3 v)
-    {
-        float m = MathF.Sqrt(v.X * v.X + v.Z * v.Z);
-        return m > 1e-9f ? new Vector3(v.X / m, 0f, v.Z / m) : new Vector3(0f, 0f, 0f);
-    }
-
     // Server: every PhysicsSyncEvery frames, stream the positions of objects physics moved since the
     // last flush as one compact PhysicsSyncPacket, then clear the changed set. Only changed objects
     // travel; a resting object's final settling move is its last entry, after which it goes quiet.
@@ -1258,7 +812,7 @@ public class PriviewNetworkScene : Scene
 
         var ids = new List<int>(_physMoved.Count);
         var pos = new List<Vector3>(_physMoved.Count);
-        var vel = new List<float>(_physMoved.Count);
+        var vel = new List<Vector3>(_physMoved.Count);
         var rot = new List<Vector3>(_physMoved.Count);
         var ang = new List<Vector3>(_physMoved.Count);
         foreach (int id in _physMoved)
@@ -1266,17 +820,20 @@ public class PriviewNetworkScene : Scene
             int idx = _editables.FindIndex(e => e.Descriptor.Id == id);
             if (idx < 0) continue;                               // deleted since it moved
             var inst = _editables[idx].Instance;
+            // full velocity from the solver's RigidBody (every moved object is a solver body).
+            Vector3 lin = Vector3.Zero, angv = Vector3.Zero;
+            if (_impBodies.TryGetValue(inst, out var rb)) { lin = rb.LinVel; angv = rb.AngVel; }
             ids.Add(id);
             pos.Add(inst.Position);
-            vel.Add(_fallVel.GetValueOrDefault(inst, 0f));
+            vel.Add(lin);
             rot.Add(inst.LocalRotate);
-            ang.Add(_angVel.GetValueOrDefault(inst, Vector3.Zero));
+            ang.Add(angv);
         }
         _physMoved.Clear();
         if (ids.Count == 0) return;
         _netManager.SendPacket(new PhysicsSyncPacket
         {
-            Ids = ids.ToArray(), Positions = pos.ToArray(), VelY = vel.ToArray(), Rotations = rot.ToArray(), AngVel = ang.ToArray(),
+            Ids = ids.ToArray(), Positions = pos.ToArray(), LinVel = vel.ToArray(), Rotations = rot.ToArray(), AngVel = ang.ToArray(),
         }, _myNetId);
     }
 
@@ -1289,7 +846,7 @@ public class PriviewNetworkScene : Scene
             int id = packet.Ids[i];
             if (!_physTargets.TryGetValue(id, out var t)) { t = new NetTarget(); _physTargets[id] = t; }
             t.Pos = packet.Positions[i];
-            t.VelY = packet.VelY[i];
+            t.Lin = packet.LinVel[i];
             t.Rot = packet.Rotations[i];
             t.AngVel = packet.AngVel[i];
         }
@@ -1301,12 +858,17 @@ public class PriviewNetworkScene : Scene
     private void StepNetworkPhysics(float dt)
     {
         if (CanEdit || _physTargets.Count == 0) return;
+        DoNetworkInterp(dt);
+    }
+
+    private void DoNetworkInterp(float dt)
+    {
         foreach (var kv in _physTargets)
         {
             int idx = _editables.FindIndex(e => e.Descriptor.Id == kv.Key);
             if (idx < 0) continue;
             var entry = _editables[idx];
-            var (cur, tgt) = StepInterpolate(entry.Instance.Position, kv.Value.Pos, kv.Value.VelY, dt, PhysLerpRate);
+            var (cur, tgt) = StepInterpolate(entry.Instance.Position, kv.Value.Pos, kv.Value.Lin, dt, PhysLerpRate);
             kv.Value.Pos = tgt;                                  // remember the dead-reckoned target
 
             // Dead-reckon the spin between sparse batches by the synced angular velocity (advance the target
@@ -1339,13 +901,13 @@ public class PriviewNetworkScene : Scene
         return a + d * t;
     }
 
-    // Pure interpolation step for a network-synced position: first extrapolate the target forward by
-    // its vertical velocity (dead-reckon the ongoing fall between sparse batches — no-op once velY is
-    // 0, i.e. at rest), then exponentially ease the current position toward it. rate is the ease speed
-    // (1/sec). Returns (new current, advanced target). Kept pure + static so physicstest can cover it.
-    public static (Vector3 cur, Vector3 tgt) StepInterpolate(Vector3 cur, Vector3 tgt, float velY, float dt, float rate)
+    // Pure interpolation step for a network-synced position: first extrapolate the target forward by its
+    // FULL linear velocity (dead-reckon the ongoing motion — fall/roll/tumble — between sparse batches; a
+    // no-op once lin is 0, i.e. at rest), then exponentially ease the current position toward it. rate is
+    // the ease speed (1/sec). Returns (new current, advanced target). Kept pure + static so physicstest covers it.
+    public static (Vector3 cur, Vector3 tgt) StepInterpolate(Vector3 cur, Vector3 tgt, Vector3 lin, float dt, float rate)
     {
-        tgt.Y += velY * dt;
+        tgt += lin * dt;
         float f = Math.Clamp(rate * dt, 0f, 1f);
         cur += (tgt - cur) * f;
         return (cur, tgt);
@@ -1375,6 +937,8 @@ public class PriviewNetworkScene : Scene
         instance.Collider = ParseColliderShape(o.Collider);
         instance.Mass = o.Mass > 0f ? o.Mass : 1f;
         instance.Restitution = o.Restitution;          // <0 stays "inherit world default"; 0..1 explicit
+        instance.Friction = o.Friction >= 0f ? o.Friction : 0.5f;   // Coulomb μ for the impulse solver
+        instance.RollingFriction = o.RollingFriction >= 0f ? o.RollingFriction : 0.05f;   // rolling resistance (Stage 6)
         instance.ColorFade = o.ColorFade;              // colour paleness (separate from the alpha channel)
 
         if (instance is Object3d mesh)
@@ -1418,6 +982,8 @@ public class PriviewNetworkScene : Scene
             Collider = ColliderShapeToString(instance.Collider),
             Mass = instance.Mass,
             Restitution = instance.Restitution,
+            Friction = instance.Friction,
+            RollingFriction = instance.RollingFriction,
             ColorFade = instance.ColorFade,
             // ---- light read-back: every live light field flows back from the paired Light ----
             Power = light?.LightPower ?? descriptor.Power,
@@ -1883,7 +1449,7 @@ public class PriviewNetworkScene : Scene
             case Field.Gravity:
                 if (!_world.Physics.GravityEnabled) break;                            // world gravity off -> locked off
                 inst.Gravity = !inst.Gravity;                                         // N or M toggles it
-                if (!inst.Gravity) { _fallVel.Remove(inst); _horizVel.Remove(inst); _angVel.Remove(inst); _orient.Remove(inst); }  // stop tracking velocity once it can't fall
+                if (!inst.Gravity) _impBodies.Remove(inst);                            // stop simulating it once it can't fall
                 if (entry.Platform != null) entry.Platform.Gravity = inst.Gravity;    // platform: persist on the live config
                 break;
             case Field.Collider:
@@ -1898,6 +1464,12 @@ public class PriviewNetworkScene : Scene
                 // explicit value below 0 returns to "inherit world", above 1 clamps. (Bouncy = closer to 1.)
                 if (inst.Restitution < 0f) inst.Restitution = dir > 0 ? 0f : -1f;
                 else { float nv = inst.Restitution + dir * RestStep; inst.Restitution = nv < 0f ? -1f : MathF.Min(1f, nv); }
+                break;
+            case Field.Friction:
+                inst.Friction = Math.Clamp(inst.Friction + dir * FrictionStep, 0f, FrictionMax);
+                break;
+            case Field.RollingFriction:
+                inst.RollingFriction = Math.Clamp(inst.RollingFriction + dir * RollFrictionStep, 0f, 1f);
                 break;
             case Field.ColorFade:
                 inst.ColorFade = Math.Clamp(inst.ColorFade + dir * ColorFadeStep, 0f, 1f);   // 0 = true colour, 1 = washed to white
@@ -2073,8 +1645,7 @@ public class PriviewNetworkScene : Scene
         if (entry.Instance is IDisplays disp) RemoveDisplaysObject(disp);
         if (entry.Instance is Object3d o) _models.Remove(o);
         if (entry.Light != null) RemoveLight(entry.Light);   // a light: actually turn it off, not just hide the marker
-        _fallVel.Remove(entry.Instance);                     // drop physics velocity tracking
-        _horizVel.Remove(entry.Instance); _angVel.Remove(entry.Instance); _orient.Remove(entry.Instance);
+        _impBodies.Remove(entry.Instance);                   // drop the solver RigidBody state
         _physMoved.Remove(entry.Descriptor.Id);              // and any pending/interp sync state
         _physTargets.Remove(entry.Descriptor.Id);
         _editables.RemoveAt(index);
@@ -2364,6 +1935,8 @@ public class PriviewNetworkScene : Scene
         Field.Collider => "Collider",
         Field.Mass => "Mass",
         Field.Restitution => "Bounce",
+        Field.Friction => "Friction",
+        Field.RollingFriction => "RollFric",
         Field.ColorFade => "Pale",
         _ => f.ToString()
     };
@@ -2411,6 +1984,8 @@ public class PriviewNetworkScene : Scene
             Field.Mass => inst.Mass.ToString("F2"),
             // <0 means "inherit world default" — show it as world (effective value) so it's never blank.
             Field.Restitution => inst.Restitution < 0f ? $"world ({RestitutionOf(inst):F2})" : inst.Restitution.ToString("F2"),
+            Field.Friction => inst.Friction.ToString("F2"),
+            Field.RollingFriction => inst.RollingFriction.ToString("F2"),
             Field.ColorFade => inst.ColorFade.ToString("F2"),
             _ => ""
         };
@@ -2423,6 +1998,27 @@ public class PriviewNetworkScene : Scene
     // Test hook: advance the authority physics one step (so a headless test can verify stability
     // without the interactive render loop). Same call the Update loop makes.
     public void StepPhysicsForTest(float dt) => StepPhysics(dt);
+
+    // ---- Stage-7a multiplayer-sync test hooks (headless) ----
+    // Snapshot the CURRENT dynamic-body state (pos + Euler orientation + full linVel + angVel) into a
+    // PhysicsSyncPacket exactly as FlushPhysicsSync gathers it — the authority side of the sync round-trip.
+    public NetworkPackets.PhysicsSyncPacket SnapshotPhysicsSyncForTest()
+    {
+        var ids = new List<int>(); var pos = new List<Vector3>(); var lin = new List<Vector3>(); var rot = new List<Vector3>(); var ang = new List<Vector3>();
+        foreach (var e in _editables)
+        {
+            var inst = e.Instance;
+            if (!(inst.Gravity && inst.Collides)) continue;
+            Vector3 lv = Vector3.Zero, av = Vector3.Zero;
+            if (_impBodies.TryGetValue(inst, out var rb)) { lv = rb.LinVel; av = rb.AngVel; }
+            ids.Add(e.Descriptor.Id); pos.Add(inst.Position); lin.Add(lv); rot.Add(inst.LocalRotate); ang.Add(av);
+        }
+        return new NetworkPackets.PhysicsSyncPacket { Ids = ids.ToArray(), Positions = pos.ToArray(), LinVel = lin.ToArray(), Rotations = rot.ToArray(), AngVel = ang.ToArray() };
+    }
+    // Client side: adopt a received batch as the interpolation target, then advance the dead-reckon/ease
+    // (same code the real client runs, minus the CanEdit gate).
+    public void ReceivePhysicsSyncForTest(NetworkPackets.PhysicsSyncPacket p) => OnPhysicsSyncReceived(p, 0);
+    public void StepNetworkPhysicsForTest(float dt) => DoNetworkInterp(dt);
 
     // Inspection/test accessor: the world config built from the CURRENT live instances (the same
     // projection SaveWorld/OnWorldRequested use), WITHOUT writing to disk.
@@ -2808,7 +2404,7 @@ public class PriviewNetworkScene : Scene
         }
         _editables.Clear();
         _models.Clear();
-        _fallVel.Clear(); _horizVel.Clear(); _angVel.Clear(); _orient.Clear(); _physMoved.Clear(); _physTargets.Clear();   // drop stale physics/sync state
+        _impBodies.Clear(); _physMoved.Clear(); _physTargets.Clear();   // drop stale physics/sync state
         _selected = -1;
         _floor = null;   // the floor is an editable entry now; the loop above already removed its display
 
