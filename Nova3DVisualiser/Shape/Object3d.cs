@@ -62,7 +62,8 @@ public class Object3d : GameObject, IDisplays
         for (int i = 0; i < _faces.Count; i++)
         {
             Triangle t = _faces[i];
-            _gpuFaces[i] = new SnapFace { I0 = t.I0, I1 = t.I1, I2 = t.I2, N0 = t.N0, N1 = t.N1, N2 = t.N2 };
+            _gpuFaces[i] = new SnapFace { I0 = t.I0, I1 = t.I1, I2 = t.I2, N0 = t.N0, N1 = t.N1, N2 = t.N2,
+                                          UV0 = t.Uv0, UV1 = t.Uv1, UV2 = t.Uv2, Group = t.Group };
         }
 
         var indices = new List<int>(_faces.Count);
@@ -102,7 +103,11 @@ public class Object3d : GameObject, IDisplays
 
     private static int CountNodes(BvhNode n) => n.Tris != null ? 1 : 1 + CountNodes(n.Left!) + CountNodes(n.Right!);
 
-    public Object3d(Vector3[] vertex, Vector3[] normals, FacingInfo[] facingInfos) : base(Vector3.Zero, Vector3.Zero)
+    // uvs (optional): one texture coordinate per FACE CORNER, in face order — length facingInfos.Length*3
+    // ([f*3 + 0..2] are the three corners of face f). null = no UVs (untextured geometry).
+    // groups (optional): one face-group id per FACE, in face order (length facingInfos.Length) — for
+    // per-object texture-face selection. null = every face is group 0 ("whole"). The cube tags 6 sides.
+    public Object3d(Vector3[] vertex, Vector3[] normals, FacingInfo[] facingInfos, Vector2[]? uvs = null, int[]? groups = null) : base(Vector3.Zero, Vector3.Zero)
     {
         _localVertices = vertex;
         _worldVertices = new Vector3[vertex.Length];
@@ -124,13 +129,19 @@ public class Object3d : GameObject, IDisplays
         }
 
         _faces = new List<Triangle>();
-        foreach (var facingInfo in facingInfos)
+        for (int f = 0; f < facingInfos.Length; f++)
         {
+            var facingInfo = facingInfos[f];
+            Vector2 uv0 = uvs != null ? uvs[f * 3]     : default;
+            Vector2 uv1 = uvs != null ? uvs[f * 3 + 1] : default;
+            Vector2 uv2 = uvs != null ? uvs[f * 3 + 2] : default;
+            int group = groups != null ? groups[f] : 0;
             _faces.Add(new Triangle(
                 new int[] { facingInfo.Vertex1 - 1, facingInfo.Vertex2 - 1, facingInfo.Vertex3 - 1 },
                 normals[facingInfo.Normal1 - 1],
                 normals[facingInfo.Normal2 - 1],
-                normals[facingInfo.Normal3 - 1]
+                normals[facingInfo.Normal3 - 1],
+                uv0, uv1, uv2, group
             ));
         }
 
@@ -223,7 +234,7 @@ public class Object3d : GameObject, IDisplays
             {
                 // t is the world-space distance parameter; recompute the world hit point from it.
                 Vector3 worldHit = ray.RayStart + ray.RayDirection * hit.Intersection;
-                return new RenderData(hit.Intersection, hit.Normal, worldHit, this.EffectiveColor);
+                return new RenderData(hit.Intersection, hit.Normal, worldHit, SurfaceColor(hit.Uv, hit.Group), hit.Uv, hit.Group);
             }
             return RenderData.NoRender;
         }
@@ -244,8 +255,24 @@ public class Object3d : GameObject, IDisplays
         }
         if (closestData.Intersection > -1)
         {
-            closestData.Color = this.EffectiveColor;
+            closestData.Color = SurfaceColor(closestData.Uv, closestData.Group);
         }
         return closestData;
+    }
+
+    // The surface colour at a hit: the sampled texel (UV scaled by TextureScale, paled by ColorFade,
+    // object alpha kept) when this object has a Texture AND this face is selected (TextureFace == ALL or
+    // matches the face's group); otherwise EffectiveColor EXACTLY as before. With no Texture (or a face
+    // that isn't the chosen one) the result is byte-identical to the pre-texture renderer — the invariant
+    // that keeps gputest at Δ=0. Kept in lockstep with the GPU kernel's sampling gate.
+    private Rgba32 SurfaceColor(Vector2 uv, int group)
+    {
+        if (this.Texture == null || (this.TextureFace >= 0 && this.TextureFace != group))
+            return this.EffectiveColor;
+        float s = this.TextureScale;
+        Rgba32 texel = this.TextureFilter == TextureFilterMode.Bilinear
+            ? this.Texture.SampleBilinear(uv.X * s, uv.Y * s)
+            : this.Texture.Sample(uv.X * s, uv.Y * s);
+        return ShadeTexel(texel);
     }
 }

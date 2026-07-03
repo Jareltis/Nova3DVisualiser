@@ -43,6 +43,26 @@ public abstract class GameObject(Vector3 position, Vector3 localRotate)
     // the GPU snapshot, so the two renderers stay in lockstep (no kernel change, gputest parity holds).
     public float ColorFade = 0f;
 
+    // Optional surface texture (decoded RGBA). null = flat colour, EXACTLY as before (this is the
+    // invariant that keeps untextured rendering byte-identical on both renderers). Sampled only by the
+    // box path in Object3d this stage; spheres/meshes ignore it until later stages (their UVs are Zero).
+    public Texture? Texture = null;
+
+    // UV scale / tiling: the interpolated UV is multiplied by this before sampling, so (with WRAP
+    // addressing) a value of 2 tiles the texture 2×2 across the surface. Default 1 = 1:1. Applied
+    // identically on both renderers (the parity rule).
+    public float TextureScale = 1f;
+
+    // Which face-group wears the texture: -1 = ALL faces (default, the pre-Stage-4 behaviour); >=0 =
+    // only triangles whose face-group id matches sample the texture, the rest show flat colour. The cube
+    // tags its 6 sides 0..5 (+X,-X,+Y,-Y,+Z,-Z); other shapes are a single "whole" group 0.
+    public int TextureFace = -1;
+
+    // Texture magnification filter: Nearest (default, bit-exact CPU↔GPU) or Bilinear (smooths blocky
+    // magnification via a 4-texel float blend — opt-in, tolerated thin parity band). Picked at the single
+    // sampling site (Object3d.SurfaceColor / Sphere textured path) and mirrored in the GPU kernel.
+    public TextureFilterMode TextureFilter = TextureFilterMode.Nearest;
+
     // The surface colour after paling: RGB lerped toward white by ColorFade, alpha preserved.
     public Rgba32 EffectiveColor
     {
@@ -53,5 +73,18 @@ public abstract class GameObject(Vector3 position, Vector3 localRotate)
             byte L(byte ch) => (byte)(ch + (255 - ch) * f + 0.5f);
             return new Rgba32(L(Color.R), L(Color.G), L(Color.B), Color.A);
         }
+    }
+
+    // The textured analogue of EffectiveColor: the texture supplies the RGB, which ColorFade still pales
+    // (kept "as-is"), while the alpha stays the OBJECT's own (Color.A) — the texel's alpha is not used
+    // for object transparency this stage. With ColorFade == 0 and an opaque object this returns the
+    // texel unchanged, so a plainly-textured surface shows the image exactly.
+    public Rgba32 ShadeTexel(Rgba32 texel)
+    {
+        byte a = Color.A;
+        if (ColorFade <= 0f) return new Rgba32(texel.R, texel.G, texel.B, a);
+        float f = ColorFade >= 1f ? 1f : ColorFade;
+        byte L(byte ch) => (byte)(ch + (255 - ch) * f + 0.5f);
+        return new Rgba32(L(texel.R), L(texel.G), L(texel.B), a);
     }
 }

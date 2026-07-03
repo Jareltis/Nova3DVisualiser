@@ -52,6 +52,7 @@ public class PhysicsConfig
 public class PlatformConfig
 {
     public bool Enabled { get; set; } = true;
+    public string Name { get; set; } = "";              // user-given in-world name ("" = show the system name "platform #0")
     // "square" (default) | "rectangle" | "circle". A world with no Shape (every existing
     // world + the default) is treated as "square" using Size — unchanged geometry.
     public string Shape { get; set; } = "square";
@@ -76,6 +77,7 @@ public class Vec3Config
 public class WorldObject
 {
     public int Id { get; set; }                       // stable per-object id (server assigns; client adopts verbatim)
+    public string Name { get; set; } = "";            // user-given in-world name ("" = show the derived system name "{type} #{id}")
     public string Type { get; set; } = "mesh";        // "mesh" | "cube" | "sphere" | primitives | "light"
     public string? Mesh { get; set; }                 // mesh name in models/ (Type "mesh")
     public Vec3Config Position { get; set; } = new();
@@ -83,6 +85,10 @@ public class WorldObject
     public float Scale { get; set; } = 1f;            // uniform, matches Object3d.Scale
     public string Color { get; set; } = "White";
     public float ColorFade { get; set; } = 0f;        // "colour transparency" / paleness 0..1: 0 = true colour, 1 = washed out to white (separate from the alpha channel = object transparency)
+    public string Texture { get; set; } = "";         // per-object PNG texture file in textures/ ("" = none/flat colour).
+    public float TextureScale { get; set; } = 1f;      // UV tiling factor (1 = 1:1; 2 = tile 2×2). Multiplies the UV before sampling.
+    public int TextureFace { get; set; } = -1;         // which face-group wears the texture: -1 = all faces; a cube: 0..5 (+X,-X,+Y,-Y,+Z,-Z)
+    public int TextureFilter { get; set; } = 0;        // magnification filter: 0 = Nearest (exact, default); 1 = Bilinear (smooth, tolerated parity band)
     public string Anchor { get; set; } = "Bottom";    // mesh only: Bottom | Center | Origin
     public float RotateSpeed { get; set; } = 0f;      // continuous spin about Y
     public bool Collides { get; set; } = true;        // collider participation (camera + as a support); markers/avatars are false. Effective only when world Collision is on.

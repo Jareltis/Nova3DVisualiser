@@ -29,11 +29,14 @@ public struct GpuHit
 }
 
 // A mesh-BVH face hit in LOCAL space: distance (world units, by the local-ray invariant) + the
-// interpolated LOCAL normal (rotated to world once the closest object is known).
+// interpolated LOCAL normal (rotated to world once the closest object is known) + the interpolated
+// texture coordinate (barycentric, same weights as the normal).
 public struct GpuFaceHit
 {
     public float T;
     public float Nx, Ny, Nz;
+    public float U, V;
+    public int Group;   // face-group id of the hit triangle (for texture-face selection)
 }
 
 /// <summary>
@@ -54,7 +57,8 @@ public sealed class GpuRaytracer : IDisposable
     private readonly Context _context;
     private readonly Accelerator _accelerator;
     private readonly Action<Index1D, GpuGlobals, ArrayView<Vector3>, ArrayView<SnapFace>,
-        ArrayView<SnapBvhNode>, ArrayView<int>, ArrayView<SnapObject>, ArrayView<SnapSphere>,
+        ArrayView<SnapBvhNode>, ArrayView<int>, ArrayView<SnapTexture>, ArrayView<Rgba32>,
+        ArrayView<SnapObject>, ArrayView<SnapSphere>,
         ArrayView<SnapLight>, ArrayView<float>, ArrayView<int>> _kernel;
 
     // Static geometry (uploaded only when the mesh set changes).
@@ -62,7 +66,15 @@ public sealed class GpuRaytracer : IDisposable
     private MemoryBuffer1D<SnapFace, Stride1D.Dense>? _faceBuf;
     private MemoryBuffer1D<SnapBvhNode, Stride1D.Dense>? _nodeBuf;
     private MemoryBuffer1D<int, Stride1D.Dense>? _triIdxBuf;
+    private MemoryBuffer1D<SnapTexture, Stride1D.Dense>? _texBuf;
+    private MemoryBuffer1D<Rgba32, Stride1D.Dense>? _texPixelBuf;
     private int _uploadedGeomVersion = -1;
+    private int _uploadedTextureVersion = -1;   // the texture pool is versioned separately (A3)
+
+    // Upload counters (diagnostics / tests): how many times the static geometry+BVH vs the texture pool
+    // were actually (re-)uploaded. A targeted texture swap bumps only the texture count.
+    public int GeometryUploads { get; private set; }
+    public int TextureUploads { get; private set; }
 
     // Per-frame data.
     private MemoryBuffer1D<SnapObject, Stride1D.Dense>? _objBuf;
@@ -102,8 +114,8 @@ public sealed class GpuRaytracer : IDisposable
         _accelerator = chosen.CreateAccelerator(_context);
         AcceleratorName = $"{_accelerator.AcceleratorType} : {_accelerator.Name}";
         _kernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D, GpuGlobals, ArrayView<Vector3>,
-            ArrayView<SnapFace>, ArrayView<SnapBvhNode>, ArrayView<int>, ArrayView<SnapObject>,
-            ArrayView<SnapSphere>, ArrayView<SnapLight>, ArrayView<float>, ArrayView<int>>(RenderKernel);
+            ArrayView<SnapFace>, ArrayView<SnapBvhNode>, ArrayView<int>, ArrayView<SnapTexture>, ArrayView<Rgba32>,
+            ArrayView<SnapObject>, ArrayView<SnapSphere>, ArrayView<SnapLight>, ArrayView<float>, ArrayView<int>>(RenderKernel);
     }
 
     /// <summary>Renders the snapshot into the caller's brightness + color buffers (length = width*height).</summary>
@@ -127,6 +139,7 @@ public sealed class GpuRaytracer : IDisposable
         };
 
         _kernel(pixels, g, _vertBuf!.View, _faceBuf!.View, _nodeBuf!.View, _triIdxBuf!.View,
+            _texBuf!.View, _texPixelBuf!.View,
             _objBuf!.View, _sphereBuf!.View, _lightBuf!.View, _brightBuf!.View, _colorBuf!.View);
         _accelerator.Synchronize();
 
@@ -139,16 +152,36 @@ public sealed class GpuRaytracer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Forgets the cached static geometry so the next <see cref="Render"/> re-uploads it. Needed only
+    /// when the SAME raytracer is reused for a DIFFERENT scene (e.g. the self-tests): GeometryVersion is a
+    /// per-scene counter, so two scenes can share a value and would otherwise skip the re-upload, leaving
+    /// the device holding one scene's geometry while the other scene's per-object offsets index into it
+    /// (out of bounds). The live app uses one raytracer per scene with a monotonic version, so never needs this.
+    /// </summary>
+    public void ResetGeometryCache() { _uploadedGeomVersion = -1; _uploadedTextureVersion = -1; }
+
     private void EnsureBuffers(SceneSnapshot snap)
     {
         // Static mesh geometry + BVH: upload only when the mesh set changed (or first frame).
-        if (snap.GeometryVersion != _uploadedGeomVersion || _vertBuf == null)
+        bool geomChanged = snap.GeometryVersion != _uploadedGeomVersion || _vertBuf == null;
+        if (geomChanged)
         {
             Upload(ref _vertBuf, snap.LocalVerts);
             Upload(ref _faceBuf, snap.Faces);
             Upload(ref _nodeBuf, snap.Nodes);
             Upload(ref _triIdxBuf, snap.TriIdx);
             _uploadedGeomVersion = snap.GeometryVersion;
+            GeometryUploads++;
+        }
+        // Texture pool: re-upload when the geometry changed (its texture set/offsets may differ) OR only the
+        // texture version bumped (a live swap) — decoupled from geometry/BVH so a swap is a pool-only upload.
+        if (geomChanged || snap.TextureVersion != _uploadedTextureVersion || _texBuf == null)
+        {
+            Upload(ref _texBuf, snap.Textures);
+            Upload(ref _texPixelBuf, snap.TexPixels);
+            _uploadedTextureVersion = snap.TextureVersion;
+            TextureUploads++;
         }
         // Per-frame: object transforms, spheres, lights.
         Upload(ref _objBuf, snap.Objects);
@@ -191,6 +224,7 @@ public sealed class GpuRaytracer : IDisposable
 
     private static void RenderKernel(Index1D index, GpuGlobals g,
         ArrayView<Vector3> verts, ArrayView<SnapFace> faces, ArrayView<SnapBvhNode> nodes, ArrayView<int> triIdx,
+        ArrayView<SnapTexture> textures, ArrayView<Rgba32> texPixels,
         ArrayView<SnapObject> objects, ArrayView<SnapSphere> spheres, ArrayView<SnapLight> lights,
         ArrayView<float> brightnessOut, ArrayView<int> colorOut)
     {
@@ -214,7 +248,7 @@ public sealed class GpuRaytracer : IDisposable
         float tMin = 0f;
         for (int layer = 0; layer < MaxLayers; layer++)
         {
-            GpuHit hit = ClosestHit(g, g.CamX, g.CamY, g.CamZ, dx, dy, dz, tMin, verts, faces, nodes, triIdx, objects, spheres);
+            GpuHit hit = ClosestHit(g, g.CamX, g.CamY, g.CamZ, dx, dy, dz, tMin, verts, faces, nodes, triIdx, objects, spheres, textures, texPixels);
             if (hit.T < 0f) break;
             if (hit.A > 0f)
             {
@@ -239,10 +273,15 @@ public sealed class GpuRaytracer : IDisposable
     // to world here, once the winner is known.
     private static GpuHit ClosestHit(GpuGlobals g, float ox, float oy, float oz, float dx, float dy, float dz, float tMin,
         ArrayView<Vector3> verts, ArrayView<SnapFace> faces, ArrayView<SnapBvhNode> nodes, ArrayView<int> triIdx,
-        ArrayView<SnapObject> objects, ArrayView<SnapSphere> spheres)
+        ArrayView<SnapObject> objects, ArrayView<SnapSphere> spheres,
+        ArrayView<SnapTexture> textures, ArrayView<Rgba32> texPixels)
     {
         float bestT = -1f; int kind = 0;
         float bnx = 0f, bny = 0f, bnz = 0f, br = 0f, bg = 0f, bb = 0f, ba = 0f;
+        int bTex = -1; float bFade = 0f, bu = 0f, bv = 0f;   // winning hit's texture index / paleness / UV
+        float bScale = 1f; int bTexFace = -1, bGroup = 0;    // winning hit's UV tiling + texture-face gate + hit face-group
+        int bFilter = 0;                                     // winning hit's texture filter (0 nearest, 1 bilinear)
+        float blnx = 0f, blny = 0f, blnz = 0f;               // winning sphere's LOCAL surface dir (for the equirect UV)
 
         for (int o = 0; o < g.ObjectCount; o++)
         {
@@ -268,6 +307,8 @@ public sealed class GpuRaytracer : IDisposable
                 bny = ob.ColX.Y * fh.Nx + ob.ColY.Y * fh.Ny + ob.ColZ.Y * fh.Nz;
                 bnz = ob.ColX.Z * fh.Nx + ob.ColY.Z * fh.Ny + ob.ColZ.Z * fh.Nz;
                 br = ob.R; bg = ob.G; bb = ob.B; ba = ob.A;
+                bTex = ob.TextureIndex; bFade = ob.ColorFade; bu = fh.U; bv = fh.V;
+                bScale = ob.TextureScale; bTexFace = ob.TextureFace; bGroup = fh.Group; bFilter = ob.TextureFilter;
             }
         }
 
@@ -279,6 +320,38 @@ public sealed class GpuRaytracer : IDisposable
             {
                 bestT = hs.T; kind = 2;
                 bnx = hs.Nx; bny = hs.Ny; bnz = hs.Nz; br = sp.R; bg = sp.G; bb = sp.B; ba = sp.A;
+                bTex = sp.TextureIndex; bFade = sp.ColorFade; bScale = sp.TextureScale; bTexFace = sp.TextureFace; bGroup = 0; bFilter = sp.TextureFilter;
+                // Surface dir in the sphere's LOCAL frame = world normal * basis-transpose (== RotateInverse
+                // on the CPU), so the equirect UV rotates with the object exactly like Sphere.GetRenderData.
+                blnx = sp.ColX.X * hs.Nx + sp.ColX.Y * hs.Ny + sp.ColX.Z * hs.Nz;
+                blny = sp.ColY.X * hs.Nx + sp.ColY.Y * hs.Ny + sp.ColY.Z * hs.Nz;
+                blnz = sp.ColZ.X * hs.Nx + sp.ColZ.Y * hs.Ny + sp.ColZ.Z * hs.Nz;
+            }
+        }
+
+        // A textured sphere's UV is the equirectangular map of its local surface dir (mesh UVs came from
+        // face interpolation above). Then texture the winning hit — but only when the texture is present
+        // AND this face is selected (TextureFace == ALL, or matches the hit's face-group; the sphere's
+        // group is 0). The UV is scaled by TextureScale (tiling) before the exact nearest+wrap SampleTexel,
+        // then ColorFade paling uses the SAME byte math as GameObject.ShadeTexel — CPU/GPU lockstep.
+        if (kind == 2 && bTex >= 0)
+            SphereUv(blnx, blny, blnz, out bu, out bv);
+
+        if (bTex >= 0 && (bTexFace == -1 || bTexFace == bGroup))
+        {
+            int tr, tg, tb;
+            // Bilinear (opt-in) blends 4 texels; Nearest picks one (bit-exact). Same gate as the CPU.
+            if (bFilter == 1)
+                SampleTexelBilinear(textures, texPixels, bTex, bu * bScale, bv * bScale, out tr, out tg, out tb);
+            else
+                SampleTexel(textures, texPixels, bTex, bu * bScale, bv * bScale, out tr, out tg, out tb);
+            if (bFade <= 0f) { br = tr / 255f; bg = tg / 255f; bb = tb / 255f; }
+            else
+            {
+                float f = bFade >= 1f ? 1f : bFade;
+                br = ((int)(tr + (255 - tr) * f + 0.5f)) / 255f;
+                bg = ((int)(tg + (255 - tg) * f + 0.5f)) / 255f;
+                bb = ((int)(tb + (255 - tb) * f + 0.5f)) / 255f;
             }
         }
 
@@ -295,7 +368,7 @@ public sealed class GpuRaytracer : IDisposable
     private static GpuFaceHit TraverseClosest(SnapObject ob, float sx, float sy, float sz, float dx, float dy, float dz, float tMin,
         ArrayView<Vector3> verts, ArrayView<SnapFace> faces, ArrayView<SnapBvhNode> nodes, ArrayView<int> triIdx)
     {
-        GpuFaceHit best; best.T = -1f; best.Nx = 0f; best.Ny = 0f; best.Nz = 0f;
+        GpuFaceHit best; best.T = -1f; best.Nx = 0f; best.Ny = 0f; best.Nz = 0f; best.U = 0f; best.V = 0f; best.Group = 0;
         int i = 0;
         while (i != -1)
         {
@@ -326,7 +399,7 @@ public sealed class GpuRaytracer : IDisposable
     private static GpuFaceHit HitFaceLocal(SnapFace f, ArrayView<Vector3> verts, int vertBase,
         float ox, float oy, float oz, float dx, float dy, float dz)
     {
-        GpuFaceHit miss; miss.T = -1f; miss.Nx = 0f; miss.Ny = 0f; miss.Nz = 0f;
+        GpuFaceHit miss; miss.T = -1f; miss.Nx = 0f; miss.Ny = 0f; miss.Nz = 0f; miss.U = 0f; miss.V = 0f; miss.Group = 0;
 
         Vector3 v0 = verts[vertBase + f.I0], v1 = verts[vertBase + f.I1], v2 = verts[vertBase + f.I2];
         float e1x = v1.X - v0.X, e1y = v1.Y - v0.Y, e1z = v1.Z - v0.Z;
@@ -363,6 +436,10 @@ public sealed class GpuRaytracer : IDisposable
         h.Nx = f.N0.X * w0 + f.N1.X * u + f.N2.X * v;
         h.Ny = f.N0.Y * w0 + f.N1.Y * u + f.N2.Y * v;
         h.Nz = f.N0.Z * w0 + f.N1.Z * u + f.N2.Z * v;
+        // Texture coordinate: same barycentric blend as the normal (matches Triangle.GetRenderData).
+        h.U = f.UV0.X * w0 + f.UV1.X * u + f.UV2.X * v;
+        h.V = f.UV0.Y * w0 + f.UV1.Y * u + f.UV2.Y * v;
+        h.Group = f.Group;
         return h;
     }
 
@@ -654,12 +731,77 @@ public sealed class GpuRaytracer : IDisposable
         ox = x; oy = y * c - z * s; oz = y * s + z * c;
     }
 
+    // Sample one texture's texel — EXACTLY replicating the CPU Texture.Sample: nearest-neighbour with
+    // WRAP (repeat) addressing and the identical integer texel arithmetic, so CPU and GPU fetch the SAME
+    // texel bit-for-bit. Returns the raw RGB bytes (as ints); the caller applies ColorFade + alpha.
+    private static void SampleTexel(ArrayView<SnapTexture> textures, ArrayView<Rgba32> texPixels, int texIndex,
+        float u, float v, out int r, out int gg, out int b)
+    {
+        SnapTexture t = textures[texIndex];
+        int x = WrapIndex(u, t.Width);
+        int y = WrapIndex(v, t.Height);
+        Rgba32 px = texPixels[t.Offset + y * t.Width + x];
+        r = px.R; gg = px.G; b = px.B;
+    }
+
+    // Bilinear-filtered texel — an EXACT replica of Texture.SampleBilinear (4-texel blend, WRAP addressing,
+    // identical lerp/round math). Only float hardware rounding (XMath vs MathF) may differ → the thin
+    // tolerated band. Returns the blended RGB bytes (as ints); the caller applies ColorFade + alpha.
+    private static void SampleTexelBilinear(ArrayView<SnapTexture> textures, ArrayView<Rgba32> texPixels, int texIndex,
+        float u, float v, out int r, out int gg, out int b)
+    {
+        SnapTexture t = textures[texIndex];
+        float fx = u * t.Width, fy = v * t.Height;
+        float flx = XMath.Floor(fx), fly = XMath.Floor(fy);
+        float fu = fx - flx, fv = fy - fly;
+
+        int x0 = (int)flx % t.Width;  if (x0 < 0) x0 += t.Width;
+        int y0 = (int)fly % t.Height; if (y0 < 0) y0 += t.Height;
+        int x1 = x0 + 1; if (x1 >= t.Width)  x1 -= t.Width;
+        int y1 = y0 + 1; if (y1 >= t.Height) y1 -= t.Height;
+
+        Rgba32 p00 = texPixels[t.Offset + y0 * t.Width + x0], p10 = texPixels[t.Offset + y0 * t.Width + x1];
+        Rgba32 p01 = texPixels[t.Offset + y1 * t.Width + x0], p11 = texPixels[t.Offset + y1 * t.Width + x1];
+
+        r  = BLerp(p00.R, p10.R, p01.R, p11.R, fu, fv);
+        gg = BLerp(p00.G, p10.G, p01.G, p11.G, fu, fv);
+        b  = BLerp(p00.B, p10.B, p01.B, p11.B, fu, fv);
+    }
+
+    // Bilinear blend of 4 texel channel bytes — identical expression to Texture.BLerp (the parity rule).
+    private static int BLerp(byte c00, byte c10, byte c01, byte c11, float fu, float fv)
+    {
+        float top = c00 + (c10 - c00) * fu;
+        float bot = c01 + (c11 - c01) * fu;
+        float val = top + (bot - top) * fv;
+        return (int)(val + 0.5f);
+    }
+
+    // Equirectangular (lat/long) UV from a UNIT local surface direction — an EXACT replica of
+    // Sphere.EquirectangularUv, except atan2/asin come from XMath and may round slightly differently
+    // (the tolerated seam/pole band). Tau = 2π; Tau*0.5f = π. u wraps at the -X seam; v spans the poles.
+    private static void SphereUv(float dx, float dy, float dz, out float u, out float v)
+    {
+        u = 0.5f + XMath.Atan2(dz, dx) / Tau;
+        v = 0.5f - XMath.Asin(XMath.Clamp(dy, -1f, 1f)) / (Tau * 0.5f);
+    }
+
+    // floor(t*n) reduced into [0,n) with a true modulo — matches Texture.WrapIndex exactly.
+    private static int WrapIndex(float t, int n)
+    {
+        int i = (int)XMath.Floor(t * n);
+        i %= n;
+        if (i < 0) i += n;
+        return i;
+    }
+
     private static float Rsqrt(float x) => x > 0f ? 1f / XMath.Sqrt(x) : 0f;
     private static int ToByte(float f) => (int)XMath.Clamp(f * 255f + 0.5f, 0f, 255f);
 
     public void Dispose()
     {
         _vertBuf?.Dispose(); _faceBuf?.Dispose(); _nodeBuf?.Dispose(); _triIdxBuf?.Dispose();
+        _texBuf?.Dispose(); _texPixelBuf?.Dispose();
         _objBuf?.Dispose(); _sphereBuf?.Dispose(); _lightBuf?.Dispose();
         _brightBuf?.Dispose(); _colorBuf?.Dispose();
         _accelerator.Dispose();

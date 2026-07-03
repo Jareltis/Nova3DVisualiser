@@ -21,6 +21,9 @@ SampleGame/models/
 # Worlds
 SampleGame/worlds/
 
+# Textures
+SampleGame/textures/
+
 # Local planning notes (not for the repo)
 BACKLOG.md
 TESTING.md

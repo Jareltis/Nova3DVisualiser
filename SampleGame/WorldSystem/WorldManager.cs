@@ -79,6 +79,23 @@ public static class WorldManager
         return result;
     }
 
+    /// <summary>Texture file names available to objects (each *.png in the default textures folder).</summary>
+    public static List<string> ListAvailableTextures() => ListAvailableTextures(AppPaths.TexturesFolder);
+
+    /// <summary>Texture file names available to objects (each *.png in <paramref name="folder"/>, e.g.
+    /// "brick.png"). A client passes its received-textures folder so the editor lists streamed textures.</summary>
+    public static List<string> ListAvailableTextures(string folder)
+    {
+        var result = new List<string>();
+        if (!Directory.Exists(folder)) return result;
+
+        foreach (string path in Directory.GetFiles(folder, "*.png"))
+            result.Add(Path.GetFileName(path));
+
+        result.Sort(StringComparer.OrdinalIgnoreCase);
+        return result;
+    }
+
     /// <summary>
     /// Ensures at least one world exists. If the worlds folder has none, writes a
     /// platform-only default world (no objects) so the app always has something to load.

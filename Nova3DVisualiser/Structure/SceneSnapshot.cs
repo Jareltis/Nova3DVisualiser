@@ -14,11 +14,23 @@ namespace Nova3DVisualiser;
 // dir = BasisX*Focal + BasisY*uv.Y + BasisZ*uv.X, normalized.
 
 // One mesh triangle in LOCAL space: vertex indices into the object's local-vertex block + the three
-// local vertex normals (rotated to world by the object basis in the kernel).
+// local vertex normals (rotated to world by the object basis in the kernel) + the three per-corner
+// texture coordinates (barycentrically interpolated in the kernel, same weights as the normal). UVs are
+// zero for untextured/no-UV geometry (harmless — only sampled when the object carries a texture).
 public struct SnapFace
 {
     public int I0, I1, I2;
     public Vector3 N0, N1, N2;
+    public Vector2 UV0, UV1, UV2;
+    public int Group;   // face-group id (for per-object texture-face selection); 0 = whole/default
+}
+
+// One decoded texture's placement in the flat SceneSnapshot.TexPixels array: a contiguous run of
+// Width*Height Rgba32 pixels (row-major, row 0 first) starting at Offset. Sampled exactly like the CPU
+// Texture.Sample (nearest-neighbour + wrap).
+public struct SnapTexture
+{
+    public int Offset, Width, Height;
 }
 
 // One flattened, STACKLESS BVH node (local space). Traversal carries a single node index: on an AABB
@@ -46,6 +58,11 @@ public struct SnapObject
     public int VertBase, FaceBase, NodeBase, TriIdxBase;
     public float R, G, B, A;
     public int CastsShadow;
+    public int TextureIndex;           // index into SceneSnapshot.Textures, or -1 for none (flat colour)
+    public float ColorFade;            // paleness 0..1 — applied to the SAMPLED texel when textured (the flat R/G/B already bakes it)
+    public float TextureScale;         // UV tiling factor (multiply UV before sampling); 1 = 1:1
+    public int TextureFace;            // -1 = all faces textured; >=0 = only faces whose Group matches
+    public int TextureFilter;          // 0 = Nearest (exact), 1 = Bilinear (4-texel blend; tolerated band)
 }
 
 public struct SnapSphere
@@ -54,6 +71,12 @@ public struct SnapSphere
     public float Radius;
     public float R, G, B, A;
     public int CastsShadow;
+    public Vector3 ColX, ColY, ColZ;   // LocalRotate basis (Rotate of the unit axes); world→local for the equirect UV is the transpose
+    public int TextureIndex;           // index into SceneSnapshot.Textures, or -1 for none (flat colour)
+    public float ColorFade;            // paleness 0..1 — applied to the SAMPLED texel when textured (the flat R/G/B already bakes it)
+    public float TextureScale;         // UV tiling factor (multiply the equirect UV before sampling); 1 = 1:1
+    public int TextureFace;            // -1 or 0 texture the (whole) sphere; any other value = flat (sphere is a single group 0)
+    public int TextureFilter;          // 0 = Nearest (exact), 1 = Bilinear (4-texel blend; tolerated band)
 }
 
 public struct SnapLight
@@ -78,11 +101,18 @@ public struct SnapLight
 // refresh every frame.
 public class SceneSnapshot
 {
-    public int GeometryVersion;        // bumped when the static mesh set changes (gates GPU re-upload)
+    public int GeometryVersion;        // bumped when the static mesh set changes (gates GPU geometry/BVH re-upload)
     public Vector3[] LocalVerts = Array.Empty<Vector3>();
     public SnapFace[] Faces = Array.Empty<SnapFace>();
     public SnapBvhNode[] Nodes = Array.Empty<SnapBvhNode>();
     public int[] TriIdx = Array.Empty<int>();
+
+    // Static texture table + a flat pixel pool (row-major Rgba32). Versioned SEPARATELY from the geometry
+    // so a live texture swap re-uploads ONLY the pool (not the static geometry + BVH). The GPU re-uploads
+    // the pool when GeometryVersion OR TextureVersion changed; geometry/BVH only when GeometryVersion did.
+    public int TextureVersion;         // bumped when the texture pool changes (a live swap) — gates a pool-only re-upload
+    public SnapTexture[] Textures = Array.Empty<SnapTexture>();
+    public Rgba32[] TexPixels = Array.Empty<Rgba32>();
 
     public SnapObject[] Objects = Array.Empty<SnapObject>();
     public SnapSphere[] Spheres = Array.Empty<SnapSphere>();

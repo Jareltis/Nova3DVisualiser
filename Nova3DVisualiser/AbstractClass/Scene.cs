@@ -21,6 +21,10 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
     // cached local geometry + BVH only then (transforms refresh every frame regardless).
     private int _geomVersion = 0;
 
+    // Bumped when only the TEXTURE POOL changes (a live editor texture swap) — separate from the geometry
+    // version so the GPU re-uploads just the pixels, leaving the static geometry + BVH cached.
+    private int _textureVersion = 0;
+
     public readonly UIManager UI = new UIManager();
 
     protected float Exposure = 0.05f;
@@ -50,6 +54,13 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
         _geomVersion++;
     }
 
+    // Forces the cached GPU geometry (incl. the texture pool) to rebuild + re-upload next frame, WITHOUT
+    // Targeted invalidation for a runtime TEXTURE swap (an editor Field.Texture change): bumps ONLY the
+    // texture version, so the GPU re-uploads just the texture pool — the static geometry + BVH stay cached
+    // (A3). A genuine mesh add/remove bumps _geomVersion via Add/RemoveDisplaysObject as before.
+    protected void InvalidateGpuTextures()
+    { _textureVersion++; }
+
     protected void AddLight(Light light)
     { _allLight.Add(light); }
     protected void RemoveLight(Light light)
@@ -66,11 +77,20 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
     // every mesh, rebuilt only when the mesh set changes (versioned). Per-object transforms refresh
     // every frame in BuildSnapshot. ----
     private int _cachedGeomVersion = -1;
+    private int _cachedTextureVersion = -1;
     private Vector3[] _cVerts = Array.Empty<Vector3>();
     private SnapFace[] _cFaces = Array.Empty<SnapFace>();
     private SnapBvhNode[] _cNodes = Array.Empty<SnapBvhNode>();
     private int[] _cTriIdx = Array.Empty<int>();
+    private SnapTexture[] _cTextures = Array.Empty<SnapTexture>();
+    private Rgba32[] _cTexPixels = Array.Empty<Rgba32>();
     private readonly List<CachedObj> _cObjList = new List<CachedObj>();
+    // Per-object texture index into _cTextures (-1 = untextured), aligned to _cObjList. Rebuilt with the
+    // TEXTURE pool (which is versioned separately from the geometry), so a live swap refreshes it alone.
+    private int[] _cObjTexIndex = Array.Empty<int>();
+    // Per-sphere texture index into _cTextures (spheres are analytic — gathered fresh each frame in
+    // BuildSnapshot — but their textures ride the same pool, so cache the index here).
+    private readonly Dictionary<Sphere, int> _cSphereTex = new Dictionary<Sphere, int>();
 
     private readonly struct CachedObj
     {
@@ -81,10 +101,19 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
         { Obj = obj; VertBase = vb; FaceBase = fb; NodeBase = nb; TriIdxBase = tb; Casts = casts; }
     }
 
-    private void RebuildGpuGeometryIfNeeded()
+    // Rebuilds the two GPU caches independently: the static geometry + BVH (gated by _geomVersion) and the
+    // texture pool (gated by _textureVersion, but ALSO rebuilt on a geometry change since adding/removing a
+    // mesh can change which textures exist and their pool offsets). This decoupling is what lets a live
+    // texture swap refresh only the pool (A3).
+    private void RebuildGpuCachesIfNeeded()
     {
-        if (_cachedGeomVersion == _geomVersion) return;
+        bool geomChanged = _cachedGeomVersion != _geomVersion;
+        if (geomChanged) RebuildGpuGeometry();
+        if (geomChanged || _cachedTextureVersion != _textureVersion) RebuildGpuTexturePool();
+    }
 
+    private void RebuildGpuGeometry()
+    {
         var verts = new List<Vector3>();
         var faces = new List<SnapFace>();
         var nodes = new List<SnapBvhNode>();
@@ -110,13 +139,62 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
         _cachedGeomVersion = _geomVersion;
     }
 
+    // Texture pool: dedup by Texture reference (the cache hands out one instance per file), pack all pixels
+    // into one flat Rgba32 array with a per-texture (offset,w,h) record; each object/sphere gets the index
+    // of its texture (or -1). Aligned to _cObjList by the same _allDisplays Object3d order.
+    private void RebuildGpuTexturePool()
+    {
+        var textures = new List<SnapTexture>();
+        var texPixels = new List<Rgba32>();
+        var texMap = new Dictionary<Texture, int>();
+
+        _cObjTexIndex = new int[_cObjList.Count];
+        int k = 0;
+        foreach (var d in _allDisplays)
+        {
+            if (d is not Object3d o) continue;
+            int texIndex = -1;
+            if (o.Texture is Texture tex)
+            {
+                if (!texMap.TryGetValue(tex, out texIndex))
+                {
+                    texIndex = textures.Count;
+                    textures.Add(new SnapTexture { Offset = texPixels.Count, Width = tex.Width, Height = tex.Height });
+                    texPixels.AddRange(tex.Pixels);
+                    texMap[tex] = texIndex;
+                }
+            }
+            _cObjTexIndex[k++] = texIndex;
+        }
+
+        // Sphere textures share the same dedup'd pool (a texture referenced by both a mesh and a sphere is
+        // uploaded once). The index is cached per sphere for the per-frame snapshot.
+        _cSphereTex.Clear();
+        foreach (var d in _allDisplays)
+        {
+            if (d is not Sphere sp || sp.Texture is not Texture stex) continue;
+            if (!texMap.TryGetValue(stex, out int si))
+            {
+                si = textures.Count;
+                textures.Add(new SnapTexture { Offset = texPixels.Count, Width = stex.Width, Height = stex.Height });
+                texPixels.AddRange(stex.Pixels);
+                texMap[stex] = si;
+            }
+            _cSphereTex[sp] = si;
+        }
+
+        _cTextures = textures.ToArray();
+        _cTexPixels = texPixels.ToArray();
+        _cachedTextureVersion = _textureVersion;
+    }
+
     // Builds a flat, value-only snapshot of the current frame for the GPU renderer. Mesh geometry +
     // per-object BVH live in LOCAL space and are cached (rebuilt only when the mesh set changes); the
     // per-object transforms, spheres, lights and camera refresh every frame. The CPU path never calls
     // this. See SceneSnapshot.cs.
     public SceneSnapshot BuildSnapshot()
     {
-        RebuildGpuGeometryIfNeeded();
+        RebuildGpuCachesIfNeeded();
 
         // Per-frame object instances: current transform (as a rotation basis so the kernel needs no
         // trig), world AABB (cheap pre-cull) and color, plus the cached geometry base offsets.
@@ -138,6 +216,11 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
                 VertBase = e.VertBase, FaceBase = e.FaceBase, NodeBase = e.NodeBase, TriIdxBase = e.TriIdxBase,
                 R = c.R / 255f, G = c.G / 255f, B = c.B / 255f, A = c.A / 255f,
                 CastsShadow = e.Casts ? 1 : 0,
+                TextureIndex = _cObjTexIndex[k],
+                ColorFade = o.ColorFade,
+                TextureScale = o.TextureScale,
+                TextureFace = o.TextureFace,
+                TextureFilter = (int)o.TextureFilter,
             };
         }
 
@@ -148,11 +231,20 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
         {
             if (d is not Sphere sp) continue;
             Rgba32 c = sp.EffectiveColor;
+            Vector3 srot = sp.LocalRotate;
             spheres.Add(new SnapSphere
             {
                 Center = sp.Position, Radius = sp.R,
                 R = c.R / 255f, G = c.G / 255f, B = c.B / 255f, A = c.A / 255f,
                 CastsShadow = shadowSetS.Contains(sp) ? 1 : 0,
+                ColX = new Vector3(1f, 0f, 0f).Rotate(srot),
+                ColY = new Vector3(0f, 1f, 0f).Rotate(srot),
+                ColZ = new Vector3(0f, 0f, 1f).Rotate(srot),
+                TextureIndex = _cSphereTex.TryGetValue(sp, out int sti) ? sti : -1,
+                ColorFade = sp.ColorFade,
+                TextureScale = sp.TextureScale,
+                TextureFace = sp.TextureFace,
+                TextureFilter = (int)sp.TextureFilter,
             });
         }
 
@@ -196,10 +288,13 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
         return new SceneSnapshot
         {
             GeometryVersion = _cachedGeomVersion,
+            TextureVersion = _cachedTextureVersion,
             LocalVerts = _cVerts,
             Faces = _cFaces,
             Nodes = _cNodes,
             TriIdx = _cTriIdx,
+            Textures = _cTextures,
+            TexPixels = _cTexPixels,
             Objects = objects,
             Spheres = spheres.ToArray(),
             Lights = lights.ToArray(),

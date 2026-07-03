@@ -12,7 +12,9 @@ using Nova3DVisualiser.StaticClass;
 using SampleGame.NetworkPackets;
 using SampleGame.Physics;
 using SampleGame.Scenes;
+using SampleGame.Textures;
 using SampleGame.Worlds;
+using System.IO.Compression;
 using System.Text.Json;
 using Terminal.Gui;
 
@@ -37,6 +39,7 @@ class Program
         if (args.Length > 0 && args[0] == "collisiontest") { CollisionSelfTest(); return; }
         if (args.Length > 0 && args[0] == "physicstest") { PhysicsSelfTest(); return; }
         if (args.Length > 0 && args[0] == "gputest") { GpuSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "texturetest") { TextureSelfTest(); return; }
 
         // Crash net: the render loop is async + parallel (Parallel.For), so a crash on a worker
         // thread or an unobserved task never reaches the try/catch below. Capture those globally
@@ -1247,6 +1250,35 @@ class Program
             bool pMove = Math.Abs(movedPos.X - 2f) < 1e-4f && Math.Abs(movedPos.Y - 1f) < 1e-4f && Math.Abs(movedPos.Z + 3f) < 1e-4f;
             Console.WriteLine($"  platform: move -> snapshot Platform.Position=({movedPos.X},{movedPos.Y},{movedPos.Z}) (want 2,1,-3) -> {(pMove ? "ok" : "BAD")}");
             ok &= pMove;
+
+            // B-identity: every editable — INCLUDING the platform — has a stable id >= 0, ids are unique,
+            // and the platform is no longer the -1 sentinel.
+            var idsAll = scene.EditableEntries.Select(e => e.Descriptor.Id).ToList();
+            bool nonNeg = idsAll.All(id => id >= 0);
+            bool unique = idsAll.Distinct().Count() == idsAll.Count;
+            var platB = scene.EditableEntries.First(e => string.Equals(e.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase));
+            bool idOk = nonNeg && unique && platB.Descriptor.Id >= 0;
+            Console.WriteLine($"  identity: ids=[{string.Join(",", idsAll)}] nonNeg={nonNeg}, unique={unique}, platformId={platB.Descriptor.Id} (was -1) -> {(idOk ? "ok" : "BAD")}");
+            ok &= idOk;
+
+            // Derived system name "{type} #{id}" for an unnamed object (and the platform).
+            var cubeB = scene.EditableEntries.First(e => string.Equals(e.Descriptor.Type, "cube", StringComparison.OrdinalIgnoreCase));
+            string cubeSys = PriviewNetworkScene.DisplayName(cubeB);
+            string platSys = PriviewNetworkScene.DisplayName(platB);
+            bool sysOk = cubeSys == $"cube #{cubeB.Descriptor.Id}" && platSys == "platform #0";
+            Console.WriteLine($"  identity: system names cube='{cubeSys}', platform='{platSys}' -> {(sysOk ? "ok" : "BAD")}");
+            ok &= sysOk;
+
+            // A user Name overrides the system name and rides the live snapshot (save/sync path) for both
+            // an ordinary object (via FromInstance/descriptor) and the platform (via PlatformConfig).
+            cubeB.Descriptor.Name = "hero box";
+            if (platB.Platform != null) platB.Platform.Name = "the stage";
+            var liveW = scene.LiveWorldSnapshot();
+            var cubeObj = liveW.Objects.First(o => o.Id == cubeB.Descriptor.Id);
+            bool nameRt = cubeObj.Name == "hero box" && liveW.Platform.Name == "the stage"
+                       && PriviewNetworkScene.DisplayName(cubeB) == "hero box";
+            Console.WriteLine($"  identity: name round-trip cube='{cubeObj.Name}', platform='{liveW.Platform.Name}' -> {(nameRt ? "ok" : "BAD")}");
+            ok &= nameRt;
         }
 
         // Part C2 — a DISABLED (i.e. deleted) platform reloads as ABSENT: no "platform" entry, and the
@@ -1298,6 +1330,126 @@ class Program
             ok &= sok;
         }
 
+        // B-camera — the local player is BODY + CAMERA. (1) The rig math: FIRSTPERSON camera == body;
+        // THIRDPERSON is behind + above along the look; toggling moves the camera while the body input is
+        // unchanged. (2) The body is a real object with a valid id + system name "player #<id>", NOT in
+        // editables (it's the player, not world content), and the default 1st-person camera sits at the body.
+        {
+            var body = new Vector3(3f, 1.5f, -2f);
+            var look = new Vector3(0f, 0.7f, 0f);   // yaw 0.7 rad
+            var camFp = PriviewNetworkScene.CameraPositionFor(body, look, PriviewNetworkScene.CameraMode.FirstPerson);
+            var camTp = PriviewNetworkScene.CameraPositionFor(body, look, PriviewNetworkScene.CameraMode.ThirdPerson);
+            Vector3 fwd = new Vector3(1, 0, 0).Rotate(new Vector3(0, look.Y, 0));
+            Vector3 wantTp = body + fwd * (-4f) + new Vector3(0, 1.5f, 0);   // ThirdPersonBack=4, Up=1.5
+            bool fpOk = (camFp - body).Length() < 1e-4f;                     // 1st person: camera AT the body
+            bool tpOk = (camTp - wantTp).Length() < 1e-4f;                   // 3rd person: exact behind + above
+            bool behindAbove = camTp.Y > body.Y + 0.5f && (camTp - body).Length() > 1f;
+            bool moves = (camTp - camFp).Length() > 1f;                      // toggling modes moves the camera
+            bool rigOk = fpOk && tpOk && behindAbove && moves;
+            Console.WriteLine($"  camera-rig: 1p@body={fpOk}, 3p behind+above exact={tpOk} (Y up={behindAbove}), toggle moves cam={moves} -> {(rigOk ? "ok" : "BAD")}");
+            ok &= rigOk;
+
+            var camWorld = new WorldConfig { Name = "camtest", Platform = new PlatformConfig { Enabled = true }, Objects = new List<WorldObject> { new WorldObject { Id = 0, Type = "cube" } } };
+            var camScene = new PriviewNetworkScene(new DisplayManagerAsync(), camWorld, isServer: false, "127.0.0.1", 0, online: false);
+            camScene.Start();
+            bool bodyIdOk = camScene.LocalBodyId >= 0 && camScene.LocalBodyName == $"player #{camScene.LocalBodyId}";
+            bool excluded = !camScene.LocalBodyInEditables;
+            bool camAtBody = (camScene.CameraPosition - camScene.LocalBodyPosition).Length() < 1e-4f
+                          && camScene.CurrentCameraMode == PriviewNetworkScene.CameraMode.FirstPerson;
+            bool bodyOk = bodyIdOk && excluded && camAtBody;
+            Console.WriteLine($"  camera-body: id={camScene.LocalBodyId} name='{camScene.LocalBodyName}', excluded-from-editables={excluded}, default 1p cam@body={camAtBody} -> {(bodyOk ? "ok" : "BAD")}");
+            ok &= bodyOk;
+        }
+
+        // B-direct-input — TYPED direct entry for numeric fields (Enter → type → parse + CLAMP). Drives the
+        // real BeginFieldEntry/TryAppendEntryChar/Confirm|Cancel path via the headless test hooks: a valid
+        // value sets exactly, an out-of-range value CLAMPS to the field's N/M range, an invalid/empty entry
+        // and Esc both leave the value UNCHANGED; enum/toggle fields reject typing but still cycle on N/M;
+        // and the relocated spawn action still works.
+        {
+            var typeWorld = new WorldConfig
+            {
+                Name = "directinput",
+                Graphics = new GraphicsConfig { },
+                Physics = new PhysicsConfig { CollisionEnabled = true },   // so the Collider enum can cycle
+                Platform = new PlatformConfig { Enabled = false },         // cube is the only editable -> index 0
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 1, Type = "cube", Color = "White",
+                        Position = new Vec3Config { X = 0f, Y = 0f, Z = 0f }, Scale = 2f },
+                },
+            };
+            var s = new PriviewNetworkScene(new DisplayManagerAsync(), typeWorld, isServer: false, "127.0.0.1", 0, online: false);
+            s.Start();
+            var cubeI = s.EditableEntries[0].Instance as Object3d;
+            var inst = s.EditableEntries[0].Instance;
+            bool dvin = cubeI != null && Math.Abs(cubeI!.Scale - 2f) < 1e-4f;   // baseline
+            if (!dvin) Console.WriteLine($"  direct-input: baseline cube scale={cubeI?.Scale} (want 2) -> BAD");
+
+            // (1) Valid typed value sets exactly.
+            bool r1 = s.TypeFieldForTest(0, "Scale", "3.5", confirm: true);
+            bool set1 = r1 && Math.Abs(cubeI!.Scale - 3.5f) < 1e-4f;
+            Console.WriteLine($"  direct-input: type Scale='3.5' -> {cubeI!.Scale:F2} (want 3.50) -> {(set1 ? "ok" : "BAD")}");
+            dvin &= set1;
+
+            // (2) Invalid entry (letters are filtered out -> empty buffer) leaves the value UNCHANGED.
+            s.TypeFieldForTest(0, "Scale", "abc", confirm: true);
+            bool inv = Math.Abs(cubeI!.Scale - 3.5f) < 1e-4f;
+            // ...and a lone '-' (parses to nothing) is also ignored.
+            s.TypeFieldForTest(0, "Scale", "-", confirm: true);
+            inv &= Math.Abs(cubeI!.Scale - 3.5f) < 1e-4f;
+            Console.WriteLine($"  direct-input: invalid 'abc'/'-' -> scale stays {cubeI!.Scale:F2} (want 3.50) -> {(inv ? "ok" : "BAD")}");
+            dvin &= inv;
+
+            // (3) Esc (confirm:false) cancels — value unchanged.
+            s.TypeFieldForTest(0, "Scale", "99", confirm: false);
+            bool esc = Math.Abs(cubeI!.Scale - 3.5f) < 1e-4f;
+            Console.WriteLine($"  direct-input: type '99' + Esc -> scale stays {cubeI!.Scale:F2} (want 3.50) -> {(esc ? "ok" : "BAD")}");
+            dvin &= esc;
+
+            // (4) Out-of-range CLAMPS to the field's N/M range (Scale >= 0.01; Mass >= 0.1; Friction <= 2;
+            //     ColorR <= 255).
+            s.TypeFieldForTest(0, "Scale", "-5", confirm: true);
+            bool clScale = Math.Abs(cubeI!.Scale - 0.01f) < 1e-4f;
+            s.TypeFieldForTest(0, "Mass", "-3", confirm: true);
+            bool clMass = Math.Abs(inst.Mass - 0.1f) < 1e-4f;
+            s.TypeFieldForTest(0, "Friction", "9", confirm: true);
+            bool clFric = Math.Abs(inst.Friction - 2f) < 1e-4f;
+            s.TypeFieldForTest(0, "ColorR", "300", confirm: true);
+            bool clR = inst.Color.R == 255;
+            bool clamp = clScale && clMass && clFric && clR;
+            Console.WriteLine($"  direct-input: clamp Scale(-5)->{cubeI!.Scale:F2}(0.01) Mass(-3)->{inst.Mass:F2}(0.1) Friction(9)->{inst.Friction:F2}(2) ColorR(300)->{inst.Color.R}(255) -> {(clamp ? "ok" : "BAD")}");
+            dvin &= clamp;
+
+            // (5) A precise decimal + a free (unclamped) field both set exactly.
+            s.TypeFieldForTest(0, "PosX", "12.25", confirm: true);
+            s.TypeFieldForTest(0, "ColorFade", "0.5", confirm: true);
+            bool prec = Math.Abs(inst.Position.X - 12.25f) < 1e-4f && Math.Abs(inst.ColorFade - 0.5f) < 1e-4f;
+            Console.WriteLine($"  direct-input: PosX='12.25'->{inst.Position.X:F2}, ColorFade='0.5'->{inst.ColorFade:F2} -> {(prec ? "ok" : "BAD")}");
+            dvin &= prec;
+
+            // (6) Enum/toggle field: N/M still cycles it, but typing is rejected (returns false) and leaves
+            //     it unchanged. Collider AABB -> OBB via N/M; typing "1" into it does nothing.
+            var before = inst.Collider;
+            s.StepFieldForTest(0, "Collider", +1);
+            var afterStep = inst.Collider;
+            bool cycled = before == ColliderShape.Aabb && afterStep == ColliderShape.Obb;
+            bool typedEnum = s.TypeFieldForTest(0, "Collider", "1", confirm: true);   // must return false
+            bool enumUnchanged = inst.Collider == afterStep;
+            bool enumOk = cycled && !typedEnum && enumUnchanged;
+            Console.WriteLine($"  direct-input: enum Collider N/M {before}->{afterStep} (cycled={cycled}), type rejected={!typedEnum}, unchanged={enumUnchanged} -> {(enumOk ? "ok" : "BAD")}");
+            dvin &= enumOk;
+
+            // (7) The relocated spawn action still works (the [B] key calls SpawnCurrent).
+            int countBefore = s.EditableEntries.Count;
+            int countAfter = s.SpawnForTest();
+            bool spawnOk = countAfter == countBefore + 1;
+            Console.WriteLine($"  direct-input: spawn -> editables {countBefore}->{countAfter} (want +1) -> {(spawnOk ? "ok" : "BAD")}");
+            dvin &= spawnOk;
+
+            ok &= dvin;
+        }
+
         Console.WriteLine(ok ? "EDITOR TEST PASSED" : "EDITOR TEST FAILED");
     }
 
@@ -1347,7 +1499,7 @@ class Program
         {
             Name = "synctest",
             Graphics = new GraphicsConfig { Shadows = true, Bvh = false, ExtraLight = true, DisableCameraLight = true, Renderer = "gpu" },
-            Platform = new PlatformConfig { Enabled = true, Size = 12f, Color = "Cyan", Collides = false, Gravity = true, Position = new Vec3Config { X = 1.5f, Y = -0.5f, Z = 2.5f } },
+            Platform = new PlatformConfig { Enabled = true, Name = "the floor", Size = 12f, Color = "Cyan", Collides = false, Gravity = true, Position = new Vec3Config { X = 1.5f, Y = -0.5f, Z = 2.5f } },
             Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 12.5f, CollisionEnabled = false, Restitution = 0.4f },
             Objects = new List<WorldObject>
             {
@@ -1355,9 +1507,9 @@ class Program
                     Position = new Vec3Config { X = 1f, Y = 2f, Z = 3f },
                     Rotation = new Vec3Config { X = 0.1f, Y = 0.2f, Z = 0.3f },
                     Scale = 1.5f, Color = "Red", Anchor = "Center", RotateSpeed = 0.5f, Radius = 1f, Collider = "obb" },
-                new WorldObject { Id = 11, Type = "cube",
+                new WorldObject { Id = 11, Type = "cube", Name = "my crate",
                     Position = new Vec3Config { X = -1f, Y = 0f, Z = 2f },
-                    Scale = 2f, Color = "Green", Collides = false, Gravity = true, Mass = 3.5f, Restitution = 0.8f, Friction = 0.35f, RollingFriction = 0.12f, ColorFade = 0.5f },
+                    Scale = 2f, Color = "Green", Collides = false, Gravity = true, Mass = 3.5f, Restitution = 0.8f, Friction = 0.35f, RollingFriction = 0.12f, ColorFade = 0.5f, Texture = "brick.png", TextureScale = 2f, TextureFace = 4, TextureFilter = 1 },
                 new WorldObject { Id = 12, Type = "sphere",
                     Position = new Vec3Config { X = 4f, Y = 1f, Z = -2f },
                     Radius = 2.5f, Color = "Blue" },
@@ -1372,11 +1524,17 @@ class Program
                     Power = 650f, Color = "Cyan", LightKind = "area",
                     Direction = new Vec3Config { X = 0f, Y = -1f, Z = 0f },
                     LightSize = 2f, AreaShape = "triangle" },
+                new WorldObject { Id = 15, Type = "flatpicture",
+                    Position = new Vec3Config { X = 2f, Y = 1.5f, Z = -3f },
+                    Rotation = new Vec3Config { X = 0f, Y = 1.57f, Z = 0f },
+                    Scale = 1.8f, Color = "Yellow", ColorFade = 0.2f, Collides = false, Texture = "poster.png" },
             }
         };
 
-        // Pack, then round-trip the packet through its own byte (de)serialization.
-        WorldSyncPacket packet = WorldSync.Pack(world, AppPaths.ModelsFolder);
+        // Pack, then round-trip the packet through its own byte (de)serialization. (This world references
+        // brick.png/poster.png which aren't on disk, so TextureData stays empty here — the texture-BYTES
+        // streaming is exercised in its own blocks below with real on-disk PNGs.)
+        WorldSyncPacket packet = WorldSync.Pack(world, AppPaths.ModelsFolder, AppPaths.TexturesFolder);
 
         byte[] bytes;
         using (var ms = new MemoryStream())
@@ -1384,12 +1542,12 @@ class Program
             using (var w = new BinaryWriter(ms)) packet.Serialize(w);
             bytes = ms.ToArray();
         }
-        Console.WriteLine($"Packet size: {bytes.Length} bytes ({world.Objects.Count} objects, {packet.MeshTexts.Count} mesh file(s)).");
+        Console.WriteLine($"Packet size: {bytes.Length} bytes ({world.Objects.Count} objects, {packet.MeshTexts.Count} mesh file(s), {packet.TextureData.Count} inline texture(s)).");
 
         var received = new WorldSyncPacket();
         using (var r = new BinaryReader(new MemoryStream(bytes))) received.Deserialize(r);
 
-        var (back, meshTexts) = WorldSync.Unpack(received);
+        var (back, meshTexts, _) = WorldSync.Unpack(received);
 
         // Compare the recovered config field-by-field.
         string? reason = CompareWorlds(world, back);
@@ -1518,10 +1676,497 @@ class Program
             if (!splitOk) { Fail("MeshChunk split/reassemble mismatch."); return; }
         }
 
+        // ---- Network TEXTURE sync (A1): stream PNG bytes so a peer without the file still sees it ----
+
+        // A distinct 2x2 RGBA image (all channels used) shared by the texture blocks below.
+        var texPixels = new[]
+        {
+            new Rgba32(10, 20, 30, 255), new Rgba32(200, 40, 60, 128),
+            new Rgba32(70, 180, 90, 200), new Rgba32(15, 25, 240, 90),
+        };
+
+        // (1) Texture round-trip: a world referencing an on-disk PNG -> Pack reads its BYTES inline ->
+        // Serialize -> Deserialize -> Unpack yields the identical bytes, which re-decode to the texture.
+        {
+            Directory.CreateDirectory(AppPaths.TexturesFolder);
+            string texName = "__sync_tex_roundtrip__.png";
+            string texPath = Path.Combine(AppPaths.TexturesFolder, texName);
+            byte[] png = PngEncode(2, 2, texPixels, 6, 0);
+            try
+            {
+                File.WriteAllBytes(texPath, png);
+                var texWorld = new WorldConfig
+                {
+                    Name = "textest",
+                    Objects = new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Texture = texName } },
+                };
+                var tp = WorldSync.Pack(texWorld, AppPaths.ModelsFolder, AppPaths.TexturesFolder);
+                bool packedInline = tp.TextureData.TryGetValue(texName, out var packedBytes) && packedBytes!.SequenceEqual(png);
+
+                byte[] tb;
+                using (var ms = new MemoryStream()) { using (var w = new BinaryWriter(ms)) tp.Serialize(w); tb = ms.ToArray(); }
+                var tr = new WorldSyncPacket();
+                using (var r = new BinaryReader(new MemoryStream(tb))) tr.Deserialize(r);
+                var (_, _, texData) = WorldSync.Unpack(tr);
+
+                bool survived = texData.TryGetValue(texName, out var recv) && recv!.SequenceEqual(png);
+                var decoded = PngDecoder.Decode(recv!);
+                bool decodeOk = decoded.Width == 2 && decoded.Height == 2;
+                bool ok = packedInline && survived && decodeOk;
+                Console.WriteLine($"Texture round-trip: packed inline={packedInline}, {png.Length} bytes survive={survived}, decode={decoded.Width}x{decoded.Height} -> {(ok ? "ok" : "BAD")}");
+                if (!ok) { Fail("Texture round-trip lost/altered the PNG bytes."); return; }
+            }
+            finally { try { File.Delete(texPath); } catch { } }
+        }
+
+        // (2) TextureChunk round-trip: the binary chunk packet survives its own serialize/deserialize.
+        {
+            var tc = new TextureChunkPacket { TextureName = "big.png", Index = 2, Total = 5, Data = new byte[] { 0, 255, 1, 254, 128, 64, 200 } };
+            byte[] cbytes;
+            using (var ms = new MemoryStream()) { using (var w = new BinaryWriter(ms)) tc.Serialize(w); cbytes = ms.ToArray(); }
+            var recv = new TextureChunkPacket();
+            using (var r = new BinaryReader(new MemoryStream(cbytes))) recv.Deserialize(r);
+            bool tcOk = recv.TextureName == "big.png" && recv.Index == 2 && recv.Total == 5 && recv.Data.SequenceEqual(tc.Data);
+            Console.WriteLine($"TextureChunk round-trip: {cbytes.Length} bytes, name={recv.TextureName} idx={recv.Index}/{recv.Total} data[{recv.Data.Length}] -> {(tcOk ? "ok" : "BAD")}");
+            if (!tcOk) { Fail("TextureChunk packet round-trip lost fields."); return; }
+        }
+
+        // (3) TextureChunk split/reassemble: cut a > threshold byte[] at the chunk size, reassemble by
+        // Index, assert byte-identical (PNGs are usually > 49 KB, so this is the common path).
+        {
+            const int chunkSize = 16384;      // mirrors PriviewNetworkScene.MeshChunkSize
+            const int threshold = 49152;      // mirrors the inline threshold
+            byte[] original = new byte[60000]; // deterministic > threshold payload (4 chunks)
+            for (int i = 0; i < original.Length; i++) original[i] = (byte)((i * 7 + 3) & 0xFF);
+
+            int total = (original.Length + chunkSize - 1) / chunkSize;
+            var parts = new byte[total][];
+            for (int i = 0; i < total; i++)
+            {
+                int start = i * chunkSize;
+                int len = Math.Min(chunkSize, original.Length - start);
+                parts[i] = new byte[len];
+                Array.Copy(original, start, parts[i], 0, len);
+            }
+            byte[] reassembled = new byte[original.Length];
+            int off = 0;
+            foreach (var p in parts) { Array.Copy(p, 0, reassembled, off, p.Length); off += p.Length; }
+            bool splitOk = original.Length > threshold && total == 4 && reassembled.SequenceEqual(original);
+            Console.WriteLine($"TextureChunk split: len={original.Length} (> {threshold}) -> {total} chunks, reassembled match={reassembled.SequenceEqual(original)} -> {(splitOk ? "ok" : "BAD")}");
+            if (!splitOk) { Fail("TextureChunk split/reassemble mismatch."); return; }
+        }
+
+        // (4) Peer-without-file: the peer's OWN textures/ lacks the file, but the streamed bytes land in
+        // received/textures/ -> loading from there attaches the texture (non-null, correct WxH), while the
+        // default folder still returns null (proving it truly wasn't local).
+        {
+            Directory.CreateDirectory(AppPaths.ReceivedTexturesFolder);
+            string name = "__peer_recv_tex__.png";
+            string absentPath = Path.Combine(AppPaths.TexturesFolder, name);
+            string recvPath = Path.Combine(AppPaths.ReceivedTexturesFolder, name);
+            byte[] png = PngEncode(2, 2, texPixels, 6, 0);
+            try
+            {
+                try { if (File.Exists(absentPath)) File.Delete(absentPath); } catch { }   // ensure the peer lacks it locally
+                File.WriteAllBytes(recvPath, png);                                          // the streamed bytes arrive here
+
+                var fromReceived = TextureLoader.Get(AppPaths.ReceivedTexturesFolder, name);
+                var fromDefault = TextureLoader.Get(AppPaths.TexturesFolder, name);
+                bool peerOk = fromReceived != null && fromReceived.Width == 2 && fromReceived.Height == 2 && fromDefault == null;
+                Console.WriteLine($"Peer-without-file: received-folder load={(fromReceived != null ? $"{fromReceived.Width}x{fromReceived.Height}" : "NULL")}, default-folder load={(fromDefault == null ? "null (absent)" : "present")} -> {(peerOk ? "ok" : "BAD")}");
+                if (!peerOk) { Fail("Peer-without-file: streamed texture did not attach from received/textures."); return; }
+            }
+            finally { try { File.Delete(recvPath); } catch { } }
+        }
+
         Console.WriteLine("WORLD SYNC TEST PASSED");
     }
 
     // Returns null if the two worlds match (within float epsilon), else a reason string.
+    // Headless end-to-end check of the Stage-1 texture pipeline: decode a KNOWN PNG (encoded in-test
+    // with the BCL's ZLibStream so we feed the decoder real, valid PNGs), sample a Texture (nearest +
+    // wrap), interpolate UVs on a triangle, and shade a textured BOX — asserting exact texels throughout.
+    static void TextureSelfTest()
+    {
+        Logger.Init(AppPaths.LogsFolder);
+        Console.WriteLine("=== TEXTURE SELF-TEST ===");
+        bool ok = true;
+        static bool Approx(float a, float b) => MathF.Abs(a - b) < 1e-4f;
+
+        // 1) DECODE — a known 2x2 RGB image (TL red, TR green, BL blue, BR yellow) round-trips exactly.
+        Rgba32 red = new(255, 0, 0), green = new(0, 255, 0), blue = new(0, 0, 255), yellow = new(255, 255, 0);
+        Rgba32[] rgb = { red, green, blue, yellow };
+        var d = PngDecoder.Decode(PngEncode(2, 2, rgb, 2, 0));
+        bool decRgb = d.Width == 2 && d.Height == 2 &&
+            d.Pixels[0] == red && d.Pixels[1] == green && d.Pixels[2] == blue && d.Pixels[3] == yellow;
+        Console.WriteLine($"  decode RGB 2x2: {d.Width}x{d.Height}, pixels match -> {(decRgb ? "ok" : "BAD")}");
+        ok &= decRgb;
+
+        // RGBA (colour type 6) with distinct alphas round-trips including the alpha channel.
+        Rgba32[] rgba = { new(10, 20, 30, 40), new(50, 60, 70, 80), new(90, 100, 110, 120), new(130, 140, 150, 160) };
+        var d2 = PngDecoder.Decode(PngEncode(2, 2, rgba, 6, 0));
+        bool decRgba = d2.Width == 2 && d2.Height == 2;
+        for (int i = 0; i < 4; i++) decRgba &= d2.Pixels[i] == rgba[i];
+        Console.WriteLine($"  decode RGBA 2x2 (with alpha): pixels match -> {(decRgba ? "ok" : "BAD")}");
+        ok &= decRgba;
+
+        // Every PNG filter (1 Sub, 2 Up, 3 Average, 4 Paeth) un-filters back to the same pixels.
+        bool filters = true;
+        for (int ft = 1; ft <= 4; ft++)
+        {
+            var df = PngDecoder.Decode(PngEncode(2, 2, rgba, 6, ft));
+            for (int i = 0; i < 4; i++) filters &= df.Pixels[i] == rgba[i];
+        }
+        Console.WriteLine($"  un-filter Sub/Up/Average/Paeth -> {(filters ? "ok" : "BAD")}");
+        ok &= filters;
+
+        // Unsupported variants are rejected with a CLEAR error (not silently corrupted).
+        bool rejCt = false, rejBd = false;
+        try { PngDecoder.Decode(PngBad(8, 3)); } catch (NotSupportedException ex) { rejCt = ex.Message.Contains("colour type"); }
+        try { PngDecoder.Decode(PngBad(16, 2)); } catch (NotSupportedException ex) { rejBd = ex.Message.Contains("bit depth"); }
+        Console.WriteLine($"  reject colour-type-3 -> {(rejCt ? "ok" : "BAD")}; reject 16-bit -> {(rejBd ? "ok" : "BAD")}");
+        ok &= rejCt && rejBd;
+
+        // 2) SAMPLE — nearest-neighbour at corners/centre, and WRAP outside [0,1).
+        var tex = new Texture(2, 2, rgb);
+        bool corners = tex.Sample(0f, 0f) == red && tex.Sample(0.6f, 0f) == green &&
+                       tex.Sample(0f, 0.6f) == blue && tex.Sample(0.6f, 0.6f) == yellow;
+        bool wrap = tex.Sample(1.0f, 0f) == red && tex.Sample(1.6f, 0.6f) == yellow && tex.Sample(-0.4f, 0f) == green;
+        Console.WriteLine($"  sample corners -> {(corners ? "ok" : "BAD")}; wrap (repeat) -> {(wrap ? "ok" : "BAD")}");
+        ok &= corners && wrap;
+
+        // 2b) BILINEAR SAMPLE (A2) — the 2x2 image is TL red, TR green, BL blue, BR yellow; alphas equal.
+        //   - at a texel edge (fu=fv=0) it equals nearest;  - halfway between two texels = their average;
+        //   - at the centre of the 4 texels = their mean;  - WRAP: the last row blends with the first.
+        byte al = red.A;
+        bool blCentre = tex.SampleBilinear(0f, 0f) == tex.Sample(0f, 0f) && tex.SampleBilinear(0f, 0f) == red;
+        bool blBetween = tex.SampleBilinear(0.25f, 0f) == new Rgba32(128, 128, 0, al);       // avg(red, green)
+        bool blQuad = tex.SampleBilinear(0.25f, 0.25f) == new Rgba32(128, 128, 64, al);       // mean(red, green, blue, yellow)
+        bool blWrap = tex.SampleBilinear(0f, 0.75f) == new Rgba32(128, 0, 128, al);           // avg(blue, wrapped red)
+        Console.WriteLine($"  bilinear: centre=nearest -> {(blCentre ? "ok" : "BAD")}; between=avg -> {(blBetween ? "ok" : "BAD")}; " +
+                          $"4-centre=mean -> {(blQuad ? "ok" : "BAD")}; wrap edge -> {(blWrap ? "ok" : "BAD")}");
+        ok &= blCentre && blBetween && blQuad && blWrap;
+
+        // 3) UV-INTERP — a triangle with corner UVs (0,0)/(1,0)/(0,1), ray hitting bary (0.8,0.1).
+        var triV = new Vector3[] { new(0, 0, 0), new(1, 0, 0), new(0, 1, 0) };
+        var tri = new Triangle(new int[] { 0, 1, 2 },
+            new Vector3(0, 0, 1), new Vector3(0, 0, 1), new Vector3(0, 0, 1),
+            new Vector2(0, 0), new Vector2(1, 0), new Vector2(0, 1));
+        var triRd = tri.GetRenderData(new Ray(new Vector3(0.8f, 0.1f, 5f), new Vector3(0, 0, -1f)), triV, Vector3.Zero);
+        bool uvInterp = triRd.Intersection > -1f && Approx(triRd.Uv.X, 0.8f) && Approx(triRd.Uv.Y, 0.1f);
+        Console.WriteLine($"  uv-interp: hit uv=({triRd.Uv.X:F3},{triRd.Uv.Y:F3}) want (0.800,0.100) -> {(uvInterp ? "ok" : "BAD")}");
+        ok &= uvInterp;
+
+        // 4) END-TO-END — a textured cube; a ray hits the +Z face at (0.5,-0.2,1) => uv (0.75,0.40).
+        const int W = 8, H = 8;
+        var px = new Rgba32[W * H];
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                px[y * W + x] = new Rgba32((byte)(x * 32), (byte)(y * 32), 128, 255);   // every texel distinct
+        var tex4 = new Texture(W, H, px, "unit.png");
+        var box = PriviewNetworkScene.CreateCube();
+        box.Texture = tex4;   // Color defaults White, ColorFade 0 -> the shaded colour is the raw texel
+        var boxRd = box.GetRenderData(new Ray(new Vector3(0.5f, -0.2f, 5f), new Vector3(0, 0, -1f)));
+        float eu = (0.5f + 1f) * 0.5f, ev = (-0.2f + 1f) * 0.5f;     // +Z face maps (x,y) -> ((x+1)/2,(y+1)/2)
+        Rgba32 texel = tex4.Sample(eu, ev);
+        Rgba32 expected = box.ShadeTexel(texel);
+        bool e2e = boxRd.Intersection > -1f && Approx(boxRd.Uv.X, eu) && Approx(boxRd.Uv.Y, ev) &&
+                   boxRd.Color == expected && expected == texel;
+        Console.WriteLine($"  end-to-end box: uv=({boxRd.Uv.X:F3},{boxRd.Uv.Y:F3}) want ({eu:F3},{ev:F3}); " +
+                          $"colour=({boxRd.Color.R},{boxRd.Color.G},{boxRd.Color.B}) want texel ({texel.R},{texel.G},{texel.B}) -> {(e2e ? "ok" : "BAD")}");
+        ok &= e2e;
+
+        // 5) PRIMITIVE UVs (Stage 3) — ramp + pyramid generate procedural per-corner UVs. They interpolate
+        // linearly/barycentrically like the cube, so their generated corner UVs must match the hand-derived
+        // per-face unwrap exactly (and they get BIT-EXACT GPU parity — proven by gputest).
+        static bool UvEq(Vector2 uv, float u, float v) => Approx(uv.X, u) && Approx(uv.Y, v);
+
+        var ramp = PriviewNetworkScene.CreateRamp();
+        var rf = ramp.Faces;
+        bool rampUv =
+            UvEq(rf[0].Uv0, 0, 1) && UvEq(rf[0].Uv1, 0, 0) && UvEq(rf[0].Uv2, 1, 0) &&       // bottom (-Y): drop Y
+            UvEq(rf[2].Uv0, 1, 0) && UvEq(rf[2].Uv1, 1, 1) && UvEq(rf[2].Uv2, 0, 1) &&       // sloped top: depth×rise
+            UvEq(rf[6].Uv0, 0, 0) && UvEq(rf[6].Uv1, 1, 0) && UvEq(rf[6].Uv2, 1, 1);         // front cap (+Z): drop Z
+        Console.WriteLine($"  ramp UVs (bottom/slope/front-cap) -> {(rampUv ? "ok" : "BAD")}");
+        ok &= rampUv;
+
+        var pyr = PriviewNetworkScene.CreatePyramid();
+        var pf = pyr.Faces;
+        bool pyrUv =
+            UvEq(pf[0].Uv0, 0, 0) && UvEq(pf[0].Uv1, 1, 0) && UvEq(pf[0].Uv2, 1, 1) &&       // base (-Y): drop Y
+            UvEq(pf[2].Uv0, 0, 0) && UvEq(pf[2].Uv1, 0.5f, 1) && UvEq(pf[2].Uv2, 1, 0);      // a side: draped triangle
+        Console.WriteLine($"  pyramid UVs (base/side) -> {(pyrUv ? "ok" : "BAD")}");
+        ok &= pyrUv;
+
+        // 6) SPHERE UV (Stage 3) — equirectangular map at the cardinal directions + the -X seam (u wraps
+        // 0↔1) + both poles, and that LocalRotate rotates the mapping (a +X world normal on a Y-90° sphere
+        // reads the texel that +Z reads unrotated). Matches the GPU kernel's SphereUv but for the atan2/asin band.
+        bool sphereUv =
+            UvEq(Sphere.EquirectangularUv(new Vector3(1, 0, 0)), 0.5f, 0.5f) &&    // +X equator
+            UvEq(Sphere.EquirectangularUv(new Vector3(0, 0, 1)), 0.75f, 0.5f) &&   // +Z
+            UvEq(Sphere.EquirectangularUv(new Vector3(0, 0, -1)), 0.25f, 0.5f) &&  // -Z
+            UvEq(Sphere.EquirectangularUv(new Vector3(0, 1, 0)), 0.5f, 0f) &&      // +Y north pole
+            UvEq(Sphere.EquirectangularUv(new Vector3(0, -1, 0)), 0.5f, 1f) &&     // -Y south pole
+            UvEq(Sphere.EquirectangularUv(new Vector3(-1, 0, 0)), 1f, 0.5f);       // -X seam
+        bool sphereRot = UvEq(
+            Sphere.EquirectangularUv(new Vector3(1, 0, 0).RotateInverse(new Vector3(0, MathF.PI / 2f, 0))), 0.75f, 0.5f);
+        Console.WriteLine($"  sphere UV cardinals+seam+poles -> {(sphereUv ? "ok" : "BAD")}; rotates with object -> {(sphereRot ? "ok" : "BAD")}");
+        ok &= sphereUv && sphereRot;
+
+        // 7) FLAT PICTURE (Stage 3b) — a two-sided vertical quad whose four corners map the FULL texture
+        // (0,0)/(1,0)/(0,1)/(1,1), right-side-up. Front AND back faces (reversed winding) both carry UVs
+        // (mirrored on the back). Linear interp → BIT-EXACT GPU parity (proven by gputest).
+        var pic = PriviewNetworkScene.CreateFlatPicture();
+        var cf = pic.Faces;
+        bool picUv =
+            cf.Count == 4 &&                                                              // 2 front + 2 back tris (two-sided)
+            UvEq(cf[0].Uv0, 0, 1) && UvEq(cf[0].Uv1, 1, 1) && UvEq(cf[0].Uv2, 1, 0) &&    // front: BL,BR,TR
+            UvEq(cf[1].Uv0, 0, 1) && UvEq(cf[1].Uv1, 1, 0) && UvEq(cf[1].Uv2, 0, 0) &&    // front: BL,TR,TL
+            UvEq(cf[2].Uv0, 0, 1) && UvEq(cf[2].Uv1, 1, 0) && UvEq(cf[2].Uv2, 1, 1);      // back (reversed): BL,TR,BR
+        Console.WriteLine($"  flat-picture UVs (front+back corners, {cf.Count} tris) -> {(picUv ? "ok" : "BAD")}");
+        ok &= picUv;
+
+        // 8) CYLINDER + CONE (Stage-3 tail) — procedural UVs added because the engine's PER-FACE-CORNER
+        // UV model needs NO seam-vertex duplication: side u = angle fraction (v: top 0, bottom 1), caps
+        // wrap the ring onto a disc (centre 0.5,0.5). Linear interp → bit-exact parity like the others.
+        var cyl = PriviewNetworkScene.CreateCylinder();
+        var yf = cyl.Faces;
+        bool cylUv =
+            UvEq(yf[0].Uv0, 0f, 1f) && UvEq(yf[0].Uv1, 1f / 16f, 0f) && UvEq(yf[0].Uv2, 1f / 16f, 1f) &&   // first side-quad tri
+            UvEq(yf[2].Uv0, 0.5f, 0.5f) && UvEq(yf[2].Uv2, 1f, 0.5f);                                       // top-cap centre + ring @angle0
+        var cone = PriviewNetworkScene.CreateCone();
+        var nf = cone.Faces;
+        bool coneUv =
+            UvEq(nf[0].Uv0, 0f, 1f) && UvEq(nf[0].Uv1, 1f / 32f, 0f) && UvEq(nf[0].Uv2, 1f / 16f, 1f) &&    // side: base→apex-midpoint→base
+            UvEq(nf[1].Uv0, 0.5f, 0.5f) && UvEq(nf[1].Uv1, 1f, 0.5f);                                        // base-cap centre + ring @angle0
+        Console.WriteLine($"  cylinder/cone UVs (side+cap) -> {((cylUv && coneUv) ? "ok" : "BAD")}");
+        ok &= cylUv && coneUv;
+
+        // 9) TEXTURE PARAMS (Stage 4) — face-group tagging, UV scale/tiling, per-face gating, options list.
+        // (a) The cube's 12 triangles tag into 6 groups (0..5 = +X,-X,+Y,-Y,+Z,-Z), two triangles each.
+        var pcube = PriviewNetworkScene.CreateCube();
+        var counts = new int[6];
+        bool groupsInRange = true;
+        foreach (var t in pcube.Faces) { if (t.Group >= 0 && t.Group < 6) counts[t.Group]++; else groupsInRange = false; }
+        bool cubeGroups = groupsInRange;
+        for (int gi = 0; gi < 6; gi++) if (counts[gi] != 2) cubeGroups = false;
+        Console.WriteLine($"  cube face-groups: [{string.Join(",", counts)}] want all 2 -> {(cubeGroups ? "ok" : "BAD")}");
+        ok &= cubeGroups;
+
+        // (b) Scale tiling: the +Z hit at (0.5,-0.2,1) → uv (0.75,0.40); with TextureScale=2 the sampled
+        // texel is tex4.Sample(0.75*2, 0.40*2) — wrap tiles it. (tex4/eu/ev are from section 4.)
+        var scube = PriviewNetworkScene.CreateCube();
+        scube.Texture = tex4; scube.TextureScale = 2f;
+        var scubeRd = scube.GetRenderData(new Ray(new Vector3(0.5f, -0.2f, 5f), new Vector3(0, 0, -1f)));
+        Rgba32 scaledTexel = scube.ShadeTexel(tex4.Sample(eu * 2f, ev * 2f));
+        bool scaleTiling = scubeRd.Intersection > -1f && scubeRd.Color == scaledTexel && scaledTexel != tex4.Sample(eu, ev);
+        Console.WriteLine($"  scale tiling (x2): colour=({scubeRd.Color.R},{scubeRd.Color.G},{scubeRd.Color.B}) want ({scaledTexel.R},{scaledTexel.G},{scaledTexel.B}) -> {(scaleTiling ? "ok" : "BAD")}");
+        ok &= scaleTiling;
+
+        // (c) Per-face gate: with TextureFace=+Z (group 4) the +Z hit is textured; set to +X (group 0) and
+        // the SAME +Z hit shows flat colour instead.
+        var fcube = PriviewNetworkScene.CreateCube();
+        fcube.Texture = tex4; fcube.Color = new Rgba32(30, 60, 90);
+        fcube.TextureFace = 4;
+        var fOn = fcube.GetRenderData(new Ray(new Vector3(0.5f, -0.2f, 5f), new Vector3(0, 0, -1f)));
+        bool faceOn = fOn.Intersection > -1f && fOn.Group == 4 && fOn.Color == fcube.ShadeTexel(tex4.Sample(eu, ev));
+        fcube.TextureFace = 0;
+        var fOff = fcube.GetRenderData(new Ray(new Vector3(0.5f, -0.2f, 5f), new Vector3(0, 0, -1f)));
+        bool faceOff = fOff.Intersection > -1f && fOff.Color == fcube.EffectiveColor;
+        Console.WriteLine($"  texture-face gate: +Z textured -> {(faceOn ? "ok" : "BAD")}; +Z flat when face=+X -> {(faceOff ? "ok" : "BAD")}");
+        ok &= faceOn && faceOff;
+
+        // (d) Face options: a cube exposes 6 sides; a sphere (analytic, whole) exposes none.
+        int cubeOpts = PriviewNetworkScene.TextureFaceOptions("cube").Length;
+        int sphOpts = PriviewNetworkScene.TextureFaceOptions("sphere").Length;
+        bool faceOpts = cubeOpts == 6 && sphOpts == 0;
+        Console.WriteLine($"  face options: cube={cubeOpts} (want 6), sphere={sphOpts} (want 0) -> {(faceOpts ? "ok" : "BAD")}");
+        ok &= faceOpts;
+
+        // 10) IMPORTED .OBJ UVs (Stage 5) — ObjLoader now parses `vt` and feeds per-corner UVs with the
+        // OBJ→image v-flip (v_tex = 1 - v_obj). A 2-tri quad with known vt: verts 1..4 at vt (0,0)(1,0)(1,1)(0,1)
+        // → after the flip the corners read (0,1)(1,1)(1,0)(0,0); the fan tris are (1,2,3) and (1,3,4).
+        const string quadObj = "v 0 -1 -1\nv 0 -1 1\nv 0 1 1\nv 0 1 -1\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nvn -1 0 0\nf 1/1/1 2/2/1 3/3/1 4/4/1\n";
+        var quadMesh = ObjLoader.Load(WriteObjFixture("uvquad", quadObj));
+        var qf = quadMesh.Faces;
+        bool objUv = qf.Count == 2 &&
+            UvEq(qf[0].Uv0, 0, 1) && UvEq(qf[0].Uv1, 1, 1) && UvEq(qf[0].Uv2, 1, 0) &&   // tri (v1,v2,v3)
+            UvEq(qf[1].Uv0, 0, 1) && UvEq(qf[1].Uv1, 1, 0) && UvEq(qf[1].Uv2, 0, 0);     // tri (v1,v3,v4)
+        Console.WriteLine($"  imported .obj UVs (v-flipped, {qf.Count} tris) -> {(objUv ? "ok" : "BAD")}");
+        ok &= objUv;
+
+        // A vt-less .obj yields Zero UVs (untextured meshes stay byte-identical).
+        const string plainObj = "v 0 -1 -1\nv 0 -1 1\nv 0 1 1\nvn -1 0 0\nf 1//1 2//1 3//1\n";
+        var plainMesh = ObjLoader.Load(WriteObjFixture("nouvquad", plainObj));
+        bool objNoUv = plainMesh.Faces.Count == 1 &&
+            UvEq(plainMesh.Faces[0].Uv0, 0, 0) && UvEq(plainMesh.Faces[0].Uv1, 0, 0) && UvEq(plainMesh.Faces[0].Uv2, 0, 0);
+        Console.WriteLine($"  vt-less .obj -> Zero UVs -> {(objNoUv ? "ok" : "BAD")}");
+        ok &= objNoUv;
+
+        // 11) REAL DISK PATH (diagnostics) — exercise the actual disk→decode→attach chain in the REAL
+        // AppPaths.TexturesFolder. A known-good 8-bit RGBA PNG must load; a JPEG-magic file renamed .png
+        // must fail with a message that NAMES it as a JPEG. Uses unique names + cleans up after itself.
+        Console.WriteLine($"  resolved textures folder: {AppPaths.TexturesFolder}");
+        Directory.CreateDirectory(AppPaths.TexturesFolder);
+        string goodName = "__texload_selftest__.png";
+        string jpgName = "__texload_jpeg__.png";
+        string goodPath = Path.Combine(AppPaths.TexturesFolder, goodName);
+        string jpgPath = Path.Combine(AppPaths.TexturesFolder, jpgName);
+        try
+        {
+            File.WriteAllBytes(goodPath, PngEncode(2, 2, rgba, 6, 0));                          // real 8-bit RGBA PNG
+            File.WriteAllBytes(jpgPath, new byte[] { 0xFF, 0xD8, 0xFF, 0xE0, 0, 16, 0x4A, 0x46, 0x49, 0x46, 0, 1 });  // JPEG/JFIF magic
+
+            var loaded = TextureLoader.Get(goodName);
+            bool diskLoad = loaded != null && loaded.Width == 2 && loaded.Height == 2;
+            Console.WriteLine($"  disk load (real loader): '{goodName}' -> {(loaded != null ? $"{loaded.Width}x{loaded.Height}" : "NULL")} -> {(diskLoad ? "ok" : "BAD")}");
+            ok &= diskLoad;
+
+            string jpgReason = "";
+            try { PngDecoder.Decode(File.ReadAllBytes(jpgPath)); }
+            catch (Exception ex) { jpgReason = ex.Message; }
+            bool jpgClear = jpgReason.Contains("JPEG", StringComparison.OrdinalIgnoreCase);
+            Console.WriteLine($"  jpeg-as-png names the format: \"{jpgReason}\" -> {(jpgClear ? "ok" : "BAD")}");
+            ok &= jpgClear;
+        }
+        finally
+        {
+            try { File.Delete(goodPath); } catch { }
+            try { File.Delete(jpgPath); } catch { }
+        }
+
+        Console.WriteLine(ok ? "TEXTURE TEST PASSED" : "TEXTURE TEST FAILED");
+    }
+
+    // Writes a fixture .obj into a temp folder and returns its full path so ObjLoader.Load can read it.
+    // Used by the texture self-tests to exercise the .obj `vt` parsing without polluting the models/ library.
+    static string WriteObjFixture(string name, string content)
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "nova_tex_fixtures");
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, name + ".obj");
+        File.WriteAllText(path, content);
+        return path;
+    }
+
+    // --- tiny PNG ENCODER (test-only): produce a real, valid PNG so the decoder is exercised end-to-end.
+    // Applies one filter type to every scanline; compresses via ZLibStream (zlib header + Adler-32); writes
+    // IHDR/IDAT/IEND with correct CRC-32s. colorType 2 = RGB, 6 = RGBA; bit depth fixed at 8.
+    static byte[] PngEncode(int w, int h, Rgba32[] pixels, int colorType, int filterType)
+    {
+        int channels = colorType == 6 ? 4 : 3;
+        int stride = w * channels;
+        byte[] raw = new byte[h * (stride + 1)];
+        byte[] prev = new byte[stride];
+        int rp = 0;
+        for (int y = 0; y < h; y++)
+        {
+            byte[] cur = new byte[stride];
+            for (int x = 0; x < w; x++)
+            {
+                Rgba32 p = pixels[y * w + x];
+                int o = x * channels;
+                cur[o] = p.R; cur[o + 1] = p.G; cur[o + 2] = p.B;
+                if (channels == 4) cur[o + 3] = p.A;
+            }
+            raw[rp++] = (byte)filterType;
+            for (int x = 0; x < stride; x++)
+            {
+                int a = x >= channels ? cur[x - channels] : 0;
+                int b = prev[x];
+                int c = x >= channels ? prev[x - channels] : 0;
+                int fv = filterType switch
+                {
+                    1 => cur[x] - a,
+                    2 => cur[x] - b,
+                    3 => cur[x] - (a + b) / 2,
+                    4 => cur[x] - PngPaeth(a, b, c),
+                    _ => cur[x],
+                };
+                raw[rp++] = (byte)(fv & 0xFF);
+            }
+            prev = cur;
+        }
+
+        byte[] idat;
+        using (var ms = new MemoryStream())
+        {
+            using (var z = new ZLibStream(ms, CompressionLevel.Optimal, leaveOpen: true)) z.Write(raw, 0, raw.Length);
+            idat = ms.ToArray();
+        }
+
+        byte[] ihdr = new byte[13];
+        PngPutBE32(ihdr, 0, w); PngPutBE32(ihdr, 4, h);
+        ihdr[8] = 8; ihdr[9] = (byte)colorType;   // [10] compression, [11] filter, [12] interlace all 0
+
+        using var outMs = new MemoryStream();
+        outMs.Write(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }, 0, 8);
+        PngWriteChunk(outMs, "IHDR", ihdr);
+        PngWriteChunk(outMs, "IDAT", idat);
+        PngWriteChunk(outMs, "IEND", Array.Empty<byte>());
+        return outMs.ToArray();
+    }
+
+    // A structurally valid PNG whose IHDR declares an UNSUPPORTED format (the decoder must reject it at
+    // the IHDR check, before inflating — so the IDAT contents are irrelevant).
+    static byte[] PngBad(int bitDepth, int colorType)
+    {
+        byte[] ihdr = new byte[13];
+        PngPutBE32(ihdr, 0, 1); PngPutBE32(ihdr, 4, 1);
+        ihdr[8] = (byte)bitDepth; ihdr[9] = (byte)colorType;
+        byte[] idat;
+        using (var ms = new MemoryStream())
+        {
+            using (var z = new ZLibStream(ms, CompressionLevel.Optimal, leaveOpen: true)) z.Write(new byte[] { 0, 0 }, 0, 2);
+            idat = ms.ToArray();
+        }
+        using var outMs = new MemoryStream();
+        outMs.Write(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }, 0, 8);
+        PngWriteChunk(outMs, "IHDR", ihdr);
+        PngWriteChunk(outMs, "IDAT", idat);
+        PngWriteChunk(outMs, "IEND", Array.Empty<byte>());
+        return outMs.ToArray();
+    }
+
+    static void PngWriteChunk(MemoryStream s, string type, byte[] data)
+    {
+        byte[] lenb = new byte[4]; PngPutBE32(lenb, 0, data.Length); s.Write(lenb, 0, 4);
+        byte[] typeb = System.Text.Encoding.ASCII.GetBytes(type);
+        s.Write(typeb, 0, typeb.Length);
+        s.Write(data, 0, data.Length);
+        byte[] crcIn = new byte[typeb.Length + data.Length];
+        Buffer.BlockCopy(typeb, 0, crcIn, 0, typeb.Length);
+        Buffer.BlockCopy(data, 0, crcIn, typeb.Length, data.Length);
+        byte[] crcb = new byte[4]; PngPutBE32(crcb, 0, unchecked((int)PngCrc32(crcIn))); s.Write(crcb, 0, 4);
+    }
+
+    static uint PngCrc32(byte[] data)
+    {
+        uint crc = 0xFFFFFFFFu;
+        foreach (byte bb in data)
+        {
+            crc ^= bb;
+            for (int k = 0; k < 8; k++) crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320u : crc >> 1;
+        }
+        return crc ^ 0xFFFFFFFFu;
+    }
+
+    static int PngPaeth(int a, int b, int c)
+    {
+        int p = a + b - c;
+        int pa = Math.Abs(p - a), pb = Math.Abs(p - b), pc = Math.Abs(p - c);
+        if (pa <= pb && pa <= pc) return a;
+        return pb <= pc ? b : c;
+    }
+
+    static void PngPutBE32(byte[] buf, int off, int v)
+    {
+        buf[off] = (byte)((v >> 24) & 0xFF);
+        buf[off + 1] = (byte)((v >> 16) & 0xFF);
+        buf[off + 2] = (byte)((v >> 8) & 0xFF);
+        buf[off + 3] = (byte)(v & 0xFF);
+    }
+
     static string? CompareWorlds(WorldConfig a, WorldConfig b)
     {
         const float eps = 1e-4f;
@@ -1532,7 +2177,8 @@ class Program
             a.Graphics.ExtraLight != b.Graphics.ExtraLight || a.Graphics.DisableCameraLight != b.Graphics.DisableCameraLight ||
             a.Graphics.Renderer != b.Graphics.Renderer)
             return "graphics flags differ";
-        if (a.Platform.Enabled != b.Platform.Enabled || !Eq(a.Platform.Size, b.Platform.Size) ||
+        if (a.Platform.Name != b.Platform.Name ||
+            a.Platform.Enabled != b.Platform.Enabled || !Eq(a.Platform.Size, b.Platform.Size) ||
             PriviewNetworkScene.ParseColor(a.Platform.Color, Rgba32.White) != PriviewNetworkScene.ParseColor(b.Platform.Color, Rgba32.White) ||
             a.Platform.Shape != b.Platform.Shape || !Eq(a.Platform.Width, b.Platform.Width) || !Eq(a.Platform.Depth, b.Platform.Depth) ||
             a.Platform.Collides != b.Platform.Collides || a.Platform.Gravity != b.Platform.Gravity ||
@@ -1549,6 +2195,7 @@ class Program
             var x = a.Objects[i];
             var y = b.Objects[i];
             if (x.Id != y.Id) return $"object[{i}].Id {x.Id} != {y.Id}";
+            if (x.Name != y.Name) return $"object[{i}].Name '{x.Name}' != '{y.Name}'";
             if (x.Type != y.Type) return $"object[{i}].Type '{x.Type}' != '{y.Type}'";
             if (x.Mesh != y.Mesh) return $"object[{i}].Mesh '{x.Mesh}' != '{y.Mesh}'";
             if (!Eq(x.Position.X, y.Position.X) || !Eq(x.Position.Y, y.Position.Y) || !Eq(x.Position.Z, y.Position.Z))
@@ -1569,6 +2216,10 @@ class Program
             if (!Eq(x.Friction, y.Friction)) return $"object[{i}].Friction {x.Friction} != {y.Friction}";
             if (!Eq(x.RollingFriction, y.RollingFriction)) return $"object[{i}].RollingFriction {x.RollingFriction} != {y.RollingFriction}";
             if (!Eq(x.ColorFade, y.ColorFade)) return $"object[{i}].ColorFade {x.ColorFade} != {y.ColorFade}";
+            if (x.Texture != y.Texture) return $"object[{i}].Texture '{x.Texture}' != '{y.Texture}'";
+            if (!Eq(x.TextureScale, y.TextureScale)) return $"object[{i}].TextureScale {x.TextureScale} != {y.TextureScale}";
+            if (x.TextureFace != y.TextureFace) return $"object[{i}].TextureFace {x.TextureFace} != {y.TextureFace}";
+            if (x.TextureFilter != y.TextureFilter) return $"object[{i}].TextureFilter {x.TextureFilter} != {y.TextureFilter}";
             if (!Eq(x.Power, y.Power)) return $"object[{i}].Power differs";
             // ---- light-only rich fields ----
             if (x.LightKind != y.LightKind) return $"object[{i}].LightKind '{x.LightKind}' != '{y.LightKind}'";
@@ -2558,6 +3209,261 @@ class Program
         public override void Update() { }
     }
 
+    // Stage-2 texture-parity scene: a TEXTURED cube (a known unique-texel image) plus an UNtextured cube,
+    // so the GPU texture path and the flat-colour path are compared side by side against the CPU. Shadows
+    // are off (this scene exists to prove texel-fetch parity is EXACT, independent of the shadow band).
+    sealed class GpuTextureTestScene : Scene
+    {
+        public GpuTextureTestScene() : base(new DisplayManagerAsync()) { }
+
+        public override void Start()
+        {
+            Exposure = 0.05f; Ambient = 0.1f; EnableShadows = false;
+
+            // A small texture with a UNIQUE texel per cell, so any wrong fetch (bad UV / wrap / channel
+            // order / offset) shows up as a colour mismatch rather than blending away.
+            const int TW = 8, TH = 8;
+            var px = new Rgba32[TW * TH];
+            for (int y = 0; y < TH; y++)
+                for (int x = 0; x < TW; x++)
+                    px[y * TW + x] = new Rgba32((byte)(20 + x * 28), (byte)(20 + y * 28), 128, 255);
+            var tex = new Texture(TW, TH, px, "gputex");
+
+            // Textured cube, tilted so several faces show and the UV interpolation is genuinely 3D.
+            var cube = PriviewNetworkScene.CreateCube();
+            cube.Position = new Vector3(8f, 0f, 0f);
+            cube.Scale = 2.2f;
+            cube.LocalRotate = new Vector3(0.3f, 0.5f, 0.15f);
+            cube.Color = Rgba32.White;   // unused when textured (both renderers sample the texel), but a bug would show white
+            cube.Texture = tex;
+            cube.UpdateGeometry();
+            AddDisplaysObject(cube);
+
+            // A second, UNtextured cube alongside — textured + flat objects must coexist at parity.
+            var plain = PriviewNetworkScene.CreateCube();
+            plain.Position = new Vector3(11f, 1.6f, 2.2f);
+            plain.Scale = 1.2f;
+            plain.Color = new Rgba32(80, 200, 120);
+            plain.UpdateGeometry();
+            AddDisplaysObject(plain);
+
+            // Textured RAMP + PYRAMID (Stage 3) — Object3d meshes whose procedural per-corner UVs
+            // interpolate barycentrically exactly like the cube, so they must hit the SAME texel-exact
+            // parity (Δ=0 interior). Tilted so several faces + the UV interpolation are genuinely 3D.
+            var ramp = PriviewNetworkScene.CreateRamp();
+            ramp.Position = new Vector3(9f, -1.9f, -2.2f);
+            ramp.Scale = 1.3f;
+            ramp.LocalRotate = new Vector3(0.2f, 0.6f, 0.05f);
+            ramp.Texture = tex;
+            ramp.UpdateGeometry();
+            AddDisplaysObject(ramp);
+
+            var pyr = PriviewNetworkScene.CreatePyramid();
+            pyr.Position = new Vector3(10f, 1.9f, -2.4f);
+            pyr.Scale = 1.3f;
+            pyr.LocalRotate = new Vector3(0.1f, 0.9f, 0.15f);
+            pyr.Texture = tex;
+            pyr.UpdateGeometry();
+            AddDisplaysObject(pyr);
+
+            // Textured FLAT PICTURE (Stage 3b) — a two-sided vertical quad, rotated to face the camera and
+            // placed CLOSE + in front so it's unoccluded. Its linear quad UVs must be texel-EXACT (Δ=0).
+            var pic = PriviewNetworkScene.CreateFlatPicture();
+            pic.Position = new Vector3(5.5f, 0f, 1.3f);
+            pic.Scale = 1.4f;
+            pic.LocalRotate = new Vector3(0.1f, 1.3f, 0.05f);
+            pic.Texture = tex;
+            pic.UpdateGeometry();
+            AddDisplaysObject(pic);
+
+            // Textured CYLINDER + CONE (Stage-3 tail) — their per-face-corner UVs interpolate linearly like
+            // every other mesh primitive, so they too must be texel-EXACT (Δ=0). Placed clear of the others.
+            var cyl = PriviewNetworkScene.CreateCylinder();
+            cyl.Position = new Vector3(7f, 2.2f, -1.5f);
+            cyl.Scale = 1.2f;
+            cyl.LocalRotate = new Vector3(0.25f, 0.4f, 0.1f);
+            cyl.Texture = tex;
+            cyl.UpdateGeometry();
+            AddDisplaysObject(cyl);
+
+            var cone = PriviewNetworkScene.CreateCone();
+            cone.Position = new Vector3(7f, -2.2f, 1.8f);
+            cone.Scale = 1.2f;
+            cone.LocalRotate = new Vector3(0.15f, 0.7f, 0.2f);
+            cone.Texture = tex;
+            cone.UpdateGeometry();
+            AddDisplaysObject(cone);
+
+            AddLight(new Light(new Vector3(2f, 5f, 1f), 600f) { Rgb = new Vector3(1f, 0.95f, 0.9f) });
+
+            SetMainCamera(new Camera(new Vector3(0f, 0f, 0f), Vector3.Zero));
+        }
+
+        public override void Update() { }
+    }
+
+    // Stage-3 sphere-texture parity: a TEXTURED sphere (analytic equirectangular UV via atan2/asin) beside
+    // an UNtextured cube. Because atan2/asin round slightly differently on the GPU, a THIN seam/pole band
+    // may differ CPU↔GPU (tolerated like the shadow band); the untextured cube stays exact. Shadows off.
+    sealed class GpuSphereTextureTestScene : Scene
+    {
+        public GpuSphereTextureTestScene() : base(new DisplayManagerAsync()) { }
+
+        public override void Start()
+        {
+            Exposure = 0.05f; Ambient = 0.1f; EnableShadows = false;
+
+            // Unique-texel image (G held at 100 so every hit stays above the brightness threshold — a dark
+            // texel at a seam pixel must not read as a background "miss" and inflate the silhouette count).
+            const int TW = 8, TH = 8;
+            var px = new Rgba32[TW * TH];
+            for (int y = 0; y < TH; y++)
+                for (int x = 0; x < TW; x++)
+                    px[y * TW + x] = new Rgba32((byte)(40 + x * 24), 100, (byte)(40 + y * 24), 255);
+            var tex = new Texture(TW, TH, px, "gpusphere");
+
+            // Zero LocalRotate: the analytic intersection is then identical on CPU and GPU, so the ONLY
+            // divergence is the transcendental UV — a clean measurement of the seam/pole band.
+            var ball = new Sphere(new Vector3(7f, 0f, 0f), Vector3.Zero, 1.7f) { Color = Rgba32.White, Texture = tex };
+            AddDisplaysObject(ball);
+
+            var plain = PriviewNetworkScene.CreateCube();
+            plain.Position = new Vector3(11f, 1.4f, 2.6f);
+            plain.Scale = 1.2f;
+            plain.Color = new Rgba32(90, 160, 210);
+            plain.UpdateGeometry();
+            AddDisplaysObject(plain);
+
+            AddLight(new Light(new Vector3(2f, 5f, 1f), 600f) { Rgb = new Vector3(1f, 0.95f, 0.9f) });
+            SetMainCamera(new Camera(new Vector3(0f, 0f, 0f), Vector3.Zero));
+        }
+
+        public override void Update() { }
+    }
+
+    // Stage-4 texture-PARAMS parity: a TILED cube (TextureScale=2 → 2×2) and a SINGLE-FACE cube (only its
+    // +Z group textured, the other 5 faces flat colour). Both the scale and the per-face gate are exact
+    // (integer group compare + linear UV), so CPU↔GPU must be Δ=0. Shadows off.
+    sealed class GpuTextureParamsTestScene : Scene
+    {
+        public GpuTextureParamsTestScene() : base(new DisplayManagerAsync()) { }
+
+        public override void Start()
+        {
+            Exposure = 0.05f; Ambient = 0.1f; EnableShadows = false;
+
+            const int TW = 8, TH = 8;
+            var px = new Rgba32[TW * TH];
+            for (int y = 0; y < TH; y++)
+                for (int x = 0; x < TW; x++)
+                    px[y * TW + x] = new Rgba32((byte)(20 + x * 28), (byte)(20 + y * 28), 128, 255);
+            var tex = new Texture(TW, TH, px, "gpuparams");
+
+            // TILED cube — TextureScale=2 tiles the image 2×2 on every face.
+            var tiled = PriviewNetworkScene.CreateCube();
+            tiled.Position = new Vector3(8f, 0f, 0f);
+            tiled.Scale = 2.2f;
+            tiled.LocalRotate = new Vector3(0.3f, 0.5f, 0.15f);
+            tiled.Texture = tex;
+            tiled.TextureScale = 2f;
+            tiled.UpdateGeometry();
+            AddDisplaysObject(tiled);
+
+            // SINGLE-FACE cube — only the +Z group (4) is textured; the other faces show flat colour.
+            var oneFace = PriviewNetworkScene.CreateCube();
+            oneFace.Position = new Vector3(11f, 1.6f, 2.4f);
+            oneFace.Scale = 1.6f;
+            oneFace.LocalRotate = new Vector3(0.2f, 0.9f, 0.1f);
+            oneFace.Color = new Rgba32(70, 160, 90);
+            oneFace.Texture = tex;
+            oneFace.TextureFace = 4;
+            oneFace.UpdateGeometry();
+            AddDisplaysObject(oneFace);
+
+            AddLight(new Light(new Vector3(2f, 5f, 1f), 600f) { Rgb = new Vector3(1f, 0.95f, 0.9f) });
+            SetMainCamera(new Camera(new Vector3(0f, 0f, 0f), Vector3.Zero));
+        }
+
+        public override void Update() { }
+    }
+
+    // A2 BILINEAR parity: a BILINEAR-filtered textured cube. Bilinear blends 4 texels with float lerps that
+    // round slightly differently on GPU (XMath) vs CPU (MathF), so — UNLIKE nearest — a THIN band of interior
+    // pixels may differ by ~1; we require only that the band stay thin (like the sphere seam), NOT Δ=0. A
+    // small 8×8 texture magnified over the cube makes most pixels land BETWEEN texels, genuinely blending.
+    sealed class GpuBilinearTextureTestScene : Scene
+    {
+        public GpuBilinearTextureTestScene() : base(new DisplayManagerAsync()) { }
+
+        public override void Start()
+        {
+            Exposure = 0.05f; Ambient = 0.1f; EnableShadows = false;
+
+            const int TW = 8, TH = 8;
+            var px = new Rgba32[TW * TH];
+            for (int y = 0; y < TH; y++)
+                for (int x = 0; x < TW; x++)
+                    px[y * TW + x] = new Rgba32((byte)(20 + x * 28), (byte)(20 + y * 28), 128, 255);
+            var tex = new Texture(TW, TH, px, "gpubilinear");
+
+            var cube = PriviewNetworkScene.CreateCube();
+            cube.Position = new Vector3(8f, 0f, 0f);
+            cube.Scale = 2.4f;
+            cube.LocalRotate = new Vector3(0.3f, 0.5f, 0.15f);
+            cube.Texture = tex;
+            cube.TextureFilter = TextureFilterMode.Bilinear;   // the opt-in smoothing under test
+            cube.UpdateGeometry();
+            AddDisplaysObject(cube);
+
+            AddLight(new Light(new Vector3(2f, 5f, 1f), 600f) { Rgb = new Vector3(1f, 0.95f, 0.9f) });
+            SetMainCamera(new Camera(new Vector3(0f, 0f, 0f), Vector3.Zero));
+        }
+
+        public override void Update() { }
+    }
+
+    // Stage-5 imported-mesh parity: a TEXTURED .obj mesh (loaded via ObjLoader, so its per-corner UVs came
+    // from the file's `vt` with the v-flip) beside an untextured cube. Imported UVs interpolate linearly
+    // like the cube, so CPU↔GPU must be Δ=0. Shadows off. The mesh is supplied by the caller (a fixture).
+    sealed class GpuImportedMeshTestScene : Scene
+    {
+        private readonly Object3d _mesh;
+        public GpuImportedMeshTestScene(Object3d mesh) : base(new DisplayManagerAsync()) { _mesh = mesh; }
+
+        public override void Start()
+        {
+            Exposure = 0.05f; Ambient = 0.1f; EnableShadows = false;
+
+            const int TW = 8, TH = 8;
+            var px = new Rgba32[TW * TH];
+            for (int y = 0; y < TH; y++)
+                for (int x = 0; x < TW; x++)
+                    px[y * TW + x] = new Rgba32((byte)(20 + x * 28), (byte)(20 + y * 28), 128, 255);
+            var tex = new Texture(TW, TH, px, "gpuimport");
+
+            // The fixture quad's normal faces -X (toward the camera at the origin); a small tilt makes the
+            // UV interpolation genuinely 3D. Placed close + in front so it's unoccluded.
+            _mesh.Position = new Vector3(6f, 0f, 0f);
+            _mesh.Scale = 1.6f;
+            _mesh.LocalRotate = new Vector3(0.1f, 0.15f, 0.05f);
+            _mesh.Texture = tex;
+            _mesh.UpdateGeometry();
+            AddDisplaysObject(_mesh);
+
+            var plain = PriviewNetworkScene.CreateCube();
+            plain.Position = new Vector3(10f, 1.4f, 2f);
+            plain.Scale = 1.2f;
+            plain.Color = new Rgba32(90, 160, 210);
+            plain.UpdateGeometry();
+            AddDisplaysObject(plain);
+
+            AddLight(new Light(new Vector3(2f, 5f, 1f), 600f) { Rgb = new Vector3(1f, 0.95f, 0.9f) });
+            SetMainCamera(new Camera(new Vector3(0f, 0f, 0f), Vector3.Zero));
+        }
+
+        public override void Update() { }
+    }
+
     // gputest: render a fixed scene with the GPU kernel (on whatever accelerator ILGPU finds — CUDA on
     // an NVIDIA box, else the managed CPU accelerator in CI) and compare it to the engine's own CPU
     // raytracer pixel-by-pixel. They share the same intersection + shading + tone-map math for the
@@ -2588,9 +3494,9 @@ class Program
             // "interior" (both hit the surface but the shaded/shadowed value differs). With shadows off
             // every feature is deterministic, so interior MUST be 0; with shadows on, soft/hard shadow
             // boundaries add a benign band of interior flips.
-            (int nonBlack, int edge, int interior, float worstB, int worstC) Compare(float bTol, int cTol)
+            (int nonBlack, int edge, int interior, float worstB, int worstC) Compare(Scene s, float bTol, int cTol)
             {
-                SceneSnapshot snap = scene.BuildSnapshot();
+                SceneSnapshot snap = s.BuildSnapshot();
                 rt.Render(snap, W, H, aspect, brightness, color);
 
                 int nb = 0, edge = 0, interior = 0; float wb = 0f; int wc = 0;
@@ -2599,7 +3505,7 @@ class Program
                     {
                         float uvx = ((float)i / (W - 1) * 2f - 1f) * aspect;
                         float uvy = -((float)j / (H - 1) * 2f - 1f);
-                        var cpu = scene.GetPixelData(new Vector2(uvx, uvy));
+                        var cpu = s.GetPixelData(new Vector2(uvx, uvy));
                         int idx = j * W + i;
                         if (cpu.Brightness > 0.01f) nb++;
 
@@ -2621,7 +3527,7 @@ class Program
             // beams, cone shapes, area sampling) + tone-map are all deterministic, so the GPU image must
             // match the CPU EXACTLY. ANY interior mismatch here (Δ>0) is a real kernel bug.
             scene.EnableShadows = false;
-            var a = Compare(0.004f, 1);   // tiny: absorbs ULP/rounding noise, far below any feature-level diff
+            var a = Compare(scene, 0.004f, 1);   // tiny: absorbs ULP/rounding noise, far below any feature-level diff
             Console.WriteLine($"  [no shadows] nonBlack={a.nonBlack}, edge={a.edge}, interior={a.interior} (worstΔb={a.worstB:F4}, worstΔc={a.worstC})");
 
             // Pass B — shadows ON: shadow rays are float-sensitive at boundaries (and the area light's
@@ -2629,12 +3535,111 @@ class Program
             // We tolerate sub-penumbra noise per pixel and only require the disagreement to stay bounded
             // in magnitude and not become pervasive (which a systematic shadow bug would).
             scene.EnableShadows = true;
-            var b = Compare(0.1f, 28);
+            var b = Compare(scene, 0.1f, 28);
             Console.WriteLine($"  [shadows]    nonBlack={b.nonBlack}, edge={b.edge}, interior={b.interior} (worstΔb={b.worstB:F4}, worstΔc={b.worstC})");
 
+            // Pass C — TEXTURED parity (Stage 2), shadows OFF: a textured cube must fetch the SAME texel on
+            // GPU and CPU. Interior must be EXACT (Δ=0). A texel-BOUNDARY band can arise where CPU (the box
+            // takes the world-space non-BVH path) and GPU (local-space BVH) barycentric noise straddles a
+            // texel edge — tolerated as a thin band (the analog of the shadow band) and reported explicitly.
+            var texScene = new GpuTextureTestScene();
+            texScene.Start();
+            rt.ResetGeometryCache();   // reuse one raytracer across scenes: force a geometry re-upload (versions can collide)
+            var c = Compare(texScene, 0.004f, 1);
+            int texBand = c.interior;                                    // texel-edge float flips, if any
+            Console.WriteLine($"  [textured]   nonBlack={c.nonBlack}, edge={c.edge}, interior={c.interior} (worstΔb={c.worstB:F4}, worstΔc={c.worstC}), texel-boundary band={texBand}");
+
+            // Pass D — TEXTURED SPHERE (Stage 3), shadows OFF: the equirectangular UV uses atan2/asin, which
+            // round slightly differently on the GPU, so a THIN seam/pole band differs (the analog of the
+            // shadow band). The mesh primitives (Pass C) stay EXACT; here we only require the band to be thin.
+            var sphScene = new GpuSphereTextureTestScene();
+            sphScene.Start();
+            rt.ResetGeometryCache();   // new scene → force a geometry re-upload
+            var e = Compare(sphScene, 0.004f, 1);
+            Console.WriteLine($"  [tex-sphere] nonBlack={e.nonBlack}, edge={e.edge}, seam/pole band={e.interior} (worstΔb={e.worstB:F4}, worstΔc={e.worstC})");
+
+            // Pass F — TEXTURE PARAMS (Stage 4), shadows OFF: a TILED cube (TextureScale=2) + a SINGLE-FACE
+            // cube (only +Z textured, the rest flat). Both the tiling and the per-face gate are exact
+            // (integer group compare + linear UV), so CPU↔GPU must be EXACT (Δ=0, band 0).
+            var paramScene = new GpuTextureParamsTestScene();
+            paramScene.Start();
+            rt.ResetGeometryCache();
+            var pf = Compare(paramScene, 0.004f, 1);
+            Console.WriteLine($"  [tex-params] nonBlack={pf.nonBlack}, edge={pf.edge}, interior={pf.interior} (worstΔb={pf.worstB:F4}, worstΔc={pf.worstC})");
+
+            // Pass G — IMPORTED-MESH texture (Stage 5), shadows OFF: a textured .obj (UVs parsed from `vt`
+            // via ObjLoader, v-flipped) must be texel-EXACT CPU↔GPU (Δ=0) — its per-corner UVs interpolate
+            // linearly like the cube. Loaded from an in-test fixture .obj so no models/ file is needed.
+            const string gpuQuadObj = "v 0 -1 -1\nv 0 -1 1\nv 0 1 1\nv 0 1 -1\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nvn -1 0 0\nf 1/1/1 2/2/1 3/3/1 4/4/1\n";
+            var importMesh = ObjLoader.Load(WriteObjFixture("uvquad", gpuQuadObj));
+            var importScene = new GpuImportedMeshTestScene(importMesh);
+            importScene.Start();
+            rt.ResetGeometryCache();
+            var pg = Compare(importScene, 0.004f, 1);
+            Console.WriteLine($"  [tex-import] nonBlack={pg.nonBlack}, edge={pg.edge}, interior={pg.interior} (worstΔb={pg.worstB:F4}, worstΔc={pg.worstC})");
+
+            // Pass H — BILINEAR (A2), shadows OFF: an opt-in bilinear-filtered cube. The 4-texel float blend
+            // rounds slightly differently on GPU (XMath) vs CPU (MathF), so we tolerate ±1 per pixel and only
+            // require the BAND beyond that (Δc>=2) to stay THIN — NOT Δ=0. The nearest passes above prove the
+            // default filter is untouched (still exact). Report the band + worstΔ.
+            var bilScene = new GpuBilinearTextureTestScene();
+            bilScene.Start();
+            rt.ResetGeometryCache();
+            var ph = Compare(bilScene, 0.004f, 1);
+            Console.WriteLine($"  [tex-bilinear] nonBlack={ph.nonBlack}, edge={ph.edge}, band={ph.interior} (worstΔb={ph.worstB:F4}, worstΔc={ph.worstC})");
+
+            // A3 — TARGETED TEXTURE RE-UPLOAD. (correctness) a texture-version-only bump re-renders the same
+            // image BYTE-IDENTICALLY via the pool-only upload path; (behaviour) it re-uploads the texture pool
+            // but NOT the geometry, while a geometry-version bump does re-upload geometry — proving the swap is
+            // targeted, not a full geometry re-upload, with the output unchanged.
+            bool reuploadOk;
+            {
+                var reScene = new GpuTextureTestScene();
+                reScene.Start();
+                rt.ResetGeometryCache();
+                var snap = reScene.BuildSnapshot();
+
+                var bright1 = new float[W * H]; var col1 = new Rgb24[W * H];
+                int g0 = rt.GeometryUploads, t0 = rt.TextureUploads;
+                rt.Render(snap, W, H, aspect, bright1, col1);                 // first frame: uploads both
+                int gFirst = rt.GeometryUploads - g0, tFirst = rt.TextureUploads - t0;
+
+                var bright2 = new float[W * H]; var col2 = new Rgb24[W * H];
+                int g1 = rt.GeometryUploads, t1 = rt.TextureUploads;
+                snap.TextureVersion++;                                        // simulate a live texture swap
+                rt.Render(snap, W, H, aspect, bright2, col2);
+                int gTex = rt.GeometryUploads - g1, tTex = rt.TextureUploads - t1;
+
+                bool identical = true;                                        // byte-identical across the two paths
+                for (int i = 0; i < W * H; i++)
+                    if (col1[i].R != col2[i].R || col1[i].G != col2[i].G || col1[i].B != col2[i].B || bright1[i] != bright2[i])
+                    { identical = false; break; }
+
+                int g2 = rt.GeometryUploads;
+                var bright3 = new float[W * H]; var col3 = new Rgb24[W * H];
+                snap.GeometryVersion++;                                       // a genuine geometry change
+                rt.Render(snap, W, H, aspect, bright3, col3);
+                int gGeom = rt.GeometryUploads - g2;
+
+                reuploadOk = gFirst == 1 && tFirst == 1                       // first frame uploads geometry + pool
+                          && gTex == 0 && tTex == 1                           // texture-only: pool re-uploaded, geometry NOT
+                          && identical                                        // ...and the image is byte-identical
+                          && gGeom == 1;                                      // geometry change re-uploads geometry
+                Console.WriteLine($"  [tex-reupload] first(g={gFirst},t={tFirst}), texSwap(g={gTex},t={tTex},identical={identical}), geomChange(g={gGeom}) -> {(reuploadOk ? "ok" : "BAD")}");
+            }
+
             bool ok = a.nonBlack > 50
-                      && a.interior == 0 && a.edge == 0                                          // shading exact (Δ=0)
-                      && (float)b.interior / total < 0.06f && (float)b.edge / total < 0.06f;      // shadow boundary thin
+                      && a.interior == 0 && a.edge == 0                                          // untextured shading exact (Δ=0)
+                      && (float)b.interior / total < 0.06f && (float)b.edge / total < 0.06f      // shadow boundary thin
+                      && c.nonBlack > 50 && c.edge == 0
+                      && (float)texBand / total < 0.02f                                          // textured mesh interior exact but for a thin texel-edge band
+                      && e.nonBlack > 50 && (float)e.edge / total < 0.02f
+                      && (float)e.interior / total < 0.08f                                       // sphere seam/pole band thin
+                      && pf.nonBlack > 50 && pf.edge == 0 && pf.interior == 0                    // tiled + single-face cubes exact (Δ=0)
+                      && pg.nonBlack > 50 && pg.edge == 0 && pg.interior == 0                    // imported textured mesh exact (Δ=0)
+                      && ph.nonBlack > 50 && (float)ph.edge / total < 0.02f
+                      && (float)ph.interior / total < 0.05f                                      // bilinear band thin (NOT Δ=0 — float rounding)
+                      && reuploadOk;                                                             // A3: texture swap is targeted + output unchanged
             Console.WriteLine(ok ? "GPU TEST PASSED" : "GPU TEST FAILED");
         }
         catch (Exception ex)

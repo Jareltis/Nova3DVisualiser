@@ -9,6 +9,7 @@ using Nova3DVisualiser.Shape;
 using Nova3DVisualiser.StaticClass;
 using SampleGame.NetworkPackets;
 using SampleGame.Physics;
+using SampleGame.Textures;
 using SampleGame.Worlds;
 using System.Globalization;
 using System.Text.Json;
@@ -30,14 +31,30 @@ public class PriviewNetworkScene : Scene
     private const int MeshChunkSize = 16384;        // chunk payload length (chars)
     private const int ChunksPerFrame = 2;           // outgoing actions drained per Update
     private readonly Queue<Action> _outgoing = new();                            // server: paced mesh-chunk + spawn sends
-    private readonly Dictionary<string, (int total, string[] parts)> _meshChunks = new();   // client: reassembly buffer
+    private readonly Dictionary<string, (int total, string[] parts)> _meshChunks = new();   // client: mesh reassembly buffer
+    private readonly Dictionary<string, (int total, byte[][] parts)> _textureChunks = new();   // client: texture (PNG bytes) reassembly buffer
 
     readonly Camera _myCamera;
     readonly Light _mainLight;
 
+    // ---- Local player = BODY + CAMERA (B-camera) ----
+    // The player is two linked things: a BODY (the physical/movement anchor — physics + collision act on
+    // it, its transform is streamed so peers see the avatar) and a CAMERA that DERIVES from the body via a
+    // per-mode offset (the camera RIG the future multi-view work builds on). FIRSTPERSON/THIRDPERSON are
+    // live; FIXED/FOLLOW/SECONDPERSON are reserved (a clean seam) — not implemented this stage.
+    public enum CameraMode { FirstPerson, ThirdPerson, Fixed, Follow, SecondPerson }
+    private CameraMode _cameraMode = CameraMode.FirstPerson;   // default 1st-person (F7 toggles 1st/3rd)
+    private Object3d _localBody = null!;   // the local player's visible avatar (created in Start); the movement anchor
+    private bool _bodyDisplayed = false;   // whether the body avatar is currently drawn (only in 3rd person)
+    private int _localBodyId;              // the local player's stable id (= network id); name is "player #<id>"
+    // 3rd-person rig: the camera sits this far BEHIND the body along the look direction and this far ABOVE.
+    private const float ThirdPersonBack = 4f;
+    private const float ThirdPersonUp = 1.5f;
+
     private WorldConfig _world;
     private readonly List<Object3d> _models = new();   // spinnable Object3d objects (meshes + cubes)
     private string _modelsFolder = AppPaths.ModelsFolder;   // where world meshes load from (server world -> received/ on a client)
+    private string _texturesFolder = AppPaths.TexturesFolder;   // where object textures load from (-> received/textures on a client)
     private Object3d? _floor;                              // the platform, tracked so a client can replace it
 
     private bool _ownLightEnabled;
@@ -49,6 +66,13 @@ public class PriviewNetworkScene : Scene
 
     private bool _isChatting = false;
     private string _currentInput = "";
+    // Inline field entry (B-direct-input — generalizes the B-identity rename seed to every editable field):
+    // while active, keystrokes fill _entryBuffer (Enter confirms, Esc cancels). The Name field takes
+    // name-safe text; a NUMERIC field takes digits/-/. and is PARSED + CLAMPED to that field's range on
+    // confirm. Movement/physics pause while typing (same dispatch as chat/rename). One input system, not two.
+    private bool _entryMode = false;
+    private string _entryBuffer = "";
+    private Field _entryField = Field.Name;   // which field the buffer is being typed into
     private readonly List<string> _chatHistory = new();
     private const int MaxHistory = 5;
 
@@ -70,7 +94,11 @@ public class PriviewNetworkScene : Scene
     private bool _editMode = false;
     private readonly List<EditEntry> _editables = new();
     private int _selected = -1;
-    private int _nextObjectId = 0;      // next id to hand a spawned object (server/local authority; 5b broadcasts spawns)
+    // The platform reserves id 0 (a real, stable id in the same space); ordinary objects start at 1, so
+    // every object — primitives/meshes/spheres/flatpictures/LIGHTS + the PLATFORM — has a unique id >= 0.
+    // The platform's SPECIAL handling stays keyed on Type == "platform", never on its id value.
+    private const int PlatformId = 0;
+    private int _nextObjectId = PlatformId + 1;   // next id to hand a spawned object (authority; 5b broadcasts spawns)
 
     // Server streams its edits as deltas; clients are view-only over the synced world.
     // CanEdit gates every world-mutating action; camera/selection/inspection stay open.
@@ -99,6 +127,7 @@ public class PriviewNetworkScene : Scene
     private const float FrictionMax = 2f;                // clamp for the friction editor field
     private const float RollFrictionStep = 0.02f;        // per-object rolling-friction adjust per N/M press
     private const float ColorFadeStep = 0.1f;            // per-object colour paleness adjust per N/M press
+    private const float TextureScaleStep = 0.1f;         // per-object UV tiling adjust per N/M press
     private static readonly string[] PlatformShapes = { "square", "rectangle", "circle" };   // ordered for PlatShape cycle
     private const float LightMarkerScale = 0.3f;         // size of the small cube that marks a light
     private static readonly Vector3 LightMarkerOffset = Vector3.Zero;  // Light sits exactly at its marker; the marker is a non-shadow-caster so there's no self-shadow to avoid
@@ -107,9 +136,10 @@ public class PriviewNetworkScene : Scene
     private string _saveMsg = "";
 
     // Properties-panel editable fields (read-only Type/Mesh are not in here).
-    private enum Field { PosX, PosY, PosZ, RotX, RotY, RotZ, Scale, RotateSpeed, ColorR, ColorG, ColorB, ColorA, Radius,
+    private enum Field { Name, PosX, PosY, PosZ, RotX, RotY, RotZ, Scale, RotateSpeed, ColorR, ColorG, ColorB, ColorA, Radius,
                          Power, ClrInf, Kind, DirX, DirY, DirZ, ConeAngle, AreaSize, AreaShape, Spin, Beams, Shape,
-                         PlatShape, PlatSize, PlatWidth, PlatDepth, Collides, Gravity, Collider, Mass, Restitution, Friction, RollingFriction, ColorFade }
+                         PlatShape, PlatSize, PlatWidth, PlatDepth, Collides, Gravity, Collider, Mass, Restitution, Friction, RollingFriction, ColorFade,
+                         Texture, TextureScale, TextureFace, TextureFilter }
     private int _fieldIndex = 0;
 
     // Editable fields for the selected entry. A light's set depends on its Kind: every light shows
@@ -119,15 +149,19 @@ public class PriviewNetworkScene : Scene
     {
         string type = e.Descriptor.Type ?? "";
         if (type == "sphere")
-            return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.Radius, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Collides, Field.Gravity, Field.Mass, Field.Restitution, Field.Friction, Field.RollingFriction };
+            return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.Radius, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Texture, Field.TextureScale, Field.TextureFace, Field.TextureFilter, Field.Collides, Field.Gravity, Field.Mass, Field.Restitution, Field.Friction, Field.RollingFriction, Field.Name };
+        // A flat picture is a visual panel: transform + colour + paleness + its texture params. No physics
+        // fields — it defaults non-colliding.
+        if (type == "flatpicture")
+            return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.Scale, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Texture, Field.TextureScale, Field.TextureFace, Field.TextureFilter, Field.Name };
         if (type == "platform")
         {
             // The floor moves like any object (Pos), then a shape-dependent size set + Color.
             return (e.Platform?.Shape?.Trim().ToLowerInvariant()) switch
             {
-                "rectangle" => new[] { Field.PosX, Field.PosY, Field.PosZ, Field.PlatShape, Field.PlatWidth, Field.PlatDepth, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Collides, Field.Gravity },
-                "circle"    => new[] { Field.PosX, Field.PosY, Field.PosZ, Field.PlatShape, Field.PlatSize, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Collides, Field.Gravity },
-                _           => new[] { Field.PosX, Field.PosY, Field.PosZ, Field.PlatShape, Field.PlatSize, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Collides, Field.Gravity },   // square + legacy/unknown
+                "rectangle" => new[] { Field.PosX, Field.PosY, Field.PosZ, Field.PlatShape, Field.PlatWidth, Field.PlatDepth, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Collides, Field.Gravity, Field.Name },
+                "circle"    => new[] { Field.PosX, Field.PosY, Field.PosZ, Field.PlatShape, Field.PlatSize, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Collides, Field.Gravity, Field.Name },
+                _           => new[] { Field.PosX, Field.PosY, Field.PosZ, Field.PlatShape, Field.PlatSize, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Collides, Field.Gravity, Field.Name },   // square + legacy/unknown
             };
         }
         if (type == "light")
@@ -140,9 +174,10 @@ public class PriviewNetworkScene : Scene
                 case LightKind.Area:        f.AddRange(new[] { Field.DirX, Field.DirY, Field.DirZ, Field.AreaSize, Field.AreaShape, Field.Spin }); break;
             }
             f.Add(Field.Gravity);   // a light has no collider, but it CAN be made to fall
+            f.Add(Field.Name);
             return f.ToArray();
         }
-        return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.Scale, Field.RotateSpeed, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Collides, Field.Gravity, Field.Collider, Field.Mass, Field.Restitution, Field.Friction, Field.RollingFriction };
+        return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.Scale, Field.RotateSpeed, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Texture, Field.TextureScale, Field.TextureFace, Field.TextureFilter, Field.Collides, Field.Gravity, Field.Collider, Field.Mass, Field.Restitution, Field.Friction, Field.RollingFriction, Field.Name };
     }
 
 
@@ -181,6 +216,7 @@ public class PriviewNetworkScene : Scene
         PacketManager.RegisterPacket<WorldSettingsPacket>();
         PacketManager.RegisterPacket<PlayerLeftPacket>();
         PacketManager.RegisterPacket<MeshChunkPacket>();
+        PacketManager.RegisterPacket<TextureChunkPacket>();
         PacketManager.RegisterPacket<PhysicsSyncPacket>();
 
         PacketManager.Subscribe<TransformPacket>(OnTransformReceived);
@@ -205,6 +241,7 @@ public class PriviewNetworkScene : Scene
             PacketManager.Subscribe<WorldEditPacket>(OnWorldEditReceived);
             PacketManager.Subscribe<WorldSettingsPacket>(OnWorldSettingsReceived);
             PacketManager.Subscribe<MeshChunkPacket>(OnMeshChunkReceived);
+            PacketManager.Subscribe<TextureChunkPacket>(OnTextureChunkReceived);
             PacketManager.Subscribe<PhysicsSyncPacket>(OnPhysicsSyncReceived);
             _awaitingWorld = true;
             _netManager.Connect(targetIp, port);
@@ -223,6 +260,16 @@ public class PriviewNetworkScene : Scene
 
         SetMainCamera(_myCamera);
 
+        // The local player's BODY: the movement anchor, seeded at the camera's start (so 1st-person feel is
+        // identical). It carries a stable id (= this peer's network id) + a system name "player #<id>", is
+        // NOT added to the editables list (it's the player, not world content — like the remote avatars),
+        // and is drawn only in 3rd person (ApplyCameraMode; default 1st person → not displayed).
+        _localBodyId = _myNetId;
+        _localBody = CreatePlayerAvatar(_localBodyId);
+        _localBody.Position = _myCamera.Position;
+        _localBody.UpdateGeometry();
+        ApplyCameraMode();   // 1st person by default → body stays hidden
+
         // Spawn palette for the editor: the two primitives, then every library mesh.
         _spawnTypes.Add("cube");
         _spawnTypes.Add("sphere");
@@ -230,6 +277,7 @@ public class PriviewNetworkScene : Scene
         _spawnTypes.Add("cone");
         _spawnTypes.Add("pyramid");
         _spawnTypes.Add("ramp");
+        _spawnTypes.Add("flatpicture");
         _spawnTypes.Add("light");
         _spawnTypes.Add("platform");
         _spawnTypes.AddRange(WorldManager.ListAvailableMeshes());
@@ -241,8 +289,8 @@ public class PriviewNetworkScene : Scene
         {
             MaybeInjectExtraLight();   // authority/solo: add the settings extra light as a real object (once)
             for (int i = 0; i < _world.Objects.Count; i++)
-                _world.Objects[i].Id = i;
-            _nextObjectId = _world.Objects.Count;
+                _world.Objects[i].Id = i + 1;   // ids 1..N — id 0 is reserved for the platform
+            _nextObjectId = _world.Objects.Count + 1;
         }
 
         foreach (var obj in _world.Objects)
@@ -281,12 +329,12 @@ public class PriviewNetworkScene : Scene
         AddDisplaysObject(floor);
         _floor = floor;
 
-        // The platform is a SPECIAL editable entry backed by the LIVE PlatformConfig (mutated in
-        // place). A sentinel id (-1) keeps it clear of every real object id in the id-based handlers.
+        // The platform is a SPECIAL editable entry backed by the LIVE PlatformConfig (mutated in place).
+        // It carries a REAL id (PlatformId = 0, reserved) — its special handling is keyed on Type, not id.
         // Runs on both authority and client (re-run by ApplyReceivedWorld), so it covers all modes.
         _editables.Add(new EditEntry
         {
-            Descriptor = new WorldObject { Type = "platform", Id = -1 },
+            Descriptor = new WorldObject { Type = "platform", Id = PlatformId, Name = _world.Platform.Name },
             Instance   = floor,
             Platform   = _world.Platform,
         });
@@ -336,14 +384,16 @@ public class PriviewNetworkScene : Scene
             case "cone":
             case "pyramid":
             case "ramp":
+            case "flatpicture":
             {
                 Object3d prim = type switch
                 {
-                    "cylinder" => CreateCylinder(),
-                    "cone"     => CreateCone(),
-                    "pyramid"  => CreatePyramid(),
-                    "ramp"     => CreateRamp(),
-                    _          => CreateCube(),
+                    "cylinder"    => CreateCylinder(),
+                    "cone"        => CreateCone(),
+                    "pyramid"     => CreatePyramid(),
+                    "ramp"        => CreateRamp(),
+                    "flatpicture" => CreateFlatPicture(),
+                    _             => CreateCube(),
                 };
                 ApplyToInstance(o, prim);
 
@@ -506,18 +556,19 @@ public class PriviewNetworkScene : Scene
         return a + ab * (vb * denom) + ac * (vc * denom);
     }
 
-    // Eject the camera's bubble out of every collidable scene object (a couple of passes catch
-    // multiple simultaneous contacts). A sphere collider for Sphere, the world AABB for Object3d.
-    private void ResolveCameraCollision()
+    // Eject the player BODY's bubble out of every collidable scene object (a couple of passes catch
+    // multiple simultaneous contacts). A sphere collider for Sphere, the world AABB for Object3d. The
+    // bubble is the body's physical presence (was the camera's, pre-B-camera); the camera derives from it.
+    private void ResolveBodyCollision()
     {
         for (int pass = 0; pass < 2; pass++)
             foreach (var e in _editables)
             {
                 if (e.Instance is not { Collides: true }) continue;
-                if (e.Instance is Sphere s)        _myCamera.Position = ResolveSphereVsSphere(_myCamera.Position, CameraRadius, s.Position, s.R);
-                else if (e.Instance is Object3d o) _myCamera.Position = o.Collider == ColliderShape.Obb
-                    ? ResolveSphereVsObb(_myCamera.Position, CameraRadius, o)
-                    : ResolveSphereVsAabb(_myCamera.Position, CameraRadius, o.WorldMin, o.WorldMax);
+                if (e.Instance is Sphere s)        _localBody.Position = ResolveSphereVsSphere(_localBody.Position, CameraRadius, s.Position, s.R);
+                else if (e.Instance is Object3d o) _localBody.Position = o.Collider == ColliderShape.Obb
+                    ? ResolveSphereVsObb(_localBody.Position, CameraRadius, o)
+                    : ResolveSphereVsAabb(_localBody.Position, CameraRadius, o.WorldMin, o.WorldMax);
             }
     }
 
@@ -543,17 +594,65 @@ public class PriviewNetworkScene : Scene
         if (_onGround && Pressed(ConsoleKey.Spacebar)) _playerVelY = JumpSpeed;   // jump
 
         _playerVelY -= _world.Physics.GravityStrength * dt;
-        _myCamera.Position.Y += _playerVelY * dt;
+        _localBody.Position.Y += _playerVelY * dt;
 
-        float yBefore = _myCamera.Position.Y;
-        ResolveCameraCollision();              // pushes the bubble out of floor + objects (all axes)
-        float yAfter = _myCamera.Position.Y;
+        float yBefore = _localBody.Position.Y;
+        ResolveBodyCollision();                // pushes the bubble out of floor + objects (all axes)
+        float yAfter = _localBody.Position.Y;
 
         // Landed: collision lifted us while we were falling -> rest on the surface.
         if (_playerVelY <= 0f && yAfter > yBefore + GroundEps) { _onGround = true; _playerVelY = 0f; }
         else _onGround = false;
         // Bonked a ceiling while rising -> stop the upward velocity.
         if (_playerVelY > 0f && yAfter < yBefore - GroundEps) _playerVelY = 0f;
+    }
+
+    // ---- Camera RIG: the camera derives from the body via a per-mode offset (pure math so it is unit-
+    // testable). FIRSTPERSON: the camera sits AT the body (its head/eye anchor — the body is at eye level,
+    // matching today's feel and the remote-avatar convention). THIRDPERSON: behind + above the body along
+    // the yaw look direction. Reserved modes fall back to first-person for now. ----
+    public static Vector3 CameraOffsetFor(Vector3 lookRotate, CameraMode mode)
+    {
+        if (mode == CameraMode.ThirdPerson)
+        {
+            Vector3 forward = new Vector3(1, 0, 0).Rotate(new Vector3(0, lookRotate.Y, 0));   // yaw-only look
+            return forward * (-ThirdPersonBack) + new Vector3(0, ThirdPersonUp, 0);           // behind + above
+        }
+        return Vector3.Zero;   // first-person (and reserved modes) — camera at the body's eye
+    }
+
+    // The camera position for a given body position + look rotation + mode. body + the mode offset.
+    public static Vector3 CameraPositionFor(Vector3 bodyPos, Vector3 lookRotate, CameraMode mode)
+        => bodyPos + CameraOffsetFor(lookRotate, mode);
+
+    // Places the camera at the body + mode offset, and keeps the avatar facing the look direction (for the
+    // 3rd-person view + the streamed transform). Called every frame after movement/physics settle the body.
+    private void SyncCameraToBody()
+    {
+        _localBody.LocalRotate = _myCamera.LocalRotate;                 // avatar faces where we look (matches remote avatars)
+        if (_bodyDisplayed) _localBody.UpdateGeometry();               // refresh its world AABB for the GPU cull when drawn
+        _myCamera.Position = CameraPositionFor(_localBody.Position, _myCamera.LocalRotate, _cameraMode);
+    }
+
+    // Adds/removes the local body avatar from the display so it is drawn ONLY in 3rd person (you never see
+    // inside your own body in 1st person). Idempotent.
+    private void ApplyCameraMode()
+    {
+        bool show = _cameraMode == CameraMode.ThirdPerson;
+        if (show && !_bodyDisplayed) { AddDisplaysObject(_localBody); _bodyDisplayed = true; }
+        else if (!show && _bodyDisplayed) { RemoveDisplaysObject(_localBody); _bodyDisplayed = false; }
+    }
+
+    // A player-avatar cube coloured by network id (shared by the local body + every remote peer's avatar),
+    // so you and everyone else render the same kind of body. Never collides / never locally simulated.
+    private static Object3d CreatePlayerAvatar(int netId)
+    {
+        Object3d cube = CreateCube();
+        Rgba32[] palette = { new Rgba32(255, 0, 0), new Rgba32(0, 255, 0), new Rgba32(0, 0, 255), new Rgba32(255, 255, 0), new Rgba32(0, 255, 255), new Rgba32(255, 0, 255) };
+        cube.Color = palette[((netId % palette.Length) + palette.Length) % palette.Length];
+        cube.Collides = false;   // an avatar never blocks the local camera (the controller drives the body)
+        cube.Gravity = false;    // avatars are driven by the controller / network, never local object gravity
+        return cube;
     }
 
     // Server: ids whose physics moved them since the last sync flush (the "changed" set). Client:
@@ -940,6 +1039,14 @@ public class PriviewNetworkScene : Scene
         instance.Friction = o.Friction >= 0f ? o.Friction : 0.5f;   // Coulomb μ for the impulse solver
         instance.RollingFriction = o.RollingFriction >= 0f ? o.RollingFriction : 0.05f;   // rolling resistance (Stage 6)
         instance.ColorFade = o.ColorFade;              // colour paleness (separate from the alpha channel)
+        instance.Texture = TextureLoader.Get(_texturesFolder, o.Texture);   // decoded PNG (cached); null (logged) if empty/missing/undecodable -> flat colour. On a client _texturesFolder is received/textures.
+        // LOUD: a world asked for a texture but it didn't attach (missing file OR unsupported format —
+        // TextureLoader logged the exact reason above). Without this, the object silently renders flat.
+        if (!string.IsNullOrWhiteSpace(o.Texture) && instance.Texture == null)
+            Logger.Warning($"Object id={o.Id} type='{o.Type}': texture '{o.Texture}' did NOT attach (missing file or unsupported format — see the texture log line above). Rendering flat colour.");
+        instance.TextureScale = o.TextureScale > 0f ? o.TextureScale : 1f;   // UV tiling (guard a 0/neg value to 1)
+        instance.TextureFace = o.TextureFace;              // which face-group wears the texture (-1 = all)
+        instance.TextureFilter = o.TextureFilter == 1 ? TextureFilterMode.Bilinear : TextureFilterMode.Nearest;   // magnification filter
 
         if (instance is Object3d mesh)
         {
@@ -968,6 +1075,7 @@ public class PriviewNetworkScene : Scene
         return new WorldObject
         {
             Id = descriptor.Id,                                   // carry the stable id through live read-back
+            Name = descriptor.Name,                               // user name (not derived from the instance)
             Type = descriptor.Type,
             Mesh = descriptor.Mesh,
             Anchor = descriptor.Anchor,
@@ -985,6 +1093,10 @@ public class PriviewNetworkScene : Scene
             Friction = instance.Friction,
             RollingFriction = instance.RollingFriction,
             ColorFade = instance.ColorFade,
+            Texture = instance.Texture?.Name ?? descriptor.Texture,   // live texture name (falls back to descriptor if none attached)
+            TextureScale = instance.TextureScale,
+            TextureFace = instance.TextureFace,
+            TextureFilter = (int)instance.TextureFilter,
             // ---- light read-back: every live light field flows back from the paired Light ----
             Power = light?.LightPower ?? descriptor.Power,
             LightKind = light != null ? LightKindToString(light.Kind) : descriptor.LightKind,
@@ -1260,6 +1372,10 @@ public class PriviewNetworkScene : Scene
         {
             HandleChatInput();
         }
+        else if (_entryMode)
+        {
+            HandleFieldEntryInput();   // inline typed entry (name or numeric) captures all keystrokes until Enter/Esc
+        }
         else
         {
             // Tab toggles the editor; camera fly stays active in edit mode.
@@ -1273,10 +1389,11 @@ public class PriviewNetworkScene : Scene
             }
             else
             {
-                if (!_flyMode) ResolveCameraCollision();   // no-gravity world: keep wall pushout; fly mode passes through
+                if (!_flyMode) ResolveBodyCollision();      // no-gravity world: keep wall pushout; fly mode passes through
                 _playerVelY = 0f; _onGround = false;       // reset so re-entering walk starts clean
             }
             StepPhysics(dt);
+            SyncCameraToBody();   // camera = body + mode offset, every frame after the body settles
 
             if (_editMode) HandleEditorInput();
 
@@ -1307,7 +1424,9 @@ public class PriviewNetworkScene : Scene
 
         if (!_isChatting && _netManager != null)
         {
-            var packet = new TransformPacket(_myCamera.Position, _myCamera.LocalRotate);
+            // Stream the BODY transform (in 1st person the body IS at the old camera position, so remote
+            // avatars look exactly as before; in 3rd person peers still see your body, not your camera).
+            var packet = new TransformPacket(_localBody.Position, _myCamera.LocalRotate);
             _netManager.SendPacket(packet, _myNetId);
         }
 
@@ -1341,13 +1460,25 @@ public class PriviewNetworkScene : Scene
     // ---- Editor input (only called in edit mode, never while chatting) ----
     private void HandleEditorInput()
     {
+        // Enter enters inline TYPED entry on the active EDITABLE field: the Name field takes text (as
+        // before), a NUMERIC field takes a typed value (parsed + clamped on confirm). Enum/toggle fields
+        // (Collider/Gravity/Collides/Kind/Shape/Texture/TexFace/TexFilter…) aren't typeable — Enter is
+        // inert there (use N/M to cycle). Spawn moved off Enter to [B] so it always works. Checked first so
+        // Enter takes the editable field before anything else reads it.
+        if (CanEdit && _selected >= 0 && _selected < _editables.Count && Pressed(ConsoleKey.Enter))
+        {
+            var selFields = FieldsFor(_editables[_selected]);
+            Field af = selFields[Math.Clamp(_fieldIndex, 0, selFields.Length - 1)];
+            if (af == Field.Name || IsNumericField(af)) { BeginFieldEntry(_editables[_selected], af); return; }
+        }
+
         // Cycle the spawn type.
         if (Pressed(ConsoleKey.G) && _spawnTypes.Count > 0)
             _spawnIndex = (_spawnIndex + 1) % _spawnTypes.Count;
 
-        // Spawn the current type a couple of units in front of the camera, at ground level.
-        // (A view-only client cannot mutate the synced world.)
-        if (CanEdit && Pressed(ConsoleKey.Enter))
+        // Spawn the current type a couple of units in front of the camera, at ground level. Relocated off
+        // Enter (now the field-edit trigger) to [B]. (A view-only client cannot mutate the synced world.)
+        if (CanEdit && Pressed(ConsoleKey.B))
             SpawnCurrent();
 
         // Aim-to-select: pick the editable object under the center crosshair.
@@ -1474,6 +1605,37 @@ public class PriviewNetworkScene : Scene
             case Field.ColorFade:
                 inst.ColorFade = Math.Clamp(inst.ColorFade + dir * ColorFadeStep, 0f, 1f);   // 0 = true colour, 1 = washed to white
                 if (entry.Light != null) entry.Light.ColorFade = inst.ColorFade;             // pale the emitted colour too
+                break;
+            case Field.Texture:
+            {
+                // Cycle "none" + every PNG in textures/. Set via the decode-once cache (null = none). A live
+                // swap re-uploads ONLY the texture pool (A3) — the static geometry + BVH stay cached.
+                var opts = new List<string> { "" };
+                opts.AddRange(WorldManager.ListAvailableTextures(_texturesFolder));
+                string cur = inst.Texture?.Name ?? "";
+                int idx = opts.FindIndex(t => string.Equals(t, cur, StringComparison.OrdinalIgnoreCase));
+                if (idx < 0) idx = 0;
+                int n = opts.Count;
+                string next = opts[(((idx + dir) % n) + n) % n];
+                inst.Texture = string.IsNullOrEmpty(next) ? null : TextureLoader.Get(_texturesFolder, next);
+                InvalidateGpuTextures();
+                break;
+            }
+            case Field.TextureScale:
+                inst.TextureScale = Math.Clamp(inst.TextureScale + dir * TextureScaleStep, 0.1f, 10f);
+                break;
+            case Field.TextureFace:
+            {
+                // Cycle "All" (-1) then each face option (a cube: +X..-Z); other shapes have only "All".
+                int total = TextureFaceOptions(entry.Descriptor.Type).Length + 1;
+                int slot = (((inst.TextureFace + 1 + dir) % total) + total) % total;
+                inst.TextureFace = slot - 1;
+                break;
+            }
+            case Field.TextureFilter:
+                // Toggle Nearest <-> Bilinear (only two modes). Rides in the per-frame SnapObject, so no
+                // GPU geometry invalidation is needed (unlike a texture swap).
+                inst.TextureFilter = inst.TextureFilter == TextureFilterMode.Bilinear ? TextureFilterMode.Nearest : TextureFilterMode.Bilinear;
                 break;
             case Field.Power:
                 if (entry.Light != null) entry.Light.LightPower = MathF.Max(0f, entry.Light.LightPower + dir * PowerStep);
@@ -1665,7 +1827,7 @@ public class PriviewNetworkScene : Scene
 
         Vector3 yaw = new Vector3(0, _myCamera.LocalRotate.Y, 0);
         Vector3 forward = new Vector3(1, 0, 0).Rotate(yaw);
-        Vector3 spawnPos = _myCamera.Position + forward * 3f;
+        Vector3 spawnPos = _localBody.Position + forward * 3f;   // in front of the BODY (same in 1st person; sensible in 3rd)
         spawnPos.Y = 0f; // ground level
 
         string label = _spawnTypes[_spawnIndex];
@@ -1686,7 +1848,10 @@ public class PriviewNetworkScene : Scene
 
         // The built-in types (primitives + light) keep their label as the Type; anything else is a
         // library mesh.
-        bool isBuiltIn = label is "cube" or "sphere" or "cylinder" or "cone" or "pyramid" or "ramp" or "light";
+        bool isBuiltIn = label is "cube" or "sphere" or "cylinder" or "cone" or "pyramid" or "ramp" or "flatpicture" or "light";
+        // A flat picture is a visual panel — non-colliding by default (a thin quad is a degenerate
+        // collider); gravity already defaults off. Every other primitive keeps the default (collides).
+        bool isFlatPic = string.Equals(label, "flatpicture", StringComparison.OrdinalIgnoreCase);
         var descriptor = new WorldObject
         {
             Id = _nextObjectId++,   // unique stable id (only the authority spawns; 5b broadcasts it)
@@ -1697,6 +1862,7 @@ public class PriviewNetworkScene : Scene
             Color = "White",
             Anchor = "Bottom",
             Radius = 1f,
+            Collides = !isFlatPic,
         };
 
         var entry = BuildWorldObject(descriptor);
@@ -1809,8 +1975,9 @@ public class PriviewNetworkScene : Scene
             : $"Selected: (none) — {_editables.Count} object(s)";
         UI.AddText(sel, new Vector2Int(x, y++), ConsoleColor.Yellow);
 
-        UI.AddText("[G] cycle type  [Enter] spawn  [ [ / ] ] select", new Vector2Int(x, y++), ConsoleColor.Gray);
+        UI.AddText("[G] cycle type  [B] spawn  [ [ / ] ] select  [Enter] type value", new Vector2Int(x, y++), ConsoleColor.Gray);
         UI.AddText("Move: J/L=X  I/K=Z  U/O=Y    [F5] save", new Vector2Int(x, y++), ConsoleColor.Gray);
+        UI.AddText($"[F1] {(_flyMode ? "Fly" : "Walk")}   [F7] View: {(_cameraMode == CameraMode.ThirdPerson ? "3rd-person" : "1st-person")}", new Vector2Int(x, y++), ConsoleColor.Gray);
 
         // Runtime graphics settings — only the authority can flip them, so only it sees the hints.
         if (CanEdit)
@@ -1847,8 +2014,10 @@ public class PriviewNetworkScene : Scene
             var fields = FieldsFor(entry);
             Field active = fields[Math.Clamp(_fieldIndex, 0, fields.Length - 1)];
 
-            // Read-only header.
+            // Read-only header: Type, stable Id, and the display Name (user name, or the system name).
             lines.Add(($"  Type: {type}", ConsoleColor.DarkGray));
+            lines.Add(($"  Id: {entry.Descriptor.Id}", ConsoleColor.DarkGray));
+            lines.Add(($"  Name: {DisplayName(entry)}", ConsoleColor.DarkGray));
             if (type == "mesh")
                 lines.Add(($"  Mesh: {entry.Descriptor.Mesh}", ConsoleColor.DarkGray));
 
@@ -1860,7 +2029,14 @@ public class PriviewNetworkScene : Scene
                 lines.Add((line, on ? ConsoleColor.Cyan : ConsoleColor.Gray));
             }
 
-            lines.Add((",/. field   N/M value   Del", ConsoleColor.DarkGray));
+            if (_entryMode)
+                lines.Add(("[Enter] confirm  [Esc] cancel", ConsoleColor.Green));
+            else if (active == Field.Name)
+                lines.Add((",/. field   [Enter] type name   Del", ConsoleColor.DarkGray));
+            else if (IsNumericField(active))
+                lines.Add((",/. field   [Enter] type / N,M step   Del", ConsoleColor.DarkGray));
+            else
+                lines.Add((",/. field   N,M cycle   Del", ConsoleColor.DarkGray));
         }
 
         DrawOverlayBox("PROPERTIES", lines);
@@ -1938,6 +2114,11 @@ public class PriviewNetworkScene : Scene
         Field.Friction => "Friction",
         Field.RollingFriction => "RollFric",
         Field.ColorFade => "Pale",
+        Field.Texture => "Texture",
+        Field.TextureScale => "TexScale",
+        Field.TextureFace => "TexFace",
+        Field.TextureFilter => "TexFilter",
+        Field.Name => "Name",
         _ => f.ToString()
     };
 
@@ -1945,6 +2126,10 @@ public class PriviewNetworkScene : Scene
     {
         var inst = entry.Instance;
         var o = inst as Object3d;
+        // While typing into THIS field on the selected entry, show the live buffer with a cursor (Name or
+        // numeric alike) — the single display point for inline entry, mirroring the old rename display.
+        if (_entryMode && _entryField == f && _selected >= 0 && _selected < _editables.Count && _editables[_selected] == entry)
+            return $"{_entryBuffer}_";
         return f switch
         {
             Field.PosX => inst.Position.X.ToString("F2"),
@@ -1987,13 +2172,79 @@ public class PriviewNetworkScene : Scene
             Field.Friction => inst.Friction.ToString("F2"),
             Field.RollingFriction => inst.RollingFriction.ToString("F2"),
             Field.ColorFade => inst.ColorFade.ToString("F2"),
+            Field.Texture => string.IsNullOrEmpty(inst.Texture?.Name) ? "none" : inst.Texture!.Name,
+            Field.TextureScale => inst.TextureScale.ToString("F2"),
+            Field.TextureFace => TextureFaceLabel(entry.Descriptor.Type, inst.TextureFace),
+            Field.TextureFilter => inst.TextureFilter == TextureFilterMode.Bilinear ? "Bilinear" : "Nearest",
+            Field.Name => DisplayName(entry),   // live typing handled by the buffer check above
             _ => ""
         };
+    }
+
+    // Editor display for a TextureFace value: "All" for -1, else the type's face option name (a cube:
+    // +X..-Z), or the raw index as a fallback for an out-of-range value from hand-edited JSON.
+    private static string TextureFaceLabel(string? type, int face)
+    {
+        if (face < 0) return "All";
+        string[] opts = TextureFaceOptions(type);
+        return face < opts.Length ? opts[face] : face.ToString();
     }
 
     // Inspection/test accessor: the live editable entries (each pairs a descriptor with its
     // instance, plus a Light for "light" objects). Read-only.
     public IReadOnlyList<EditEntry> EditableEntries => _editables;
+
+    // ---- B-direct-input test hooks (headless typed entry) ----
+    // Drives the SAME BeginFieldEntry/TryAppendEntryChar/Confirm|Cancel path the keyboard uses. Types
+    // `typed` into the field named `fieldName` (the Field enum member, e.g. "Scale"/"PosX"/"Mass"/"Name"/
+    // "Collider") on editable entry `entryIndex`, then confirms (Enter) or cancels (Esc). Returns true if
+    // the field is typeable (Name or numeric) and entry mode ran; false for an enum/toggle field or a bad
+    // index/field/typo — so a test can assert enum fields reject typing.
+    public bool TypeFieldForTest(int entryIndex, string fieldName, string typed, bool confirm)
+    {
+        if (entryIndex < 0 || entryIndex >= _editables.Count) return false;
+        if (!Enum.TryParse<Field>(fieldName, out var f)) return false;
+        var entry = _editables[entryIndex];
+        int fi = Array.IndexOf(FieldsFor(entry), f);
+        if (fi < 0) return false;                                   // field not on this entry's panel
+        _selected = entryIndex; _fieldIndex = fi;
+        if (f != Field.Name && !IsNumericField(f)) return false;    // enum/toggle: not typeable
+        BeginFieldEntry(entry, f);
+        foreach (char c in typed) TryAppendEntryChar(c);            // exercise the real per-key filter
+        if (confirm) ConfirmFieldEntry(); else CancelFieldEntry();
+        return true;
+    }
+
+    // N/M steps a field (dir -1/+1) headlessly — used to assert enum/toggle fields still cycle. No-op for a
+    // bad index/field name.
+    public void StepFieldForTest(int entryIndex, string fieldName, int dir)
+    {
+        if (entryIndex < 0 || entryIndex >= _editables.Count) return;
+        if (!Enum.TryParse<Field>(fieldName, out var f)) return;
+        AdjustField(f, _editables[entryIndex], dir);
+    }
+
+    // The string the panel shows for a field (so a test can read back the enum/toggle display). No-op-safe.
+    public string FieldValueForTest(int entryIndex, string fieldName)
+    {
+        if (entryIndex < 0 || entryIndex >= _editables.Count) return "";
+        if (!Enum.TryParse<Field>(fieldName, out var f)) return "";
+        return FieldValue(f, _editables[entryIndex]);
+    }
+
+    // Spawns the current type headlessly — the action the relocated [B] key triggers. Returns the new
+    // editable count so a test can assert the spawn worked.
+    public int SpawnForTest() { SpawnCurrent(); return _editables.Count; }
+
+    // Inspection/test accessors for the local player body (B-camera): its stable id + system name, whether
+    // it leaked into the editables list (it must NOT — it's the player, not world content), and its current
+    // world position + the derived camera position.
+    public int LocalBodyId => _localBodyId;
+    public string LocalBodyName => $"player #{_localBodyId}";
+    public bool LocalBodyInEditables => _editables.Any(e => ReferenceEquals(e.Instance, _localBody));
+    public Vector3 LocalBodyPosition => _localBody.Position;
+    public Vector3 CameraPosition => _myCamera.Position;
+    public CameraMode CurrentCameraMode => _cameraMode;
 
     // Test hook: advance the authority physics one step (so a headless test can verify stability
     // without the interactive render loop). Same call the Update loop makes.
@@ -2053,17 +2304,24 @@ public class PriviewNetworkScene : Scene
         Vector3 forward = new Vector3(1, 0, 0).Rotate(yawRotation);
         Vector3 right   = new Vector3(0, 0, 1).Rotate(yawRotation);
 
-        if (Input.IsGetKey(ConsoleKey.W)) _myCamera.Position += forward * moveSpeed * dt;
-        if (Input.IsGetKey(ConsoleKey.S)) _myCamera.Position -= forward * moveSpeed * dt;
-        if (Input.IsGetKey(ConsoleKey.D)) _myCamera.Position += right * moveSpeed * dt;
-        if (Input.IsGetKey(ConsoleKey.A)) _myCamera.Position -= right * moveSpeed * dt;
+        // WASD moves the BODY (the physical anchor); the camera derives from it in SyncCameraToBody.
+        if (Input.IsGetKey(ConsoleKey.W)) _localBody.Position += forward * moveSpeed * dt;
+        if (Input.IsGetKey(ConsoleKey.S)) _localBody.Position -= forward * moveSpeed * dt;
+        if (Input.IsGetKey(ConsoleKey.D)) _localBody.Position += right * moveSpeed * dt;
+        if (Input.IsGetKey(ConsoleKey.A)) _localBody.Position -= right * moveSpeed * dt;
         // F1 toggles free-fly / walk. Vertical Space/C only fly when NOT walking; in walk mode Space
         // jumps (handled in StepPlayerPhysics, which reads it edge-triggered).
         if (Pressed(ConsoleKey.F1)) _flyMode = !_flyMode;
+        // F7 toggles the camera rig 1st <-> 3rd person (a purely local view choice — works on every peer).
+        if (Pressed(ConsoleKey.F7))
+        {
+            _cameraMode = _cameraMode == CameraMode.ThirdPerson ? CameraMode.FirstPerson : CameraMode.ThirdPerson;
+            ApplyCameraMode();
+        }
         if (!PlayerWalking)
         {
-            if (Input.IsGetKey(ConsoleKey.Spacebar)) _myCamera.Position.Y += moveSpeed * dt;
-            if (Input.IsGetKey(ConsoleKey.C))        _myCamera.Position.Y -= moveSpeed * dt;
+            if (Input.IsGetKey(ConsoleKey.Spacebar)) _localBody.Position.Y += moveSpeed * dt;
+            if (Input.IsGetKey(ConsoleKey.C))        _localBody.Position.Y -= moveSpeed * dt;
         }
 
         if (Input.IsGetKey(ConsoleKey.OemPlus)) _mainLight.LightPower += moveSpeed * 50 * dt;
@@ -2099,12 +2357,7 @@ public class PriviewNetworkScene : Scene
     
     private void CreateRemotePlayer(int netId)
     {
-        Object3d newPlayerCube = CreateCube();
-        Rgba32[] palette = { new Rgba32(255, 0, 0), new Rgba32(0, 255, 0), new Rgba32(0, 0, 255), new Rgba32(255, 255, 0), new Rgba32(0, 255, 255), new Rgba32(255, 0, 255) };
-        newPlayerCube.Color = palette[netId % palette.Length];
-        newPlayerCube.Collides = false;   // a remote-player avatar never blocks the local camera
-        newPlayerCube.Gravity = false;    // remote avatars are driven by network transforms, never local gravity
-
+        Object3d newPlayerCube = CreatePlayerAvatar(netId);   // same avatar shape/colour as the local body
         _remotePlayers.Add(netId, newPlayerCube);
         AddDisplaysObject(newPlayerCube);
     }
@@ -2169,6 +2422,227 @@ public class PriviewNetworkScene : Scene
         }
     }
     
+    // ---- Object identity: id + name (B-identity) ----
+
+    // The user-given name for an entry: the platform's rides on its live PlatformConfig; every other
+    // object's on its descriptor. "" means "no user name — show the derived system name".
+    private static string UserName(EditEntry e) => (e.Platform != null ? e.Platform.Name : e.Descriptor.Name) ?? "";
+
+    private static void SetUserName(EditEntry e, string name)
+    {
+        if (e.Platform != null) e.Platform.Name = name;   // platform saves via _world.Platform
+        e.Descriptor.Name = name;                         // descriptor rides FromInstance for every other object
+    }
+
+    // Derived, never stored: "{type} #{id}" (e.g. "cube #3", "light #5", "platform #0").
+    public static string SystemName(EditEntry e) => $"{e.Descriptor.Type} #{e.Descriptor.Id}";
+
+    // What the panel shows: the user name, or the system name when the user hasn't named it.
+    public static string DisplayName(EditEntry e)
+    {
+        string n = UserName(e);
+        return string.IsNullOrWhiteSpace(n) ? SystemName(e) : n;
+    }
+
+    // Whether a field takes a TYPED numeric value (Enter → parse + clamp). Everything else is either the
+    // Name (its own text path) or an enum/toggle that only makes sense to cycle with N/M.
+    private static bool IsNumericField(Field f) => f switch
+    {
+        Field.PosX or Field.PosY or Field.PosZ or
+        Field.RotX or Field.RotY or Field.RotZ or
+        Field.Scale or Field.RotateSpeed or
+        Field.ColorR or Field.ColorG or Field.ColorB or Field.ColorA or
+        Field.Radius or Field.Power or Field.ClrInf or
+        Field.DirX or Field.DirY or Field.DirZ or
+        Field.ConeAngle or Field.AreaSize or Field.Spin or Field.Beams or
+        Field.PlatSize or Field.PlatWidth or Field.PlatDepth or
+        Field.Mass or Field.Restitution or Field.Friction or Field.RollingFriction or
+        Field.ColorFade or Field.TextureScale => true,
+        _ => false,   // Name (text), Kind/AreaShape/Shape/PlatShape/Texture/TexFace/TexFilter/Collides/Gravity/Collider (cycle/toggle)
+    };
+
+    // Enters inline typed-entry for field `f` on entry `e`: seed the buffer (the Name field with its
+    // current name, so it can be edited; a numeric field EMPTY, for a clean exact value) and drain any
+    // buffered keys (incl. the Enter that opened it) so they don't leak into the buffer.
+    private void BeginFieldEntry(EditEntry e, Field f)
+    {
+        _entryMode = true;
+        _entryField = f;
+        _entryBuffer = f == Field.Name ? UserName(e) : "";
+        // Drain the trigger key (and any buffered keys) so they don't leak into the buffer. Guard against a
+        // redirected/absent console (headless self-tests) where Console.KeyAvailable throws.
+        while (!Console.IsInputRedirected && Console.KeyAvailable) Console.ReadKey(true);
+    }
+
+    private void CancelFieldEntry() { _entryMode = false; _entryBuffer = ""; }
+
+    // Appends one keystroke to the entry buffer under the active field's rules: the Name field takes
+    // name-safe chars (letters/digits/space/-/_, capped 32); a numeric field takes digits plus a single
+    // leading '-' and a single '.', capped 16. Returns whether the char was accepted.
+    private bool TryAppendEntryChar(char c)
+    {
+        if (_entryField == Field.Name)
+        {
+            if ((char.IsLetterOrDigit(c) || c == ' ' || c == '-' || c == '_') && _entryBuffer.Length < 32)
+            { _entryBuffer += c; return true; }
+            return false;
+        }
+        bool numOk = char.IsDigit(c)
+                     || (c == '-' && _entryBuffer.Length == 0)     // leading sign only
+                     || (c == '.' && !_entryBuffer.Contains('.')); // single decimal point
+        if (numOk && _entryBuffer.Length < 16) { _entryBuffer += c; return true; }
+        return false;
+    }
+
+    // Confirms the inline entry (the Enter path): the Name writes as text; a numeric buffer is PARSED and
+    // routed through SetNumericField (which clamps to the field's range). An empty/invalid/NaN buffer
+    // leaves the value UNCHANGED (a safe cancel), never throwing.
+    private void ConfirmFieldEntry()
+    {
+        if (_selected >= 0 && _selected < _editables.Count)
+        {
+            var entry = _editables[_selected];
+            if (_entryField == Field.Name)
+            {
+                SetUserName(entry, _entryBuffer.Trim());
+                _editDirty = true;   // stream/save the rename like any other edit
+            }
+            else if (float.TryParse(_entryBuffer, NumberStyles.Float, CultureInfo.InvariantCulture, out float v)
+                     && !float.IsNaN(v) && !float.IsInfinity(v))
+            {
+                SetNumericField(_entryField, entry, v);   // clamps to range + side effects
+                _editDirty = true;
+            }
+            // else: empty/invalid -> leave the value unchanged (cancel), never crash
+        }
+        _entryMode = false; _entryBuffer = "";
+    }
+
+    // Text entry for the inline field buffer (mirrors HandleChatInput): Enter confirms, Esc cancels,
+    // Backspace deletes, and the per-field filter (TryAppendEntryChar) gates accepted chars.
+    private void HandleFieldEntryInput()
+    {
+        while (Console.KeyAvailable)
+        {
+            var keyInfo = Console.ReadKey(true);
+            if (keyInfo.Key == ConsoleKey.Enter) ConfirmFieldEntry();
+            else if (keyInfo.Key == ConsoleKey.Escape) CancelFieldEntry();   // cancel: leave the value unchanged
+            else if (keyInfo.Key == ConsoleKey.Backspace)
+            {
+                if (_entryBuffer.Length > 0) _entryBuffer = _entryBuffer.Substring(0, _entryBuffer.Length - 1);
+            }
+            else TryAppendEntryChar(keyInfo.KeyChar);   // the per-field filter accepts/rejects (Name allows space; numeric doesn't)
+        }
+    }
+
+    // Sets a NUMERIC field to an absolute value, clamped to the SAME range N/M uses and with the SAME side
+    // effects (geometry/marker/derived-colour updates) — keep this in lockstep with AdjustField's clamps.
+    // Non-numeric fields (Name/enums/toggles) are never routed here.
+    private void SetNumericField(Field f, EditEntry entry, float v)
+    {
+        var inst = entry.Instance;
+        var o = inst as Object3d;
+        switch (f)
+        {
+            case Field.PosX: inst.Position.X = v; o?.UpdateGeometry(); SyncLightToMarker(entry); break;
+            case Field.PosY: inst.Position.Y = v; o?.UpdateGeometry(); SyncLightToMarker(entry); break;
+            case Field.PosZ: inst.Position.Z = v; o?.UpdateGeometry(); SyncLightToMarker(entry); break;
+            case Field.RotX: inst.LocalRotate.X = v; o?.UpdateGeometry(); break;
+            case Field.RotY: inst.LocalRotate.Y = v; o?.UpdateGeometry(); break;
+            case Field.RotZ: inst.LocalRotate.Z = v; o?.UpdateGeometry(); break;
+            case Field.Scale:
+                if (o != null) { o.Scale = MathF.Max(0.01f, v); o.UpdateGeometry(); }
+                break;
+            case Field.RotateSpeed:
+                if (o != null) o.RotateSpeed = v;
+                break;
+            case Field.ColorR: inst.Color = new Rgba32((byte)Math.Clamp((int)MathF.Round(v), 0, 255), inst.Color.G, inst.Color.B, inst.Color.A); SyncColorDerived(entry); break;
+            case Field.ColorG: inst.Color = new Rgba32(inst.Color.R, (byte)Math.Clamp((int)MathF.Round(v), 0, 255), inst.Color.B, inst.Color.A); SyncColorDerived(entry); break;
+            case Field.ColorB: inst.Color = new Rgba32(inst.Color.R, inst.Color.G, (byte)Math.Clamp((int)MathF.Round(v), 0, 255), inst.Color.A); SyncColorDerived(entry); break;
+            case Field.ColorA: inst.Color = new Rgba32(inst.Color.R, inst.Color.G, inst.Color.B, (byte)Math.Clamp((int)MathF.Round(v), 0, 255)); SyncColorDerived(entry); break;
+            case Field.Radius:
+                if (inst is Sphere s) s.R = MathF.Max(0.01f, v);
+                break;
+            case Field.Mass:
+                inst.Mass = MathF.Max(MassMin, v);
+                break;
+            case Field.Restitution:
+                // Same semantics as N/M: a negative typed value returns to "inherit world"; else clamp 0..1.
+                inst.Restitution = v < 0f ? -1f : MathF.Min(1f, v);
+                break;
+            case Field.Friction:
+                inst.Friction = Math.Clamp(v, 0f, FrictionMax);
+                break;
+            case Field.RollingFriction:
+                inst.RollingFriction = Math.Clamp(v, 0f, 1f);
+                break;
+            case Field.ColorFade:
+                inst.ColorFade = Math.Clamp(v, 0f, 1f);
+                if (entry.Light != null) entry.Light.ColorFade = inst.ColorFade;   // pale the emitted colour too
+                break;
+            case Field.TextureScale:
+                inst.TextureScale = Math.Clamp(v, 0.1f, 10f);
+                break;
+            case Field.Power:
+                if (entry.Light != null) entry.Light.LightPower = MathF.Max(0f, v);
+                break;
+            case Field.ClrInf:
+                if (entry.Light != null) entry.Light.ColorInfluence = Math.Clamp(v, 0f, 1f);
+                break;
+            case Field.DirX: SetDirectionComponent(entry, 0, v); break;
+            case Field.DirY: SetDirectionComponent(entry, 1, v); break;
+            case Field.DirZ: SetDirectionComponent(entry, 2, v); break;
+            case Field.ConeAngle:
+                if (entry.Light != null) { entry.Light.ConeAngleDeg = Math.Clamp(v, 1f, 89f); RebuildLightMarker(entry); }
+                break;
+            case Field.AreaSize:
+                if (entry.Light != null)
+                {
+                    entry.Light.AreaSize = MathF.Max(0.05f, v);
+                    if (entry.Light.Kind == LightKind.Area && entry.Instance is Object3d am)
+                    { am.Scale = entry.Light.AreaSize; am.UpdateGeometry(); }   // shaped marker tracks the area size
+                }
+                break;
+            case Field.Spin:
+                if (entry.Light != null) entry.Light.SpinSpeed = v;
+                break;
+            case Field.Beams:
+                if (entry.Light != null) { entry.Light.BeamCount = Math.Clamp((int)MathF.Round(v), 1, 8); RebuildLightMarker(entry); }
+                break;
+            case Field.PlatSize:
+                if (entry.Platform != null) { entry.Platform.Size = MathF.Max(PlatformMin, v); RebuildFloor(entry); }
+                break;
+            case Field.PlatWidth:
+                if (entry.Platform != null) { entry.Platform.Width = MathF.Max(PlatformMin, v); RebuildFloor(entry); }
+                break;
+            case Field.PlatDepth:
+                if (entry.Platform != null) { entry.Platform.Depth = MathF.Max(PlatformMin, v); RebuildFloor(entry); }
+                break;
+        }
+    }
+
+    // Sets one direction component (0=X,1=Y,2=Z) to an absolute value, reusing AdjustDirection's
+    // renormalize + marker re-aim by feeding it the delta from the current component.
+    private void SetDirectionComponent(EditEntry entry, int axis, float v)
+    {
+        if (entry.Light == null) return;
+        Vector3 d = entry.Light.Direction;
+        float cur = axis == 0 ? d.X : axis == 1 ? d.Y : d.Z;
+        Vector3 delta = axis == 0 ? new Vector3(v - cur, 0f, 0f)
+                       : axis == 1 ? new Vector3(0f, v - cur, 0f)
+                                   : new Vector3(0f, 0f, v - cur);
+        AdjustDirection(entry, delta);
+    }
+
+    // Rebuilds a light's marker mesh from its current fields (cone shape/angle/beam-fan/area). Shared by
+    // the typed setters that change cone geometry, mirroring AdjustField's inline ReplaceMarker calls.
+    private void RebuildLightMarker(EditEntry entry)
+    {
+        if (entry.Light == null) return;
+        ReplaceMarker(entry, BuildLightMarker(entry.Light.Kind, entry.Light.Direction, entry.Light.AreaSize,
+            entry.Light.ConeShape, entry.Light.ConeAngleDeg, entry.Light.AreaShape, entry.Light.BeamCount));
+    }
+
     private void OnChatReceived(ChatPacket packet, int senderId)
     {
         // Server is a hub: re-broadcast to all clients (the original sender ignores its own echo below).
@@ -2212,18 +2686,41 @@ public class PriviewNetworkScene : Scene
         // Send the LIVE world (current instances + live ids), not the stale last-saved _world,
         // so a client joining mid-edit sees exactly what the server has now.
         var live = BuildLiveWorldConfig();
-        var sync = WorldSync.Pack(live, AppPaths.ModelsFolder);
+        var sync = WorldSync.Pack(live, AppPaths.ModelsFolder, AppPaths.TexturesFolder);
+        int connId = _netManager?.LastSenderConnId ?? -1;
+
+        // Stream every LARGE referenced texture (too big to inline) as chunks to THIS requester FIRST, so
+        // that — TCP being reliable + ordered — the peer materializes them to disk before the world packet
+        // below triggers its build. Small textures already ride inline in `sync`.
+        int chunkTex = 0, chunkParts = 0;
+        foreach (var kv in WorldSync.ReadLargeTextures(live, AppPaths.TexturesFolder))
+        {
+            byte[] bytes = kv.Value;
+            int total = (bytes.Length + MeshChunkSize - 1) / MeshChunkSize;
+            for (int i = 0; i < total; i++)
+            {
+                int start = i * MeshChunkSize;
+                int len = Math.Min(MeshChunkSize, bytes.Length - start);
+                byte[] slice = new byte[len];
+                Array.Copy(bytes, start, slice, 0, len);
+                _netManager?.SendPacketTo(connId,
+                    new TextureChunkPacket { TextureName = kv.Key, Index = i, Total = total, Data = slice }, _myNetId);
+                chunkParts++;
+            }
+            chunkTex++;
+        }
+
         // Answer ONLY the requester — broadcasting would rebuild every already-connected client's world.
-        _netManager?.SendPacketTo(_netManager.LastSenderConnId, sync, _myNetId);
-        Logger.Info($"Sent world '{live.Name}' to client {senderId} ({sync.MeshTexts.Count} mesh file(s)).");
+        _netManager?.SendPacketTo(connId, sync, _myNetId);
+        Logger.Info($"Sent world '{live.Name}' to client {senderId} ({sync.MeshTexts.Count} mesh file(s), {sync.TextureData.Count} inline texture(s), {chunkTex} streamed texture(s) in {chunkParts} chunk(s)).");
     }
 
     // Client side: the world arrived. Runs on the main thread (via ProcessEvents in Update),
     // so it is safe to rebuild the scene here — Update fully precedes the render each frame.
     private void OnWorldSyncReceived(WorldSyncPacket packet, int senderId)
     {
-        var (world, meshTexts) = WorldSync.Unpack(packet);
-        ApplyReceivedWorld(world, meshTexts);
+        var (world, meshTexts, textureData) = WorldSync.Unpack(packet);
+        ApplyReceivedWorld(world, meshTexts, textureData);
     }
 
     // Client side: a server edit delta arrived. Runs on the main thread (via ProcessEvents in
@@ -2377,6 +2874,28 @@ public class PriviewNetworkScene : Scene
         _meshChunks.Remove(packet.MeshName);
     }
 
+    // Client: a slice of a streamed texture arrived — buffer by Index; once all parts are present,
+    // concatenate the bytes and write the .png to received/textures/. Mirrors OnMeshChunkReceived, but
+    // for a BINARY payload. Ordered before the WorldSyncPacket by TCP, so the file is on disk in time.
+    private void OnTextureChunkReceived(TextureChunkPacket packet, int senderId)
+    {
+        if (!_textureChunks.TryGetValue(packet.TextureName, out var buf) || buf.parts.Length != packet.Total)
+        {
+            buf = (packet.Total, new byte[packet.Total][]);
+            _textureChunks[packet.TextureName] = buf;
+        }
+        if (packet.Index < 0 || packet.Index >= buf.total) return;   // out-of-range guard
+        buf.parts[packet.Index] = packet.Data;
+
+        if (buf.parts.Any(p => p == null)) return;   // still waiting on parts
+        int totalLen = buf.parts.Sum(p => p.Length);
+        byte[] full = new byte[totalLen];
+        int off = 0;
+        foreach (var part in buf.parts) { Array.Copy(part, 0, full, off, part.Length); off += part.Length; }
+        MaterializeTexture(packet.TextureName, full);
+        _textureChunks.Remove(packet.TextureName);
+    }
+
     // Writes one received mesh to received/<name>.obj (idempotent overwrite). Shared by the 4b
     // bulk world download and the 5b Spawn handler that streams a brand-new mesh in real time.
     private static void MaterializeMesh(string name, string objText)
@@ -2389,12 +2908,30 @@ public class PriviewNetworkScene : Scene
         catch (Exception ex) { Logger.Error($"Failed writing received mesh '{name}'", ex); }
     }
 
-    private void ApplyReceivedWorld(WorldConfig world, IReadOnlyDictionary<string, string> meshTexts)
+    // Client: one reassembled/inline texture arrives — write its raw PNG bytes to received/textures/<name>
+    // (idempotent overwrite), where the loader decodes it exactly like a local file. Mirrors MaterializeMesh.
+    private static void MaterializeTexture(string name, byte[] pngBytes)
     {
-        // 1) Materialize the received meshes into a dedicated folder (never the user's models/).
+        try
+        {
+            Directory.CreateDirectory(AppPaths.ReceivedTexturesFolder);
+            File.WriteAllBytes(Path.Combine(AppPaths.ReceivedTexturesFolder, name), pngBytes);
+        }
+        catch (Exception ex) { Logger.Error($"Failed writing received texture '{name}'", ex); }
+    }
+
+    private void ApplyReceivedWorld(WorldConfig world, IReadOnlyDictionary<string, string> meshTexts,
+                                    IReadOnlyDictionary<string, byte[]> textureData)
+    {
+        // 1) Materialize the received meshes + inline textures into dedicated folders (never the user's
+        //    models/ or textures/). Large textures already streamed via chunks (materialized on arrival,
+        //    which — TCP being ordered — precedes this packet, so they are on disk before the build below).
         foreach (var kv in meshTexts)
             MaterializeMesh(kv.Key, kv.Value);
+        foreach (var kv in textureData)
+            MaterializeTexture(kv.Key, kv.Value);
         _modelsFolder = AppPaths.ReceivedFolder;
+        _texturesFolder = AppPaths.ReceivedTexturesFolder;
 
         // 2) Tear down the current world's objects + platform (camera stays; lights reconciled below).
         foreach (var e in _editables)
@@ -2411,7 +2948,7 @@ public class PriviewNetworkScene : Scene
         // 3) Build the received world (BuildWorldObject loads meshes from _modelsFolder == received/).
         _world = world;
         // Adopt the server's ids verbatim (do NOT reassign); future local spawns (5b) start past them.
-        _nextObjectId = _world.Objects.Count == 0 ? 0 : _world.Objects.Max(o => o.Id) + 1;
+        _nextObjectId = _world.Objects.Count == 0 ? PlatformId + 1 : _world.Objects.Max(o => o.Id) + 1;   // never hand out id 0 (platform)
         BuildPlatform();
         foreach (var o in _world.Objects)
             BuildWorldObject(o);
@@ -2425,53 +2962,107 @@ public class PriviewNetworkScene : Scene
         // 5) Done — drop the waiting overlay (replace on a repeat send).
         _awaitingWorld = false;
         _worldReceived = true;
-        Logger.Info($"Applied received world '{_world.Name}': {_world.Objects.Count} objects, {meshTexts.Count} mesh file(s).");
+        Logger.Info($"Applied received world '{_world.Name}': {_world.Objects.Count} objects, {meshTexts.Count} mesh file(s), {textureData.Count} inline texture(s) (+ any streamed to received/textures).");
     }
 
     public static Object3d CreateCube()
     {
-        return new Object3d(
-            new Vector3[]
-            {
-                new Vector3(-1f, -1f, 1f),   
-                new Vector3(-1f, 1f, 1f),
-                new Vector3(-1f, -1f, -1f),
-                new Vector3(-1f, 1f, -1f),
-                new Vector3(1f, -1f, 1f),
-                new Vector3(1f, 1f, 1f),
-                new Vector3(1f, -1f, -1f),
-                new Vector3(1f, 1f, -1f)
-            },
-            new Vector3[]
-            {
-                new Vector3(-1f, 0, 0),
-                new Vector3(0, 0, -1f),
-                new Vector3(1f, 0, 0),
-                new Vector3(0, 0, 1f),
-                new Vector3(0, -1f, 0),
-                new Vector3(0, 1f, 0)
-            },
-            new FacingInfo[]
-            {
-                new FacingInfo(new int[] {2,3,1}, 1),
-                new FacingInfo(new int[] {4,7,3}, 2),
-                new FacingInfo(new int[] {8,5,7}, 3),
-                new FacingInfo(new int[] {6,1,5}, 4),
-                new FacingInfo(new int[] {7,1,3}, 5),
-                new FacingInfo(new int[] {4,6,8}, 6),
-                new FacingInfo(new int[] {2,4,3}, 1),
-                new FacingInfo(new int[] {4,8,7}, 2),
-                new FacingInfo(new int[] {8,6,5}, 3),
-                new FacingInfo(new int[] {6,2,1}, 4),
-                new FacingInfo(new int[] {7,5,1}, 5),
-                new FacingInfo(new int[] {4,2,6}, 6)
-            });
+        var verts = new Vector3[]
+        {
+            new Vector3(-1f, -1f, 1f),
+            new Vector3(-1f, 1f, 1f),
+            new Vector3(-1f, -1f, -1f),
+            new Vector3(-1f, 1f, -1f),
+            new Vector3(1f, -1f, 1f),
+            new Vector3(1f, 1f, 1f),
+            new Vector3(1f, -1f, -1f),
+            new Vector3(1f, 1f, -1f)
+        };
+        var normals = new Vector3[]
+        {
+            new Vector3(-1f, 0, 0),
+            new Vector3(0, 0, -1f),
+            new Vector3(1f, 0, 0),
+            new Vector3(0, 0, 1f),
+            new Vector3(0, -1f, 0),
+            new Vector3(0, 1f, 0)
+        };
+        var faces = new FacingInfo[]
+        {
+            new FacingInfo(new int[] {2,3,1}, 1),
+            new FacingInfo(new int[] {4,7,3}, 2),
+            new FacingInfo(new int[] {8,5,7}, 3),
+            new FacingInfo(new int[] {6,1,5}, 4),
+            new FacingInfo(new int[] {7,1,3}, 5),
+            new FacingInfo(new int[] {4,6,8}, 6),
+            new FacingInfo(new int[] {2,4,3}, 1),
+            new FacingInfo(new int[] {4,8,7}, 2),
+            new FacingInfo(new int[] {8,6,5}, 3),
+            new FacingInfo(new int[] {6,2,1}, 4),
+            new FacingInfo(new int[] {7,5,1}, 5),
+            new FacingInfo(new int[] {4,2,6}, 6)
+        };
+        return new Object3d(verts, normals, faces, GenerateBoxUvs(verts, normals, faces), GenerateBoxGroups(normals, faces));
+    }
+
+    // Face-group id per cube triangle = which of the 6 axis faces it belongs to, ordered to match the
+    // editor's TextureFace options: 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z. Two triangles share each group.
+    private static int[] GenerateBoxGroups(Vector3[] normals, FacingInfo[] faces)
+    {
+        var g = new int[faces.Length];
+        for (int f = 0; f < faces.Length; f++) g[f] = AxisGroup(normals[faces[f].Normal1 - 1]);
+        return g;
+    }
+
+    // Maps an axis-aligned face normal to a group id in +X,-X,+Y,-Y,+Z,-Z order (0..5).
+    private static int AxisGroup(Vector3 n)
+    {
+        float ax = MathF.Abs(n.X), ay = MathF.Abs(n.Y), az = MathF.Abs(n.Z);
+        if (ax >= ay && ax >= az) return n.X >= 0f ? 0 : 1;
+        if (ay >= az)             return n.Y >= 0f ? 2 : 3;
+        return n.Z >= 0f ? 4 : 5;
+    }
+
+    // The texture-face options for a given object type (beyond "All"): the cube exposes its 6 sides; every
+    // other shape is a single "whole" group, so it offers only "All". Used by the editor's Field.TextureFace.
+    public static readonly string[] CubeFaceNames = { "+X", "-X", "+Y", "-Y", "+Z", "-Z" };
+    public static string[] TextureFaceOptions(string? type)
+        => string.Equals(type?.Trim(), "cube", StringComparison.OrdinalIgnoreCase) ? CubeFaceNames : Array.Empty<string>();
+
+    // Procedural UVs for an axis-aligned box in [-1,1]^3: each of the 6 faces maps the FULL texture
+    // (0,0)–(1,1). For each face corner, drop the axis the face normal points along and remap the two
+    // remaining (tangent) coordinates from [-1,1] to [0,1]. Returned in face/corner order — length
+    // faces.Length*3 — matching the Object3d build loop (uvs[f*3 + 0..2] are face f's three corners).
+    private static Vector2[] GenerateBoxUvs(Vector3[] verts, Vector3[] normals, FacingInfo[] faces)
+    {
+        var uvs = new Vector2[faces.Length * 3];
+        for (int f = 0; f < faces.Length; f++)
+        {
+            var fi = faces[f];
+            Vector3 n = normals[fi.Normal1 - 1];
+            uvs[f * 3]     = BoxCornerUv(verts[fi.Vertex1 - 1], n);
+            uvs[f * 3 + 1] = BoxCornerUv(verts[fi.Vertex2 - 1], n);
+            uvs[f * 3 + 2] = BoxCornerUv(verts[fi.Vertex3 - 1], n);
+        }
+        return uvs;
+    }
+
+    private static Vector2 BoxCornerUv(Vector3 p, Vector3 n)
+    {
+        float ax = MathF.Abs(n.X), ay = MathF.Abs(n.Y), az = MathF.Abs(n.Z);
+        float u, v;
+        if (ax >= ay && ax >= az) { u = p.Z; v = p.Y; }        // ±X face: tangents Z (u), Y (v)
+        else if (ay >= ax && ay >= az) { u = p.X; v = p.Z; }   // ±Y face: tangents X (u), Z (v)
+        else { u = p.X; v = p.Y; }                             // ±Z face: tangents X (u), Y (v)
+        return new Vector2((u + 1f) * 0.5f, (v + 1f) * 0.5f);
     }
 
     // Builds a flat-shaded Object3d from local vertices + 1-based triangle index triples: one
     // normal per face, taken from the winding (Cross(b-a, c-a)) so the supplied normal always
     // agrees with the renderer's winding-based back-face test. Mirrors CreateCube's flat style.
-    private static Object3d BuildFlat(List<Vector3> verts, List<(int a, int b, int c)> tris)
+    // uvs (optional): per-face-corner texture coordinates in face order (length tris.Count*3), threaded
+    // straight into the Object3d ctor; null = untextured (Zero UVs, ignored unless a Texture is set).
+    private static Object3d BuildFlat(List<Vector3> verts, List<(int a, int b, int c)> tris, Vector2[]? uvs = null)
     {
         var vertArr = verts.ToArray();
         var normals = new Vector3[tris.Count];
@@ -2484,7 +3075,7 @@ public class PriviewNetworkScene : Scene
             normals[k] = Vector3.Cross(e1, e2).Norm();
             faces[k] = new FacingInfo(new int[] { a, b, c }, k + 1);
         }
-        return new Object3d(vertArr, normals, faces);
+        return new Object3d(vertArr, normals, faces, uvs);
     }
 
     // Unit-ish cylinder: radius 1, y in [-1, 1], origin-centred like the cube, with end caps.
@@ -2500,16 +3091,23 @@ public class PriviewNetworkScene : Scene
         int B(int s) => (s % seg) + 1;          // bottom ring (1-based)
         int T(int s) => seg + (s % seg) + 1;    // top ring (1-based)
 
+        // Procedural UVs built ALONGSIDE the tris (same order), so the seam segment reaches u=1 while the
+        // first reaches u=0 — no shared-vertex conflict because UVs are stored PER FACE-CORNER, not per
+        // vertex. Side: u = angle fraction, v = height (bottom row v=1, top v=0). Caps: the ring wrapped
+        // onto a disc in the texture, centre (0.5,0.5). Linear interp → bit-exact CPU↔GPU parity.
+        Vector2 Cap(int s) { float a = MathF.Tau * s / seg; return new Vector2(0.5f + 0.5f * MathF.Cos(a), 0.5f + 0.5f * MathF.Sin(a)); }
         var tris = new List<(int, int, int)>();
+        var uvs = new List<Vector2>();
         for (int s = 0; s < seg; s++)
         {
             int b0 = B(s), b1 = B(s + 1), t0 = T(s), t1 = T(s + 1);
-            tris.Add((b0, t1, b1));   // side quad (two outward-wound tris)
-            tris.Add((b0, t0, t1));
-            tris.Add((tc, t1, t0));   // top cap (+Y)
-            tris.Add((bc, b0, b1));   // bottom cap (-Y)
+            float u0 = (float)s / seg, u1 = (float)(s + 1) / seg;
+            tris.Add((b0, t1, b1)); uvs.Add(new Vector2(u0, 1f)); uvs.Add(new Vector2(u1, 0f)); uvs.Add(new Vector2(u1, 1f));   // side quad
+            tris.Add((b0, t0, t1)); uvs.Add(new Vector2(u0, 1f)); uvs.Add(new Vector2(u0, 0f)); uvs.Add(new Vector2(u1, 0f));
+            tris.Add((tc, t1, t0)); uvs.Add(new Vector2(0.5f, 0.5f)); uvs.Add(Cap(s + 1)); uvs.Add(Cap(s));                     // top cap (+Y)
+            tris.Add((bc, b0, b1)); uvs.Add(new Vector2(0.5f, 0.5f)); uvs.Add(Cap(s)); uvs.Add(Cap(s + 1));                     // bottom cap (-Y)
         }
-        return BuildFlat(verts, tris);
+        return BuildFlat(verts, tris, uvs.ToArray());
     }
 
     // Unit-ish cone: base radius 1 at y=-1, apex at (0,1,0), with a base cap.
@@ -2523,13 +3121,20 @@ public class PriviewNetworkScene : Scene
 
         int B(int s) => (s % seg) + 1;
 
+        // UVs alongside the tris (see CreateCylinder): the side triangle spans u=[s,s+1]/seg at v=1 with
+        // the apex at the segment's u-midpoint at v=0; the base cap wraps the ring onto a disc (centre 0.5,0.5).
+        Vector2 Cap(int s) { float a = MathF.Tau * s / seg; return new Vector2(0.5f + 0.5f * MathF.Cos(a), 0.5f + 0.5f * MathF.Sin(a)); }
         var tris = new List<(int, int, int)>();
+        var uvs = new List<Vector2>();
         for (int s = 0; s < seg; s++)
         {
+            float u0 = (float)s / seg, u1 = (float)(s + 1) / seg;
             tris.Add((B(s), apex, B(s + 1)));   // side
+            uvs.Add(new Vector2(u0, 1f)); uvs.Add(new Vector2((u0 + u1) * 0.5f, 0f)); uvs.Add(new Vector2(u1, 1f));
             tris.Add((bc, B(s), B(s + 1)));     // base cap (-Y)
+            uvs.Add(new Vector2(0.5f, 0.5f)); uvs.Add(Cap(s)); uvs.Add(Cap(s + 1));
         }
-        return BuildFlat(verts, tris);
+        return BuildFlat(verts, tris, uvs.ToArray());
     }
 
     // Raw geometry for a spot-marker cone whose base CROSS-SECTION reflects the spot's ConeShape: apex
@@ -2626,7 +3231,30 @@ public class PriviewNetworkScene : Scene
             (1, 2, 3), (1, 3, 4),                          // base (-Y)
             (1, 5, 2), (2, 5, 3), (3, 5, 4), (4, 5, 1),    // sides
         };
-        return BuildFlat(verts, tris);
+        return BuildFlat(verts, tris, GeneratePyramidUvs(verts, tris));
+    }
+
+    // Procedural UVs for the pyramid, matching the cube's per-face "full texture" style. The two BASE
+    // tris (-Y) unwrap like the cube's -Y face: drop Y, remap X,Z from [-1,1]→[0,1]. Each triangular
+    // SIDE (baseA, apex, baseB — the apex is always the middle corner) drapes the texture with the two
+    // base corners at the bottom edge (0,0)/(1,0) and the apex at the top centre (0.5,1).
+    private static Vector2[] GeneratePyramidUvs(List<Vector3> v, List<(int a, int b, int c)> tris)
+    {
+        Vector2 Xz(Vector3 p) => new Vector2((p.X + 1f) * 0.5f, (p.Z + 1f) * 0.5f);
+        var uvs = new Vector2[tris.Count * 3];
+        for (int t = 0; t < tris.Count; t++)
+        {
+            var (a, b, c) = tris[t];
+            if (t < 2)   // base
+            {
+                uvs[t * 3] = Xz(v[a - 1]); uvs[t * 3 + 1] = Xz(v[b - 1]); uvs[t * 3 + 2] = Xz(v[c - 1]);
+            }
+            else         // side: (baseA, apex, baseB) → (0,0),(0.5,1),(1,0)
+            {
+                uvs[t * 3] = new Vector2(0f, 0f); uvs[t * 3 + 1] = new Vector2(0.5f, 1f); uvs[t * 3 + 2] = new Vector2(1f, 0f);
+            }
+        }
+        return uvs;
     }
 
     // A wedge / RAMP: a triangular prism whose top is a 45° inclined plane rising in +X (the high edge is
@@ -2651,7 +3279,27 @@ public class PriviewNetworkScene : Scene
             (1, 2, 3),              // front triangular cap (+Z)
             (4, 6, 5),              // back triangular cap (-Z)
         };
-        return BuildFlat(verts, tris);
+        return BuildFlat(verts, tris, GenerateRampUvs(verts, tris));
+    }
+
+    // Procedural UVs for the ramp, cube-style: each face maps the FULL texture (0,0)–(1,1). Axis-aligned
+    // faces drop the face-normal axis and remap the two tangent coords [-1,1]→[0,1] (like the cube); the
+    // sloped top (a diagonal-normal rectangle) is unwrapped along its own two edge directions — Z (depth,
+    // u) and the low→high rise (x, v). One projection per tri, indexed to match CreateRamp's tris order.
+    private static Vector2[] GenerateRampUvs(List<Vector3> v, List<(int a, int b, int c)> tris)
+    {
+        Vector2 Xz(Vector3 p) => new Vector2((p.X + 1f) * 0.5f, (p.Z + 1f) * 0.5f);   // -Y (drop Y)
+        Vector2 Zy(Vector3 p) => new Vector2((p.Z + 1f) * 0.5f, (p.Y + 1f) * 0.5f);   // +X wall (drop X)
+        Vector2 Xy(Vector3 p) => new Vector2((p.X + 1f) * 0.5f, (p.Y + 1f) * 0.5f);   // ±Z caps (drop Z)
+        Vector2 Slope(Vector3 p) => new Vector2((p.Z + 1f) * 0.5f, (p.X + 1f) * 0.5f); // sloped top: u=depth, v=rise
+        var proj = new Func<Vector3, Vector2>[] { Xz, Xz, Slope, Slope, Zy, Zy, Xy, Xy };
+        var uvs = new Vector2[tris.Count * 3];
+        for (int t = 0; t < tris.Count; t++)
+        {
+            var (a, b, c) = tris[t];
+            uvs[t * 3] = proj[t](v[a - 1]); uvs[t * 3 + 1] = proj[t](v[b - 1]); uvs[t * 3 + 2] = proj[t](v[c - 1]);
+        }
+        return uvs;
     }
 
     // Builds the platform floor for the given config: a square (Size half-extent), a
@@ -2688,6 +3336,35 @@ public class PriviewNetworkScene : Scene
                 new FacingInfo(new int[] {2,3,1}, 1),
                 new FacingInfo(new int[] {2,4,3}, 1),
             });
+    }
+
+    // A "flat picture" / billboard: a VERTICAL unit quad in the XY plane (origin-centred, ±1), standing
+    // up and facing ±Z. TWO-SIDED — the two triangles are duplicated with reversed winding so the
+    // winding-based back-face cull shows the image from EITHER side (mirrored on the back). Per-corner
+    // UVs map the FULL texture right-side-up (u=(x+1)/2 across; v=(1-y)/2 down, so the quad's top row is
+    // the image's top). Linear/barycentric interp → BIT-EXACT CPU↔GPU parity, like the cube/ramp.
+    public static Object3d CreateFlatPicture()
+    {
+        var verts = new List<Vector3>
+        {
+            new Vector3(-1f,  1f, 0f),   // 1 top-left
+            new Vector3( 1f,  1f, 0f),   // 2 top-right
+            new Vector3(-1f, -1f, 0f),   // 3 bottom-left
+            new Vector3( 1f, -1f, 0f),   // 4 bottom-right
+        };
+        var tris = new List<(int, int, int)>
+        {
+            (3, 4, 2), (3, 2, 1),   // front (+Z normal)
+            (3, 2, 4), (3, 1, 2),   // back  (-Z normal — reversed winding, so it's visible from behind)
+        };
+        Vector2 Uv(Vector3 p) => new Vector2((p.X + 1f) * 0.5f, (1f - p.Y) * 0.5f);
+        var uvs = new Vector2[tris.Count * 3];
+        for (int t = 0; t < tris.Count; t++)
+        {
+            var (a, b, c) = tris[t];
+            uvs[t * 3] = Uv(verts[a - 1]); uvs[t * 3 + 1] = Uv(verts[b - 1]); uvs[t * 3 + 2] = Uv(verts[c - 1]);
+        }
+        return BuildFlat(verts, tris, uvs);
     }
 
     // A flat disc on y=0: a triangle fan from the centre to a ring at the given radius, wound

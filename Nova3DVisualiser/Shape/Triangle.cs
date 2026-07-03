@@ -4,7 +4,7 @@ using Nova3DVisualiser.Interfaces.modifier;
 
 namespace Nova3DVisualiser.Shape;
 
-public class Triangle(int[] indices, Vector3 n0, Vector3 n1, Vector3 n2)
+public class Triangle(int[] indices, Vector3 n0, Vector3 n1, Vector3 n2, Vector2 uv0 = default, Vector2 uv1 = default, Vector2 uv2 = default, int group = 0)
 {
     private readonly int _i0 = indices[0];
     private readonly int _i1 = indices[1];
@@ -17,10 +17,26 @@ public class Triangle(int[] indices, Vector3 n0, Vector3 n1, Vector3 n2)
     private readonly Vector3 _n1 = n1;
     private readonly Vector3 _n2 = n2;
 
+    // Per-corner texture coordinates, parallel to the vertex normals. Zero for untextured geometry
+    // (interpolates to Zero, which the object ignores when it has no Texture).
+    private readonly Vector2 _uv0 = uv0;
+    private readonly Vector2 _uv1 = uv1;
+    private readonly Vector2 _uv2 = uv2;
+
+    // Face-group id (which "side" of the object this triangle belongs to) — used by per-object
+    // texture-face selection. 0 = the single "whole" group (default); the cube tags its 6 sides 0..5.
+    private readonly int _group = group;
+
     // Local-space vertex normals (exposed so the GPU snapshot can bake world-space normals).
     public Vector3 N0 => _n0;
     public Vector3 N1 => _n1;
     public Vector3 N2 => _n2;
+
+    public Vector2 Uv0 => _uv0;
+    public Vector2 Uv1 => _uv1;
+    public Vector2 Uv2 => _uv2;
+
+    public int Group => _group;
 
     public RenderData GetRenderData(Ray ray, Vector3[] worldVertices, Vector3 rotationForNormal)
     {
@@ -56,7 +72,11 @@ public class Triangle(int[] indices, Vector3 n0, Vector3 n1, Vector3 n2)
         Vector3 interpolated = _n0 * w0 + _n1 * u + _n2 * v;
         Vector3 finalNormal = interpolated.Rotate(rotationForNormal).Norm();
 
+        // Texture coordinate: the SAME barycentric blend as the normal, so a textured surface samples
+        // exactly where the smooth normal points. Zero for untextured triangles (ignored downstream).
+        Vector2 uv = _uv0 * w0 + _uv1 * u + _uv2 * v;
+
         Vector3 intersectionPoint = ray.GetIntersectionPoint(intersection);
-        return new RenderData(intersection, finalNormal, intersectionPoint);
+        return new RenderData(intersection, finalNormal, intersectionPoint, default, uv, _group);
     }
 }

@@ -57,7 +57,7 @@ Object physics is simulated **by the authority/solo** and each moved body's full
 - A **world** is a single `worlds/<name>.json` file that owns the whole scene: graphics toggles, the platform, and every object's full transform (position/rotation/scale/color/anchor and, for lights, kind/direction/cone/beams/shape/etc.).
 - `models/` is a **pure mesh library** — just `<name>.obj` files. The world references a mesh by name and supplies its placement.
 - An **in-scene editor** (toggled with `Tab`) lets you spawn, move, rotate, scale, recolor, and delete objects live, then save back to JSON.
-- Built-in spawn types: `cube`, `sphere`, `cylinder`, `cone`, `pyramid`, `ramp` (a wedge with a sloped top — great for rolling), `light`, plus every mesh in `models/`.
+- Built-in spawn types: `cube`, `sphere`, `cylinder`, `cone`, `pyramid`, `ramp` (a wedge with a sloped top — great for rolling), `flatpicture` (a two-sided vertical panel that displays a texture — a poster/billboard, non-colliding), `light`, plus every mesh in `models/`.
 - **Platform shapes**: square, rectangle, or circle, with configurable size/color.
 - **Live graphics toggles**: flip **shadows** (`F2`), **BVH acceleration** (`F3`), the **camera headlight** (`F4`), and the **floor platform** (`F6`) right in the scene — no need to recreate the world. On a server these changes sync to every client.
 
@@ -108,6 +108,7 @@ Keys are grouped by mode. The camera (flight) controls work at all times; the ed
 | **A** / **D** | Strafe left / right |
 | **Space** / **C** | Fly up / down *(fly mode)* — in a **gravity world**, **Space** jumps and **C** is unused |
 | **F1** | Toggle **fly** ↔ **walk**. In a gravity world the default is **walk** (gravity pulls you down, you stand on the floor/objects, can't pass through them); fly mode restores free up/down flight and passes through objects |
+| **F7** | Toggle **1st-person** ↔ **3rd-person** view. You are a **body + camera**: in 1st person the camera is at your eyes (your own body is hidden); in 3rd person the camera pulls behind + above and you see your own avatar. Others always see your avatar either way |
 | **← / →** | Look left / right (yaw) |
 | **↑ / ↓** | Look up / down (pitch) |
 | **Q** / **E** | Roll camera left / right |
@@ -127,12 +128,13 @@ The editor shows a center crosshair and a properties panel for the selected obje
 | Key | Action |
 | --- | --- |
 | **Tab** | Toggle the editor |
-| **G** | Cycle the spawn type (cube / sphere / cylinder / cone / pyramid / ramp / light / any `models/` mesh) |
-| **Enter** | Spawn the current type in front of the camera *(authority only)* |
+| **G** | Cycle the spawn type (cube / sphere / cylinder / cone / pyramid / ramp / flatpicture / light / any `models/` mesh) |
+| **B** | Spawn the current type in front of the camera *(authority only)* |
 | **F** | Aim-select: pick the object under the crosshair |
 | **[** / **]** | Select previous / next object |
 | **,** / **.** | Move the field cursor up / down in the properties panel |
 | **N** / **M** | Decrease / increase the value of the highlighted field *(authority only)* |
+| **Enter** | Type an exact value into the highlighted field — the **Name** (text) or any **numeric** field (parsed + clamped on Enter; Esc cancels). Enum/toggle fields aren't typed — use N/M *(authority only)* |
 | **I** / **K** | Move the selected object along +Z / −Z *(authority only)* |
 | **J** / **L** | Move the selected object along −X / +X *(authority only)* |
 | **U** / **O** | Move the selected object up / down (+Y / −Y) *(authority only)* |
@@ -153,11 +155,14 @@ The editor shows a center crosshair and a properties panel for the selected obje
 | **Backspace** | Delete a character |
 | **Esc** | Cancel without sending |
 
-### The properties panel (edited with `,` `.` `N` `M`)
+### The properties panel (edited with `,` `.` `N` `M`, or **Enter** to type)
+Use `,` / `.` to move the field cursor and **N** / **M** to step the highlighted field. For a faster, exact change, press **Enter** to *type* a value into the highlighted field: the **Name** (text) or any **numeric** field (Pos/Rot/Scale/Spin, R/G/B/A, Pale, Mass, Bounce, Friction, RollFric, TexScale, Radius, Power, and the light fields). The typed value is parsed and **clamped to the field's valid range** on **Enter**; **Esc** cancels (leaves it unchanged); an empty or invalid entry is ignored. Enum/toggle fields (Collide, Gravity, Collider, Texture, TexFace, TexFilter, Kind, Shape) are *not* typed — cycle them with N/M.
+
 The list of editable fields depends on the selected object's type:
 
-- **Mesh / cube / cylinder / cone / pyramid / ramp** — Pos X/Y/Z, Rot X/Y/Z, Scale, Spin (auto-rotate speed), **R / G / B / A** (color + object transparency), **Pale** (color paleness), **Collide**, **Gravity**, **Collider**, **Mass**, **Bounce**.
-- **Sphere** — Pos X/Y/Z, Radius, **R / G / B / A**, **Pale**, **Collide**, **Gravity**, **Mass**, **Bounce**.
+- **Mesh / cube / cylinder / cone / pyramid / ramp** — Pos X/Y/Z, Rot X/Y/Z, Scale, Spin (auto-rotate speed), **R / G / B / A** (color + object transparency), **Pale** (color paleness), **Texture** (cycle the PNGs in `textures/` + "none"), **TexScale** (UV tiling), **TexFace** (which side wears it — a cube's 6 faces, else "All"), **Collide**, **Gravity**, **Collider**, **Mass**, **Bounce**.
+- **Flat picture** — Pos X/Y/Z, Rot X/Y/Z, Scale, **R / G / B / A**, **Pale**, **Texture**, **TexScale**, **TexFace** — a visual panel (no physics fields; it's non-colliding).
+- **Sphere** — Pos X/Y/Z, Radius, **R / G / B / A**, **Pale**, **Texture**, **TexScale**, **TexFace**, **Collide**, **Gravity**, **Mass**, **Bounce**.
 - **Platform** — Pos X/Y/Z, Shape/Size (or Width × Depth), **R / G / B / A**, **Pale**, **Collide**, **Gravity**.
 - **Light** — Pos X/Y/Z, Power, **Influence**, **R / G / B / A**, **Pale**, **Kind**, then per kind, then **Gravity**:
   - *Point*: nothing extra.
@@ -173,7 +178,7 @@ Color is edited as four **R / G / B / A** channels (0–255 each): full 24-bit c
 Drop a mesh into `SampleGame/models/` as `<name>.obj` (export with vertex normals for smooth shading; Blender does this by default). Models are a pure geometry library — there is **no per-model JSON** anymore; placement (position, rotation, scale, color, anchor, spin) lives in the world.
 
 To place a model in a scene, either:
-- Spawn it live in the editor (`G` to find it in the spawn list, then `Enter`), arrange it, and `F5` to save; or
+- Spawn it live in the editor (`G` to find it in the spawn list, then `B` to spawn), arrange it, and `F5` to save; or
 - Add an object entry to the world's `worlds/<name>.json` by hand.
 
 A world object looks like this:
@@ -192,8 +197,11 @@ A world object looks like this:
   "gravity": false
 }
 ```
-- `type` — `mesh`, `cube`, `sphere`, `cylinder`, `cone`, `pyramid`, `ramp`, or `light`.
+- `type` — `mesh`, `cube`, `sphere`, `cylinder`, `cone`, `pyramid`, `ramp`, `flatpicture`, or `light`.
 - `mesh` — the `models/` file name (without `.obj`), for `type: "mesh"`.
+- `texture` — a `textures/` PNG file name (e.g. `"brick.png"`, `""` = none/flat colour): wraps the object with the image. Works on every primitive (cube/sphere/cylinder/cone/pyramid/ramp/flatpicture) **and imported `mesh` objects** (which map by the UVs authored in the `.obj`). > In an online session a peer that lacks the PNG in its own `textures/` folder falls back to flat colour (textures ride sync by file name, not pixels).
+- `textureScale` — UV tiling factor (default `1`): `2` tiles the texture 2×2 across the surface, `0.5` shows half of it, etc.
+- `textureFace` — which face wears the texture (default `-1` = all faces). For a cube, `0`–`5` select one side (`+X, -X, +Y, -Y, +Z, -Z`); the other faces then show flat colour. Other shapes are a single face (only `-1`/all applies).
 - `position` — world position in units (Y is the vertical axis).
 - `rotation` — initial rotation in radians.
 - `scale` — uniform scale.
