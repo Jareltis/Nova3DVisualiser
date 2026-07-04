@@ -88,7 +88,7 @@ public class WorldObject
     public string Texture { get; set; } = "";         // per-object PNG texture file in textures/ ("" = none/flat colour).
     public float TextureScale { get; set; } = 1f;      // UV tiling factor (1 = 1:1; 2 = tile 2×2). Multiplies the UV before sampling.
     public int TextureFace { get; set; } = -1;         // which face-group wears the texture: -1 = all faces; a cube: 0..5 (+X,-X,+Y,-Y,+Z,-Z)
-    public int TextureFilter { get; set; } = 0;        // magnification filter: 0 = Nearest (exact, default); 1 = Bilinear (smooth, tolerated parity band)
+    public int TextureFilter { get; set; } = 0;        // texture filter: 0 = Nearest (exact, default); 1 = Bilinear; 2 = Mipmapped/trilinear (both a tolerated parity band)
     public string Anchor { get; set; } = "Bottom";    // mesh only: Bottom | Center | Origin
     public float RotateSpeed { get; set; } = 0f;      // continuous spin about Y
     public bool Collides { get; set; } = true;        // collider participation (camera + as a support); markers/avatars are false. Effective only when world Collision is on.
@@ -110,4 +110,7 @@ public class WorldObject
     public string ConeShape { get; set; } = "circle";  // spot: cone cross-section "circle" | "square" | "triangle"
     public string AreaShape { get; set; } = "square";  // area: emitter cross-section "square" | "circle" | "triangle"
     public float ColorInfluence { get; set; } = 0.6f;  // light only: how strongly the light's color shows over surface albedo (0..1)
+    // ---- camera-only fields (ignored for other types) ----
+    public string CameraKind { get; set; } = "fixed";  // camera: "fixed" (placed position + orientation) | "follow" (placed position, orientation looks at a target)
+    public int FollowTargetId { get; set; } = -1;      // follow camera: object id to aim at; -1 = the player body (default). Ignored by fixed cameras.
 }

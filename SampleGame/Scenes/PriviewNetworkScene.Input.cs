@@ -56,12 +56,15 @@ public partial class PriviewNetworkScene
         // F1 toggles free-fly / walk. Vertical Space/C only fly when NOT walking; in walk mode Space
         // jumps (handled in StepPlayerPhysics, which reads it edge-triggered).
         if (Pressed(ConsoleKey.F1)) _flyMode = !_flyMode;
-        // F7 toggles the camera rig 1st <-> 3rd person (a purely local view choice — works on every peer).
-        if (Pressed(ConsoleKey.F7))
-        {
-            _cameraMode = _cameraMode == CameraMode.ThirdPerson ? CameraMode.FirstPerson : CameraMode.ThirdPerson;
-            ApplyCameraMode();
-        }
+        // F7 cycles the camera rig through the three body views 1st -> 3rd -> 2nd person (a purely local
+        // view choice — works on every peer).
+        if (Pressed(ConsoleKey.F7)) CycleBodyView();
+        // F8 cycles the ACTIVE VIEW among the player body + every placed camera object (a local, per-peer
+        // choice like F7 — never world state). A view-only client can look through cameras too.
+        if (Pressed(ConsoleKey.F8)) CycleActiveView();
+        // F9 toggles SINGLE <-> 2-way split screen (left = the current active view, right = the next one in
+        // the F8 cycle). A local view choice like F7/F8 — never world state.
+        if (Pressed(ConsoleKey.F9)) _splitScreen = !_splitScreen;
         if (!PlayerWalking)
         {
             if (Input.IsGetKey(ConsoleKey.Spacebar)) _localBody.Position.Y += moveSpeed * dt;
@@ -73,6 +76,20 @@ public partial class PriviewNetworkScene
 
         // Detail level: tap P to cycle render resolution 1->2->3->4->1 (lower = fewer rays = faster).
         if (Pressed(ConsoleKey.P)) RenderScale = RenderScale % 4 + 1;
+    }
+
+    // The F7 body-view cycle: 1st -> 3rd -> 2nd -> 1st person. While viewing THROUGH a placed camera the
+    // avatar stays shown, so only re-apply avatar visibility when the body view is active (the new mode
+    // still takes effect once you return to the body). Also used by the headless CycleBodyViewForTest hook.
+    private void CycleBodyView()
+    {
+        _cameraMode = _cameraMode switch
+        {
+            CameraMode.FirstPerson => CameraMode.ThirdPerson,
+            CameraMode.ThirdPerson => CameraMode.SecondPerson,
+            _ => CameraMode.FirstPerson,   // 2nd person (or any placed-camera fallthrough) -> back to 1st
+        };
+        if (_activeCameraId < 0) ApplyCameraMode();
     }
 
     private void OnTransformReceived(TransformPacket packet, int senderId)
@@ -147,17 +164,23 @@ public partial class PriviewNetworkScene
                 }
                 _isChatting = false;
                 _currentInput = "";
+                ConsumeKeyForEditor(ConsoleKey.Enter);   // Part A: the still-held Enter must NOT edge-fire the editor next frame
             }
             else if (keyInfo.Key == ConsoleKey.Escape)
             {
                 _isChatting = false;
                 _currentInput = "";
+                ConsumeKeyForEditor(ConsoleKey.Escape);
             }
             else if (keyInfo.Key == ConsoleKey.Backspace)
             {
                 if (_currentInput.Length > 0)
                     _currentInput = _currentInput.Substring(0, _currentInput.Length - 1);
             }
+            // Scroll the history: PgUp/PgDn OR Up/Down arrows (arrows are captured HERE while chatting, so
+            // they never reach the camera look). Older = up, newer = down; clamped, with the scrolled-up indicator.
+            else if (keyInfo.Key == ConsoleKey.PageUp   || keyInfo.Key == ConsoleKey.UpArrow)   ScrollChat(+1);
+            else if (keyInfo.Key == ConsoleKey.PageDown || keyInfo.Key == ConsoleKey.DownArrow) ScrollChat(-1);
             else
             {
                 if (keyInfo.KeyChar != '\u0000')
@@ -201,8 +224,8 @@ public partial class PriviewNetworkScene
         Field.ConeAngle or Field.AreaSize or Field.Spin or Field.Beams or
         Field.PlatSize or Field.PlatWidth or Field.PlatDepth or
         Field.Mass or Field.Restitution or Field.Friction or Field.RollingFriction or
-        Field.ColorFade or Field.TextureScale => true,
-        _ => false,   // Name (text), Kind/AreaShape/Shape/PlatShape/Texture/TexFace/TexFilter/Collides/Gravity/Collider (cycle/toggle)
+        Field.ColorFade or Field.TextureScale or Field.FollowTargetId => true,
+        _ => false,   // Name (text), Kind/AreaShape/Shape/PlatShape/Texture/TexFace/TexFilter/Collides/Gravity/Collider/CamKind (cycle/toggle)
     };
 
     // Enters inline typed-entry for field `f` on entry `e`: seed the buffer (the Name field with its
@@ -362,6 +385,11 @@ public partial class PriviewNetworkScene
             case Field.PlatDepth:
                 if (entry.Platform != null) { entry.Platform.Depth = MathF.Max(PlatformMin, v); RebuildFloor(entry); }
                 break;
+            case Field.FollowTargetId:
+                // Camera follow-target id: rounded, floored at -1 (any negative == the player-body sentinel).
+                // Lives on the descriptor (a camera has no engine companion), riding save/sync/FromInstance.
+                entry.Descriptor.FollowTargetId = Math.Max(-1, (int)MathF.Round(v));
+                break;
         }
     }
 
@@ -402,24 +430,21 @@ public partial class PriviewNetworkScene
         {
             _chatHistory.RemoveAt(0);
         }
+        _chatShowTimer = ChatShowFrames;   // keep the contained chat box shown briefly after a new message
+        // (Auto-scroll: at the bottom (_chatScroll==0) the box shows the new message; scrolled up, the draw's
+        // clamp keeps the offset valid so it doesn't jump to the bottom — see ChatVisibleSlice.)
     }
-    
-    private void DrawChatInterface()
-    {
-        for (int i = 0; i < _chatHistory.Count; i++)
-        {
-            UI.AddText(_chatHistory[i], new Vector2Int(2, 2 + i), ConsoleColor.Gray);
-        }
 
-        if (_isChatting)
-        {
-            UI.AddText($"> {_currentInput}_", new Vector2Int(2, 2 + MaxHistory + 1), ConsoleColor.Yellow);
-            UI.AddText("[ENTER] Send  [ESC] Cancel", new Vector2Int(2, 2 + MaxHistory + 2), ConsoleColor.DarkGray);
-        }
-        else
-        {
-            UI.AddText("Press [T] to chat", new Vector2Int(2, 2 + MaxHistory + 1), ConsoleColor.DarkGray);
-        }
-    }
-    
+    // Scrolls the chat history: dir > 0 = older (up), dir < 0 = newer (down). Clamped at the bottom (0);
+    // the draw re-clamps the top each frame via ChatVisibleSlice. Shared by PgUp/PgDn + Up/Down arrows
+    // (while chatting) and PgUp/PgDn (while the box is shown but not typing).
+    private void ScrollChat(int dir) => _chatScroll = Math.Max(0, _chatScroll + dir);
+
+    // Fix-B test hooks: drive the chat scroll (same path arrows/PgUp/PgDn use) and read the offset back.
+    public void ScrollChatForTest(int dir) => ScrollChat(dir);
+    public int ChatScrollForTest => _chatScroll;
+
+    // The chat DRAW (a contained, wrapped, scrollable box) lives in the overlay partial (DrawChatInterface in
+    // PriviewNetworkScene.EditorOverlay.cs) so all HUD rendering is in one place.
+
 }

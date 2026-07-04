@@ -20,6 +20,15 @@ public partial class PriviewNetworkScene
 {
     // Primitive + marker geometry factories and their procedural UV/group generators.
 
+    // A small cube marker for a placed CAMERA object: a visual-only indicator (sized like a light marker),
+    // oriented by the object's rotation so a Fixed camera's aim is visible. Colour is set at the call site.
+    public static Object3d CreateCameraMarker()
+    {
+        var m = CreateCube();
+        m.Scale = LightMarkerScale;
+        return m;
+    }
+
     public static Object3d CreateCube()
     {
         var verts = new Vector3[]

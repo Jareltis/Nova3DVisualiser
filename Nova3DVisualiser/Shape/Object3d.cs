@@ -234,7 +234,9 @@ public class Object3d : GameObject, IDisplays
             {
                 // t is the world-space distance parameter; recompute the world hit point from it.
                 Vector3 worldHit = ray.RayStart + ray.RayDirection * hit.Intersection;
-                return new RenderData(hit.Intersection, hit.Normal, worldHit, SurfaceColor(hit.Uv, hit.Group), hit.Uv, hit.Group);
+                float incid = MathF.Abs(hit.Normal * ray.RayDirection);   // both unit (primary rays) → |cos| incidence
+                return new RenderData(hit.Intersection, hit.Normal, worldHit,
+                    SurfaceColor(hit.Uv, hit.Group, hit.Intersection, incid, ray.Cone), hit.Uv, hit.Group);
             }
             return RenderData.NoRender;
         }
@@ -255,7 +257,8 @@ public class Object3d : GameObject, IDisplays
         }
         if (closestData.Intersection > -1)
         {
-            closestData.Color = SurfaceColor(closestData.Uv, closestData.Group);
+            float incid = MathF.Abs(closestData.Normal * ray.RayDirection);   // both unit (primary rays)
+            closestData.Color = SurfaceColor(closestData.Uv, closestData.Group, closestData.Intersection, incid, ray.Cone);
         }
         return closestData;
     }
@@ -264,15 +267,31 @@ public class Object3d : GameObject, IDisplays
     // object alpha kept) when this object has a Texture AND this face is selected (TextureFace == ALL or
     // matches the face's group); otherwise EffectiveColor EXACTLY as before. With no Texture (or a face
     // that isn't the chosen one) the result is byte-identical to the pre-texture renderer — the invariant
-    // that keeps gputest at Δ=0. Kept in lockstep with the GPU kernel's sampling gate.
-    private Rgba32 SurfaceColor(Vector2 uv, int group)
+    // that keeps gputest at Δ=0. The filter chooses the sampler: Nearest (exact), Bilinear (4-texel blend),
+    // or Mipmapped (trilinear — a mip level from the ray-cone footprint, blended). distance/incidenceCos +
+    // the ray's Cone feed the mip footprint; they are ignored by Nearest/Bilinear. Kept in lockstep with
+    // the GPU kernel's sampling gate + samplers.
+    private Rgba32 SurfaceColor(Vector2 uv, int group, float distance, float incidenceCos, float cone)
     {
         if (this.Texture == null || (this.TextureFace >= 0 && this.TextureFace != group))
             return this.EffectiveColor;
         float s = this.TextureScale;
-        Rgba32 texel = this.TextureFilter == TextureFilterMode.Bilinear
-            ? this.Texture.SampleBilinear(uv.X * s, uv.Y * s)
-            : this.Texture.Sample(uv.X * s, uv.Y * s);
+        Rgba32 texel;
+        switch (this.TextureFilter)
+        {
+            case TextureFilterMode.Mipmapped:
+            {
+                float lod = Texture.MipLod(this.Texture.Width, this.Texture.LevelCount, distance, cone, incidenceCos, s);
+                texel = this.Texture.SampleTrilinear(uv.X * s, uv.Y * s, lod);
+                break;
+            }
+            case TextureFilterMode.Bilinear:
+                texel = this.Texture.SampleBilinear(uv.X * s, uv.Y * s);
+                break;
+            default:
+                texel = this.Texture.Sample(uv.X * s, uv.Y * s);
+                break;
+        }
         return ShadeTexel(texel);
     }
 }

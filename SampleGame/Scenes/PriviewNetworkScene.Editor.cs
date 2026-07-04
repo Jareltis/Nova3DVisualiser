@@ -28,11 +28,15 @@ public partial class PriviewNetworkScene
         // (Collider/Gravity/Collides/Kind/Shape/Texture/TexFace/TexFilter…) aren't typeable — Enter is
         // inert there (use N/M to cycle). Spawn moved off Enter to [B] so it always works. Checked first so
         // Enter takes the editable field before anything else reads it.
-        if (CanEdit && _selected >= 0 && _selected < _editables.Count && Pressed(ConsoleKey.Enter))
+        if (_selected >= 0 && _selected < _editables.Count && Pressed(ConsoleKey.Enter))
         {
-            var selFields = FieldsFor(_editables[_selected]);
-            Field af = selFields[Math.Clamp(_fieldIndex, 0, selFields.Length - 1)];
-            if (af == Field.Name || IsNumericField(af)) { BeginFieldEntry(_editables[_selected], af); return; }
+            var entry = _editables[_selected];
+            var (af, onHeader, section) = ActiveInspectorTarget(entry);
+            // DOCKED: Enter on a section HEADER collapses/expands it (a LOCAL view action — clients too).
+            if (onHeader) ToggleSection(section);
+            // Enter on a typeable FIELD (Name/numeric) begins inline entry (authority only). Enum/toggle
+            // fields aren't typeable — Enter is inert there (use N/M). Checked first so Enter is consumed.
+            else if (CanEdit && af is Field f && (f == Field.Name || IsNumericField(f))) { BeginFieldEntry(entry, f); return; }
         }
 
         // Cycle the spawn type.
@@ -44,11 +48,16 @@ public partial class PriviewNetworkScene
         if (CanEdit && Pressed(ConsoleKey.B))
             SpawnCurrent();
 
-        // Aim-to-select: pick the editable object under the center crosshair.
+        // Aim-to-select: pick the editable object under the crosshair — cast from the BODY-view camera
+        // through the crosshair (region centre → uv (0,0)). Suppressed when no region shows the body view.
         if (Pressed(ConsoleKey.F))
         {
-            int hit = PickNearest(_myCamera.GetRayForUv(Vector2.Zero), _editables);
-            if (hit >= 0) { _selected = hit; _fieldIndex = 0; }
+            var (bodyVisible, aimCam) = BodyAimCamera();
+            if (bodyVisible)
+            {
+                int hit = PickNearest(aimCam.GetRayForUv(Vector2.Zero), _editables);
+                if (hit >= 0) { _selected = hit; _fieldIndex = 0; }
+            }
         }
 
         // Cycle the selection (wrap around); reset the field cursor on a new selection.
@@ -62,11 +71,17 @@ public partial class PriviewNetworkScene
 
         if (_selected >= 0 && _selected < _editables.Count)
         {
-            // Properties panel: navigate fields (,/.) stays open so a client can inspect.
-            var fields = FieldsFor(_editables[_selected]);
-            if (Pressed(ConsoleKey.OemComma))  _fieldIndex = (_fieldIndex - 1 + fields.Length) % fields.Length;
-            if (Pressed(ConsoleKey.OemPeriod)) _fieldIndex = (_fieldIndex + 1) % fields.Length;
-            _fieldIndex = Math.Clamp(_fieldIndex, 0, fields.Length - 1);
+            // Field cursor (,/.) — open to clients (inspect). DOCKED navigates the section headers + the
+            // currently-VISIBLE fields (collapsed sections hide their fields, so the cursor SKIPS them);
+            // OVERLAY navigates the flat field list. `_fieldIndex` is the cursor in BOTH (row index vs field index).
+            var entry = _editables[_selected];
+            var fields = FieldsFor(entry);
+            int cursorLen = _hudMode == HudMode.DockedEdit
+                ? BuildInspectorRows(SectionsOf(fields), _collapsedSections).Count
+                : fields.Length;
+            if (Pressed(ConsoleKey.OemComma))  _fieldIndex = (_fieldIndex - 1 + cursorLen) % cursorLen;
+            if (Pressed(ConsoleKey.OemPeriod)) _fieldIndex = (_fieldIndex + 1) % cursorLen;
+            _fieldIndex = Math.Clamp(_fieldIndex, 0, cursorLen - 1);
 
             // World-mutating actions are authority-only; a client never edits the synced world.
             if (CanEdit)
@@ -82,7 +97,6 @@ public partial class PriviewNetworkScene
 
                 if (delta.X != 0f || delta.Y != 0f || delta.Z != 0f)
                 {
-                    var entry = _editables[_selected];
                     var inst = entry.Instance;
                     inst.Position += delta;
                     if (inst is Object3d o) o.UpdateGeometry();
@@ -90,11 +104,16 @@ public partial class PriviewNetworkScene
                     _editDirty = true;
                 }
 
-                // Adjust the active field (N/M) — covers pos/rot/scale/spin/color/radius/power.
+                // Adjust the active field (N/M) — covers pos/rot/scale/spin/color/radius/power. In DOCKED,
+                // when the cursor is on a section HEADER there is no field to step, so N/M do nothing.
                 int dir = 0;
                 if (Pressed(ConsoleKey.N)) dir = -1;
                 if (Pressed(ConsoleKey.M)) dir = +1;
-                if (dir != 0) { AdjustField(fields[_fieldIndex], _editables[_selected], dir); _editDirty = true; }
+                if (dir != 0)
+                {
+                    var (af, _, _) = ActiveInspectorTarget(entry);
+                    if (af is Field f) { AdjustField(f, entry, dir); _editDirty = true; }
+                }
 
                 // Delete the selected object (the platform deletes by disabling — see DeleteSelected).
                 if (Pressed(ConsoleKey.Delete)) DeleteSelected();
@@ -182,6 +201,10 @@ public partial class PriviewNetworkScene
                 string next = opts[(((idx + dir) % n) + n) % n];
                 inst.Texture = string.IsNullOrEmpty(next) ? null : TextureLoader.Get(_texturesFolder, next);
                 InvalidateGpuTextures();
+                // A1 tail: a peer may lack this PNG — stream its bytes NOW (before the Modify broadcast that
+                // this edit dirties, later in Update). TCP FIFO ⇒ the peer materializes it before applying
+                // the edit that names it. No-op when not the online authority or cycling to "none".
+                StreamTextureToPeers(next);
                 break;
             }
             case Field.TextureScale:
@@ -196,9 +219,10 @@ public partial class PriviewNetworkScene
                 break;
             }
             case Field.TextureFilter:
-                // Toggle Nearest <-> Bilinear (only two modes). Rides in the per-frame SnapObject, so no
-                // GPU geometry invalidation is needed (unlike a texture swap).
-                inst.TextureFilter = inst.TextureFilter == TextureFilterMode.Bilinear ? TextureFilterMode.Nearest : TextureFilterMode.Bilinear;
+                // Cycle Nearest -> Bilinear -> Mipmapped (N steps back). Rides in the per-frame SnapObject,
+                // and the mip chain is already resident in the (geometry-versioned) texture pool, so NO GPU
+                // re-upload is needed on a live switch.
+                inst.TextureFilter = (TextureFilterMode)(((((int)inst.TextureFilter + dir) % 3) + 3) % 3);
                 break;
             case Field.Power:
                 if (entry.Light != null) entry.Light.LightPower = MathF.Max(0f, entry.Light.LightPower + dir * PowerStep);
@@ -281,6 +305,17 @@ public partial class PriviewNetworkScene
                 break;
             case Field.PlatDepth:
                 if (entry.Platform != null) { entry.Platform.Depth = MathF.Max(PlatformMin, entry.Platform.Depth + dir * PlatformStep); RebuildFloor(entry); }
+                break;
+            case Field.CamKind:
+                // Cycle Fixed <-> Follow (two values, so N and M both toggle). A camera has no engine
+                // companion — its kind lives on the descriptor, which rides FromInstance/save/sync.
+                entry.Descriptor.CameraKind = CameraKindToString(
+                    ParseCameraKind(entry.Descriptor.CameraKind) == CameraMode.Fixed ? CameraMode.Follow : CameraMode.Fixed);
+                break;
+            case Field.FollowTargetId:
+                // Step the follow-target id, floored at -1 (the player-body sentinel). N/M nudges; typed
+                // entry sets it exactly. Lives on the descriptor like CamKind (rides save/sync/FromInstance).
+                entry.Descriptor.FollowTargetId = Math.Max(-1, entry.Descriptor.FollowTargetId + dir);
                 break;
         }
     }
@@ -367,6 +402,8 @@ public partial class PriviewNetworkScene
         if (index < 0 || index >= _editables.Count) return;
 
         var entry = _editables[index];
+        // Deleting the camera we're viewing THROUGH -> fall back to the body view (restore avatar visibility).
+        if (IsCamera(entry) && entry.Descriptor.Id == _activeCameraId) { _activeCameraId = -1; ApplyCameraMode(); }
         if (entry.Instance is IDisplays disp) RemoveDisplaysObject(disp);
         if (entry.Instance is Object3d o) _models.Remove(o);
         if (entry.Light != null) RemoveLight(entry.Light);   // a light: actually turn it off, not just hide the marker
@@ -388,7 +425,9 @@ public partial class PriviewNetworkScene
     {
         if (_spawnTypes.Count == 0) return;
 
-        Vector3 yaw = new Vector3(0, _myCamera.LocalRotate.Y, 0);
+        // Place in front of the BODY along the body-view facing (matches the crosshair region even in split;
+        // in single view this is _myCamera, unchanged).
+        Vector3 yaw = new Vector3(0, BodyAimCamera().cam.LocalRotate.Y, 0);
         Vector3 forward = new Vector3(1, 0, 0).Rotate(yaw);
         Vector3 spawnPos = _localBody.Position + forward * 3f;   // in front of the BODY (same in 1st person; sensible in 3rd)
         spawnPos.Y = 0f; // ground level
@@ -409,12 +448,13 @@ public partial class PriviewNetworkScene
             return;
         }
 
-        // The built-in types (primitives + light) keep their label as the Type; anything else is a
+        // The built-in types (primitives + light + camera) keep their label as the Type; anything else is a
         // library mesh.
-        bool isBuiltIn = label is "cube" or "sphere" or "cylinder" or "cone" or "pyramid" or "ramp" or "flatpicture" or "light";
-        // A flat picture is a visual panel — non-colliding by default (a thin quad is a degenerate
-        // collider); gravity already defaults off. Every other primitive keeps the default (collides).
+        bool isBuiltIn = label is "cube" or "sphere" or "cylinder" or "cone" or "pyramid" or "ramp" or "flatpicture" or "light" or "camera";
+        // A flat picture (thin quad) and a camera marker are visual-only — non-colliding by default; gravity
+        // already defaults off. Every other primitive keeps the default (collides).
         bool isFlatPic = string.Equals(label, "flatpicture", StringComparison.OrdinalIgnoreCase);
+        bool isCamera = string.Equals(label, "camera", StringComparison.OrdinalIgnoreCase);
         var descriptor = new WorldObject
         {
             Id = _nextObjectId++,   // unique stable id (only the authority spawns; 5b broadcasts it)
@@ -425,7 +465,7 @@ public partial class PriviewNetworkScene
             Color = "White",
             Anchor = "Bottom",
             Radius = 1f,
-            Collides = !isFlatPic,
+            Collides = !(isFlatPic || isCamera),
         };
 
         var entry = BuildWorldObject(descriptor);
@@ -436,6 +476,10 @@ public partial class PriviewNetworkScene
         // also stream its .obj so a client that never had it can render it (idempotent overwrite).
         if (_online && _isServer)
         {
+            // A1 tail: if the spawned object carries a texture a peer may lack, stream its bytes FIRST
+            // (before the mesh chunks + the spawn packet below) so the peer has it when the spawn applies.
+            StreamTextureToPeers(descriptor.Texture);
+
             var packet = new WorldEditPacket
             {
                 Op = 1,
@@ -520,5 +564,20 @@ public partial class PriviewNetworkScene
         if (down) _prevDown.Add(key); else _prevDown.Remove(key);
         return down && !was;
     }
+
+    // Part A: marks `key` as "already seen" in the edge-detection set. The chat/field-entry read the console
+    // BUFFER while the editor reads the live PHYSICAL key state (GetAsyncKeyState) via Pressed(). When the
+    // chat closes on a still-held Enter, without this the editor's next-frame Pressed(Enter) would see a
+    // FALSE edge (down now, "not down" before, since Pressed was never called while chatting) and wrongly
+    // begin Inspector field-entry. Adding the key to _prevDown makes that Pressed() return false until it is
+    // released and pressed again.
+    private void ConsumeKeyForEditor(ConsoleKey key) => _prevDown.Add(key);
+
+    // Part A (testable): the editor input (field cursor / N,M / Enter type-value / spawn / Del) runs ONLY
+    // when NOT chatting and NOT typing a field, so the chat/field-entry has EXCLUSIVE input for the frame —
+    // this mirrors the Update dispatch (chatting/entry → the editor branch is skipped). Exposed for a test.
+    private bool EditorProcessesInput => !_isChatting && !_entryMode;
+    public bool EditorProcessesInputForTest => EditorProcessesInput;
+    public void SetChattingForTest(bool on) => _isChatting = on;
 
 }

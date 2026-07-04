@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using Nova3DVisualiser;
 using SampleGame.Scenes;
-using Quat = SampleGame.Scenes.PriviewNetworkScene.Quat;
+using Quat = SampleGame.Physics.Quat;
 
 namespace SampleGame.Physics;
 
@@ -69,7 +69,7 @@ public static class ImpulseMath
 }
 
 // Contact generation for Stage 1: a DYNAMIC sphere (always body B) vs a STATIC shape (always body A).
-// Pure + testable. Reuses PriviewNetworkScene.ClosestPointOnTriangle for the mesh case.
+// Pure + testable. Reuses CollisionMath.ClosestPointOnTriangle for the mesh case.
 public static class ContactGen
 {
     // Closest point on an oriented box (centre c, half-extents h, orientation q) to world point p.
@@ -141,7 +141,7 @@ public static class ContactGen
         float best = float.MaxValue; Vector3 bestQ = default;
         for (int t = 0; t < tris.Length; t += 3)
         {
-            Vector3 q = PriviewNetworkScene.ClosestPointOnTriangle(sph.Position, verts[tris[t]], verts[tris[t + 1]], verts[tris[t + 2]]);
+            Vector3 q = CollisionMath.ClosestPointOnTriangle(sph.Position, verts[tris[t]], verts[tris[t + 1]], verts[tris[t + 2]]);
             Vector3 d = sph.Position - q; float d2 = d * d;
             if (d2 < best) { best = d2; bestQ = q; }
         }
@@ -218,7 +218,7 @@ public static class ContactGen
                 Vector3 p = corner[k];
                 float planeDist = (p - v0) * fn;                        // signed distance to the plane (>0 above, <0 penetrating)
                 if (planeDist > margin || planeDist < -MaxCornerPen) continue;
-                Vector3 q = PriviewNetworkScene.ClosestPointOnTriangle(p, v0, v1, v2);
+                Vector3 q = CollisionMath.ClosestPointOnTriangle(p, v0, v1, v2);
                 if ((p - fn * planeDist - q).Length() > InteriorEps) continue;   // p projects OUTSIDE the triangle -> not a face contact
                 float pen = -planeDist;
                 if (pen > bestPen[k]) { bestPen[k] = pen; bestN[k] = fn; found[k] = true; }   // deepest penetrating face for this corner
@@ -247,7 +247,7 @@ public static class ContactGen
         Vector3 hA = A.HalfExtents, hB = B.HalfExtents;
         Vector3 hAi = new Vector3(hA.X + margin, hA.Y + margin, hA.Z + margin);
 
-        var (hit, n, _) = PriviewNetworkScene.SatBox3D(A.Position, aX, aY, aZ, hAi, B.Position, bX, bY, bZ, hB);
+        var (hit, n, _) = CollisionMath.SatBox3D(A.Position, aX, aY, aZ, hAi, B.Position, bX, bY, bZ, hB);
         if (!hit) return;                                            // separated beyond the speculative margin
 
         Vector3[] uA = { aX, aY, aZ }; float[] fA = { hA.X, hA.Y, hA.Z };

@@ -108,7 +108,9 @@ Keys are grouped by mode. The camera (flight) controls work at all times; the ed
 | **A** / **D** | Strafe left / right |
 | **Space** / **C** | Fly up / down *(fly mode)* — in a **gravity world**, **Space** jumps and **C** is unused |
 | **F1** | Toggle **fly** ↔ **walk**. In a gravity world the default is **walk** (gravity pulls you down, you stand on the floor/objects, can't pass through them); fly mode restores free up/down flight and passes through objects |
-| **F7** | Toggle **1st-person** ↔ **3rd-person** view. You are a **body + camera**: in 1st person the camera is at your eyes (your own body is hidden); in 3rd person the camera pulls behind + above and you see your own avatar. Others always see your avatar either way |
+| **F7** | Cycle the body view **1st-person → 3rd-person → 2nd-person**. You are a **body + camera**: in 1st person the camera is at your eyes (your own body is hidden); in 3rd person it pulls behind + above; in 2nd person it sits in **front** and looks **back** at you (so you see your own face). 3rd + 2nd person both pull the camera in past walls in the way. Others always see your avatar either way |
+| **F8** | Cycle the **active view** through your **body view** and every placed **camera object**: a **Fixed** camera shows a static shot from where you placed it; a **Follow** camera swivels to track a **target** — your body by default, or any object by id (its **Target** field). You still control your body normally while watching from a camera (your avatar is shown so you can see yourself). A local, per-peer choice — clients can look through cameras too |
+| **F9** | Toggle **split-screen**: SINGLE (full screen) ↔ a **2-way LEFT \| RIGHT** split. The left half shows your current active view (F8); the right half shows the **next** view in the F8 cycle (the next placed camera, or your body view if there are none) — two cameras rendered at once. A local, per-peer view choice |
 | **← / →** | Look left / right (yaw) |
 | **↑ / ↓** | Look up / down (pitch) |
 | **Q** / **E** | Roll camera left / right |
@@ -117,18 +119,19 @@ Keys are grouped by mode. The camera (flight) controls work at all times; the ed
 | **V** | Reset FOV to default |
 | **=** / **-** | Increase / decrease your camera light power |
 | **P** | Cycle render detail 1 → 2 → 3 → 4 → 1 (lower = faster) |
-| **T** | Open chat (online sessions) |
-| **Esc** | Quit the app |
+| **T** | Open chat — a contained box (never overlaps the HUD) with word-wrapped messages; **PgUp/PgDn** or **↑/↓** scroll the history; **Enter** sends, **Esc** closes the chat |
+| **Esc** | Quit the app (while chatting, Esc closes the chat instead) |
 
 > **Gravity** is a per-world setting (enabled in the *Create world* dialog). With gravity **off**, the camera always free-flies as before. With gravity **on**, you start as a walking character — press **F1** any time to switch to free-fly for building/inspecting.
 
-### Editor (press **Tab** to toggle the editor on/off)
-The editor shows a center crosshair and a properties panel for the selected object. Flight controls still work while editing.
+### Editor (press **Tab** for the overlay editor, or **`** for the docked editor)
+The HUD has three modes: **PLAY** (minimal — a crosshair + chat hint over full-screen 3D), **OVERLAY-EDIT** (**Tab** — the editor panels overlaid on full-screen 3D), and **DOCKED-EDIT** (**`** — a Unity/Blender-style layout: the 3D in a centre viewport with a Toolbar on top, a Status bar on the bottom, a Hierarchy on the left, and a grouped Inspector on the right). The editing controls below are identical in both edit modes; only the presentation differs. Flight controls still work while editing. The layout reflows when you resize / zoom the terminal.
 
 | Key | Action |
 | --- | --- |
-| **Tab** | Toggle the editor |
-| **G** | Cycle the spawn type (cube / sphere / cylinder / cone / pyramid / ramp / flatpicture / light / any `models/` mesh) |
+| **Tab** | Toggle the **overlay** editor (Play ↔ Overlay-Edit) |
+| **`** | Toggle the **docked** editor (Play ↔ Docked-Edit) |
+| **G** | Cycle the spawn type (cube / sphere / cylinder / cone / pyramid / ramp / flatpicture / light / **camera** / any `models/` mesh). A **camera** is a placeable viewpoint (set its **Kind** to Fixed or Follow; a Follow camera's **Target** is the object id it tracks, or the player by default) you switch to with **F8**. A camera's rotation follows the view convention: **Rot X = roll** (spins the image), **Rot Y = yaw**, **Rot Z = pitch** — use Y/Z to aim it |
 | **B** | Spawn the current type in front of the camera *(authority only)* |
 | **F** | Aim-select: pick the object under the crosshair |
 | **[** / **]** | Select previous / next object |

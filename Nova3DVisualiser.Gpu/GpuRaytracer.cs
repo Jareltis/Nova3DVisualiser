@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using ILGPU;
 using ILGPU.Algorithms;
 using ILGPU.Runtime;
@@ -5,19 +6,37 @@ using ILGPU.Runtime.Cuda;
 
 namespace Nova3DVisualiser.Gpu;
 
-// Per-frame scalar inputs packed into one blittable struct so the kernel takes few arguments.
+// Per-frame scalar inputs packed into one blittable struct so the kernel takes few arguments. One
+// dispatch renders ONE viewport: the kernel maps its index within the RW×RH region to the region pixel
+// (RX0+rx, RY0+ry), the region-relative uv (using Aspect = the REGION's aspect), and the full-buffer
+// output index (y*Width+x). Width/Height are the FULL buffer dims (the output stride); a full-screen
+// viewport (RX0=RY0=0, RW=Width, RH=Height) reproduces the old single-view mapping exactly.
 public struct GpuGlobals
 {
-    public int Width, Height;
-    public float Aspect;
+    public int Width, Height;       // full buffer dims (output stride)
+    public int RX0, RY0, RW, RH;    // this viewport's region within the buffer
+    public float Aspect;            // the REGION's aspect
     public float CamX, CamY, CamZ;
     public float BxX, BxY, BxZ;     // camera basis (ray dir = Bx*Focal + By*uv.Y + Bz*uv.X)
     public float ByX, ByY, ByZ;
     public float BzX, BzY, BzZ;
     public float Focal;
+    public float PixelCone;          // per-pixel ray-cone spread for texture mip selection (== ConsoleScreenAsync.PixelConeSpread)
     public float Ambient, Exposure;
     public int EnableShadows;
+    public int UseBvh;               // 1 = traverse the two-level BVH; 0 = brute-force all triangles (F3)
     public int ObjectCount, SphereCount, LightCount;
+}
+
+// One viewport for the GPU: a screen region [X0,Y0,W,H] within the full buffer + the region's aspect +
+// the camera reduction to render it from. RenderViews dispatches one kernel per GpuViewport into the
+// SAME output buffers, so a split frame accumulates several regions before one copy-back.
+public struct GpuViewport
+{
+    public int X0, Y0, W, H;
+    public float Aspect;
+    public Vector3 CamPos, BasisX, BasisY, BasisZ;
+    public float Focal;
 }
 
 // A ray hit returned to the compositor: world-space surface normal + albedo/alpha.
@@ -118,29 +137,57 @@ public sealed class GpuRaytracer : IDisposable
             ArrayView<SnapObject>, ArrayView<SnapSphere>, ArrayView<SnapLight>, ArrayView<float>, ArrayView<int>>(RenderKernel);
     }
 
-    /// <summary>Renders the snapshot into the caller's brightness + color buffers (length = width*height).</summary>
+    /// <summary>
+    /// Single full-screen view: renders the snapshot's render camera across the whole buffer. A thin wrapper
+    /// over RenderViews (one full-screen viewport), so it stays BYTE-IDENTICAL to the old single-view path.
+    /// </summary>
     public void Render(SceneSnapshot snap, int width, int height, float aspect,
                        float[] brightnessOut, Rgb24[] colorOut)
+    {
+        var view = new GpuViewport
+        {
+            X0 = 0, Y0 = 0, W = width, H = height, Aspect = aspect,
+            CamPos = snap.CamPos, BasisX = snap.BasisX, BasisY = snap.BasisY, BasisZ = snap.BasisZ, Focal = snap.Focal,
+        };
+        RenderViews(snap, width, height, new[] { view }, brightnessOut, colorOut);
+    }
+
+    /// <summary>
+    /// Renders each viewport (its own region + camera) into the caller's full-size brightness + color
+    /// buffers (length = width*height). The static geometry + per-frame object/light data are uploaded ONCE
+    /// (shared by all viewports); each viewport dispatches the kernel over its RW×RH region, writing only
+    /// that region of the SAME device buffers, then one copy-back. The viewports must together cover every
+    /// pixel each frame (as the single view and the 2-way split do) so nothing ghosts from a prior frame.
+    /// </summary>
+    public void RenderViews(SceneSnapshot snap, int width, int height, IReadOnlyList<GpuViewport> views,
+                            float[] brightnessOut, Rgb24[] colorOut)
     {
         int pixels = width * height;
         EnsureBuffers(snap);
         EnsureOutputs(pixels);
 
-        var g = new GpuGlobals
+        for (int v = 0; v < views.Count; v++)
         {
-            Width = width, Height = height, Aspect = aspect,
-            CamX = snap.CamPos.X, CamY = snap.CamPos.Y, CamZ = snap.CamPos.Z,
-            BxX = snap.BasisX.X, BxY = snap.BasisX.Y, BxZ = snap.BasisX.Z,
-            ByX = snap.BasisY.X, ByY = snap.BasisY.Y, ByZ = snap.BasisY.Z,
-            BzX = snap.BasisZ.X, BzY = snap.BasisZ.Y, BzZ = snap.BasisZ.Z,
-            Focal = snap.Focal,
-            Ambient = snap.Ambient, Exposure = snap.Exposure, EnableShadows = snap.EnableShadows,
-            ObjectCount = snap.Objects.Length, SphereCount = snap.Spheres.Length, LightCount = snap.Lights.Length,
-        };
+            GpuViewport vp = views[v];
+            var g = new GpuGlobals
+            {
+                Width = width, Height = height,
+                RX0 = vp.X0, RY0 = vp.Y0, RW = vp.W, RH = vp.H, Aspect = vp.Aspect,
+                CamX = vp.CamPos.X, CamY = vp.CamPos.Y, CamZ = vp.CamPos.Z,
+                BxX = vp.BasisX.X, BxY = vp.BasisX.Y, BxZ = vp.BasisX.Z,
+                ByX = vp.BasisY.X, ByY = vp.BasisY.Y, ByZ = vp.BasisY.Z,
+                BzX = vp.BasisZ.X, BzY = vp.BasisZ.Y, BzZ = vp.BasisZ.Z,
+                Focal = vp.Focal,
+                // Same ray-cone spread the CPU sampler uses (one shared formula) so mip levels agree CPU↔GPU.
+                PixelCone = Nova3DVisualiser.Implementation.ConsoleScreenAsync.PixelConeSpread(vp.W, vp.H, vp.Aspect, vp.Focal),
+                Ambient = snap.Ambient, Exposure = snap.Exposure, EnableShadows = snap.EnableShadows, UseBvh = snap.UseBvh,
+                ObjectCount = snap.Objects.Length, SphereCount = snap.Spheres.Length, LightCount = snap.Lights.Length,
+            };
 
-        _kernel(pixels, g, _vertBuf!.View, _faceBuf!.View, _nodeBuf!.View, _triIdxBuf!.View,
-            _texBuf!.View, _texPixelBuf!.View,
-            _objBuf!.View, _sphereBuf!.View, _lightBuf!.View, _brightBuf!.View, _colorBuf!.View);
+            _kernel(vp.W * vp.H, g, _vertBuf!.View, _faceBuf!.View, _nodeBuf!.View, _triIdxBuf!.View,
+                _texBuf!.View, _texPixelBuf!.View,
+                _objBuf!.View, _sphereBuf!.View, _lightBuf!.View, _brightBuf!.View, _colorBuf!.View);
+        }
         _accelerator.Synchronize();
 
         _brightBuf!.View.CopyToCPU(brightnessOut);
@@ -218,6 +265,7 @@ public sealed class GpuRaytracer : IDisposable
 
     private const float Bias = 0.01f;
     private const float MinVis = 1e-3f;   // alpha-shadow: transmittance at/below this counts as fully blocked
+    private const float MipMinCos = 0.25f;   // grazing-incidence clamp for mip footprint — MUST match Texture.MipMinCos
     private const float DirRefDistSq = 64f;
     private const float Tau = 6.2831853f;
     private const int MaxLayers = 32;   // transparency depth-peel cap (bounds the per-ray layer loop)
@@ -228,13 +276,18 @@ public sealed class GpuRaytracer : IDisposable
         ArrayView<SnapObject> objects, ArrayView<SnapSphere> spheres, ArrayView<SnapLight> lights,
         ArrayView<float> brightnessOut, ArrayView<int> colorOut)
     {
+        // Index runs 0..RW*RH-1 WITHIN this viewport's region. Map it to the region pixel (rx,ry), then to
+        // the full-buffer pixel (x,y), the region-relative uv (region aspect), and the output index below.
+        // A full-screen viewport (RX0=RY0=0, RW=Width, RH=Height) reduces this to the old i/j mapping.
         int p = index.X;
-        int i = p % g.Width;
-        int j = p / g.Width;
+        int rx = p % g.RW;
+        int ry = p / g.RW;
+        int x = g.RX0 + rx;
+        int y = g.RY0 + ry;
 
-        // uv exactly as ConsoleScreenAsync.CalculateUV (aspect on X, flipped Y).
-        float uvx = ((float)i / (g.Width - 1) * 2f - 1f) * g.Aspect;
-        float uvy = -((float)j / (g.Height - 1) * 2f - 1f);
+        // uv exactly as ConsoleScreenAsync.RegionUV (region-relative, aspect on X, flipped Y).
+        float uvx = ((float)rx / (g.RW - 1) * 2f - 1f) * g.Aspect;
+        float uvy = -((float)ry / (g.RH - 1) * 2f - 1f);
 
         // Primary ray direction = Bx*Focal + By*uv.Y + Bz*uv.X, normalized.
         float dx = g.BxX * g.Focal + g.ByX * uvy + g.BzX * uvx;
@@ -264,8 +317,9 @@ public sealed class GpuRaytracer : IDisposable
         }
 
         float brightness = 0.2126f * outR + 0.7152f * outG + 0.0722f * outB;
-        brightnessOut[p] = brightness;
-        colorOut[p] = (ToByte(outR) << 16) | (ToByte(outG) << 8) | ToByte(outB);
+        int outIdx = y * g.Width + x;   // write to the full-buffer pixel (regions tile the buffer)
+        brightnessOut[outIdx] = brightness;
+        colorOut[outIdx] = (ToByte(outR) << 16) | (ToByte(outG) << 8) | ToByte(outB);
     }
 
     // Closest hit with T strictly greater than tMin, over every mesh (two-level BVH) + every sphere.
@@ -298,7 +352,11 @@ public sealed class GpuRaytracer : IDisposable
             float ldy = (ob.ColY.X * dx + ob.ColY.Y * dy + ob.ColY.Z * dz) * ob.InvScale;
             float ldz = (ob.ColZ.X * dx + ob.ColZ.Y * dy + ob.ColZ.Z * dz) * ob.InvScale;
 
-            GpuFaceHit fh = TraverseClosest(ob, lsx, lsy, lsz, ldx, ldy, ldz, tMin, verts, faces, nodes, triIdx);
+            // F3: traverse the BVH, or brute-force every triangle when it's off. Both find the SAME closest
+            // hit (a BVH only prunes; it doesn't change the result), so the rendered image is IDENTICAL.
+            GpuFaceHit fh = g.UseBvh == 1
+                ? TraverseClosest(ob, lsx, lsy, lsz, ldx, ldy, ldz, tMin, verts, faces, nodes, triIdx)
+                : BruteClosest(ob, lsx, lsy, lsz, ldx, ldy, ldz, tMin, verts, faces);
             if (fh.T > tMin && (bestT < 0f || fh.T < bestT))
             {
                 bestT = fh.T; kind = 1;
@@ -340,11 +398,22 @@ public sealed class GpuRaytracer : IDisposable
         if (bTex >= 0 && (bTexFace == -1 || bTexFace == bGroup))
         {
             int tr, tg, tb;
-            // Bilinear (opt-in) blends 4 texels; Nearest picks one (bit-exact). Same gate as the CPU.
-            if (bFilter == 1)
-                SampleTexelBilinear(textures, texPixels, bTex, bu * bScale, bv * bScale, out tr, out tg, out tb);
+            float su = bu * bScale, sv = bv * bScale;
+            // Mipmapped (2) picks a mip level from the ray-cone footprint and blends the two nearest levels
+            // (trilinear) — MESH hits only (kind 1). A textured SPHERE (kind 2) is NOT mip-selected this
+            // stage (its analytic equirect footprint is awkward) → bilinear fallback, mirroring the CPU
+            // Sphere path. Bilinear (1) blends 4 texels; Nearest (0) picks one (bit-exact). Same gate/math as the CPU.
+            if (bFilter == 2 && kind == 1)
+            {
+                float nlen = XMath.Sqrt(bnx * bnx + bny * bny + bnz * bnz);
+                float incid = nlen > 1e-8f ? XMath.Abs(bnx * dx + bny * dy + bnz * dz) / nlen : 1f;   // D is unit
+                float lod = MipLod(textures[bTex].Width, textures[bTex].LevelCount, bestT, g.PixelCone, incid, bScale);
+                SampleTexelTrilinear(textures, texPixels, bTex, su, sv, lod, out tr, out tg, out tb);
+            }
+            else if (bFilter >= 1)   // Bilinear, or the sphere's Mipmapped→bilinear fallback
+                SampleTexelBilinear(textures, texPixels, bTex, su, sv, out tr, out tg, out tb);
             else
-                SampleTexel(textures, texPixels, bTex, bu * bScale, bv * bScale, out tr, out tg, out tb);
+                SampleTexel(textures, texPixels, bTex, su, sv, out tr, out tg, out tb);
             if (bFade <= 0f) { br = tr / 255f; bg = tg / 255f; bb = tb / 255f; }
             else
             {
@@ -389,6 +458,21 @@ public sealed class GpuRaytracer : IDisposable
                 else i = i + 1;   // internal hit -> left child
             }
             else i = nd.Exit;
+        }
+        return best;
+    }
+
+    // BVH-OFF closest hit (F3): test EVERY triangle of the mesh (no acceleration). Returns the same closest
+    // face hit (t > tMin) as TraverseClosest — a BVH only prunes which triangles are tested, not the result —
+    // so the image is identical; only the work (and thus FPS) differs. Faces are contiguous from FaceBase.
+    private static GpuFaceHit BruteClosest(SnapObject ob, float sx, float sy, float sz, float dx, float dy, float dz, float tMin,
+        ArrayView<Vector3> verts, ArrayView<SnapFace> faces)
+    {
+        GpuFaceHit best; best.T = -1f; best.Nx = 0f; best.Ny = 0f; best.Nz = 0f; best.U = 0f; best.V = 0f; best.Group = 0;
+        for (int k = 0; k < ob.FaceCount; k++)
+        {
+            GpuFaceHit h = HitFaceLocal(faces[ob.FaceBase + k], verts, ob.VertBase, sx, sy, sz, dx, dy, dz);
+            if (h.T > tMin && (best.T < 0f || h.T < best.T)) best = h;
         }
         return best;
     }
@@ -668,7 +752,10 @@ public sealed class GpuRaytracer : IDisposable
             float ldy = (ob.ColY.X * lx + ob.ColY.Y * ly + ob.ColY.Z * lz) * ob.InvScale;
             float ldz = (ob.ColZ.X * lx + ob.ColZ.Y * ly + ob.ColZ.Z * lz) * ob.InvScale;
 
-            if (AnyHit(ob, lsx, lsy, lsz, ldx, ldy, ldz, maxDist, verts, faces, nodes, triIdx))
+            bool blocked = g.UseBvh == 1
+                ? AnyHit(ob, lsx, lsy, lsz, ldx, ldy, ldz, maxDist, verts, faces, nodes, triIdx)
+                : BruteAnyHit(ob, lsx, lsy, lsz, ldx, ldy, ldz, maxDist, verts, faces);
+            if (blocked)
             {
                 if (ob.A >= 1f) return 0f;                 // opaque occluder -> full shadow
                 t *= 1f - ob.A;
@@ -715,6 +802,19 @@ public sealed class GpuRaytracer : IDisposable
                 else i = i + 1;
             }
             else i = nd.Exit;
+        }
+        return false;
+    }
+
+    // BVH-OFF any-hit (F3): test EVERY triangle for a shadow-ray occlusion (0 < t < maxDist). Same result as
+    // AnyHit (the BVH only prunes), so shadows are identical — only the work differs.
+    private static bool BruteAnyHit(SnapObject ob, float sx, float sy, float sz, float dx, float dy, float dz, float maxDist,
+        ArrayView<Vector3> verts, ArrayView<SnapFace> faces)
+    {
+        for (int k = 0; k < ob.FaceCount; k++)
+        {
+            GpuFaceHit h = HitFaceLocal(faces[ob.FaceBase + k], verts, ob.VertBase, sx, sy, sz, dx, dy, dz);
+            if (h.T > 0f && h.T < maxDist) return true;
         }
         return false;
     }
@@ -775,6 +875,89 @@ public sealed class GpuRaytracer : IDisposable
         float bot = c01 + (c11 - c01) * fu;
         float val = top + (bot - top) * fv;
         return (int)(val + 0.5f);
+    }
+
+    // One mip level's dimension along an axis: max(1, baseDim >> level) — matches Texture.MipDim.
+    private static int MipDimI(int baseDim, int level)
+    {
+        int d = baseDim >> level;
+        return d < 1 ? 1 : d;
+    }
+
+    // Pixel-pool offset of a texture's mip level L = Offset + Σ_{k<L} dim(k) — the chain is stored
+    // contiguously from Offset (level 0 first), each level's block being MipDim(W,k)*MipDim(H,k).
+    private static int MipLevelOffset(SnapTexture t, int level)
+    {
+        int off = t.Offset, w = t.Width, h = t.Height;
+        for (int l = 0; l < level; l++)
+        {
+            off += w * h;
+            w >>= 1; if (w < 1) w = 1;
+            h >>= 1; if (h < 1) h = 1;
+        }
+        return off;
+    }
+
+    // Fractional mip LOD from a ray-cone footprint — an EXACT replica of Texture.MipLod (only XMath vs MathF
+    // Log2/Abs rounding may differ → the thin tolerated band). See Texture.MipLod for the documented formula.
+    private static float MipLod(int width, int levelCount, float distance, float cone, float incidenceCos, float texScale)
+    {
+        float cos = XMath.Abs(incidenceCos);
+        if (cos < MipMinCos) cos = MipMinCos;
+        float footprint = distance * cone / cos;
+        float texels = footprint * texScale * width;
+        if (texels < 1f) texels = 1f;
+        float lod = XMath.Log2(texels);
+        if (lod < 0f) lod = 0f;
+        float maxLod = levelCount - 1;
+        if (lod > maxLod) lod = maxLod;
+        return lod;
+    }
+
+    // Bilinear sample of one mip LEVEL (its own w/h + block offset) — an EXACT replica of
+    // Texture.SampleBilinearLevel (same WRAP + BLerp). Level 0 equals SampleTexelBilinear.
+    private static void SampleBilinearLevel(ArrayView<SnapTexture> textures, ArrayView<Rgba32> texPixels, int texIndex,
+        int level, float u, float v, out int r, out int gg, out int b)
+    {
+        SnapTexture t = textures[texIndex];
+        int w = MipDimI(t.Width, level), h = MipDimI(t.Height, level);
+        int off = MipLevelOffset(t, level);
+
+        float fx = u * w, fy = v * h;
+        float flx = XMath.Floor(fx), fly = XMath.Floor(fy);
+        float fu = fx - flx, fv = fy - fly;
+
+        int x0 = (int)flx % w; if (x0 < 0) x0 += w;
+        int y0 = (int)fly % h; if (y0 < 0) y0 += h;
+        int x1 = x0 + 1; if (x1 >= w) x1 -= w;
+        int y1 = y0 + 1; if (y1 >= h) y1 -= h;
+
+        Rgba32 p00 = texPixels[off + y0 * w + x0], p10 = texPixels[off + y0 * w + x1];
+        Rgba32 p01 = texPixels[off + y1 * w + x0], p11 = texPixels[off + y1 * w + x1];
+
+        r  = BLerp(p00.R, p10.R, p01.R, p11.R, fu, fv);
+        gg = BLerp(p00.G, p10.G, p01.G, p11.G, fu, fv);
+        b  = BLerp(p00.B, p10.B, p01.B, p11.B, fu, fv);
+    }
+
+    // Trilinear texel — bilinear within the two nearest levels, blended by the fractional lod. An EXACT
+    // replica of Texture.SampleTrilinear (the level-selection + blend float math is the tolerated band).
+    private static void SampleTexelTrilinear(ArrayView<SnapTexture> textures, ArrayView<Rgba32> texPixels, int texIndex,
+        float u, float v, float lod, out int r, out int gg, out int b)
+    {
+        int maxL = textures[texIndex].LevelCount - 1;
+        if (lod < 0f) lod = 0f;
+        if (lod > maxL) lod = maxL;
+        int l0 = (int)XMath.Floor(lod);
+        if (l0 >= maxL) { SampleBilinearLevel(textures, texPixels, texIndex, maxL, u, v, out r, out gg, out b); return; }
+
+        int l1 = l0 + 1;
+        float f = lod - l0;
+        SampleBilinearLevel(textures, texPixels, texIndex, l0, u, v, out int r0, out int g0, out int b0);
+        SampleBilinearLevel(textures, texPixels, texIndex, l1, u, v, out int r1, out int g1, out int b1);
+        r  = (int)(r0 + (r1 - r0) * f + 0.5f);
+        gg = (int)(g0 + (g1 - g0) * f + 0.5f);
+        b  = (int)(b0 + (b1 - b0) * f + 0.5f);
     }
 
     // Equirectangular (lat/long) UV from a UNIT local surface direction — an EXACT replica of

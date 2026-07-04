@@ -47,7 +47,7 @@ partial class Program
 
         // 1) Centre INSIDE the box -> ejected until it no longer penetrates (dist from box >= r).
         {
-            Vector3 outc = PriviewNetworkScene.ResolveSphereVsAabb(new Vector3(0f, 0f, 0f), r, bmin, bmax);
+            Vector3 outc = CollisionMath.ResolveSphereVsAabb(new Vector3(0f, 0f, 0f), r, bmin, bmax);
             float dist = DistToAabb(outc, bmin, bmax);
             bool t = dist >= r - eps;
             Console.WriteLine($"  aabb-centre: ejected to ({outc.X:F3},{outc.Y:F3},{outc.Z:F3}), dist-from-box={dist:F3} (want >= {r}) -> {(t ? "ok" : "BAD")}");
@@ -57,7 +57,7 @@ partial class Program
         // 2) Beside the +X face -> pushed EXACTLY to the surface; tangential (Y,Z) kept.
         {
             Vector3 inc = new(1.2f, 0.5f, -0.3f);
-            Vector3 outc = PriviewNetworkScene.ResolveSphereVsAabb(inc, r, bmin, bmax);
+            Vector3 outc = CollisionMath.ResolveSphereVsAabb(inc, r, bmin, bmax);
             float dist = DistToAabb(outc, bmin, bmax);
             bool t = Math.Abs(dist - r) < eps && Math.Abs(outc.Y - inc.Y) < eps && Math.Abs(outc.Z - inc.Z) < eps && outc.X > inc.X;
             Console.WriteLine($"  aabb-face: ({inc.X},{inc.Y},{inc.Z}) -> ({outc.X:F3},{outc.Y:F3},{outc.Z:F3}), dist-from-box={dist:F3} (want {r}), tangential kept -> {(t ? "ok" : "BAD")}");
@@ -67,7 +67,7 @@ partial class Program
         // 3) Sphere-vs-sphere overlap -> centres end up exactly r+sr apart.
         {
             Vector3 center = new(0.5f, 0f, 0f); float sr = 0.5f; float rr = r + sr;
-            Vector3 outc = PriviewNetworkScene.ResolveSphereVsSphere(new Vector3(0f, 0f, 0f), r, center, sr);
+            Vector3 outc = CollisionMath.ResolveSphereVsSphere(new Vector3(0f, 0f, 0f), r, center, sr);
             float d = (outc - center).Length();
             bool t = Math.Abs(d - rr) < eps;
             Console.WriteLine($"  sphere-sphere: resolved centre-dist={d:F3} (want {rr}) -> {(t ? "ok" : "BAD")}");
@@ -77,8 +77,8 @@ partial class Program
         // 4) Non-penetrating inputs are returned UNCHANGED (both AABB + sphere resolvers).
         {
             Vector3 farc = new(5f, 0f, 0f);
-            Vector3 a = PriviewNetworkScene.ResolveSphereVsAabb(farc, r, bmin, bmax);
-            Vector3 b = PriviewNetworkScene.ResolveSphereVsSphere(farc, r, new Vector3(0f, 0f, 0f), 0.5f);
+            Vector3 a = CollisionMath.ResolveSphereVsAabb(farc, r, bmin, bmax);
+            Vector3 b = CollisionMath.ResolveSphereVsSphere(farc, r, new Vector3(0f, 0f, 0f), 0.5f);
             bool t = a == farc && b == farc;
             Console.WriteLine($"  no-penetration: aabb->({a.X},{a.Y},{a.Z}), sphere->({b.X},{b.Y},{b.Z}) (want unchanged 5,0,0) -> {(t ? "ok" : "BAD")}");
             ok &= t;
@@ -88,8 +88,8 @@ partial class Program
         {
             Vector3 ax = new(1f, 0f, 0f), ay = new(0f, 1f, 0f), az = new(0f, 0f, 1f), half = new(1f, 1f, 1f), center = new(0f, 0f, 0f);
             Vector3 inc = new(1.2f, 0.5f, -0.3f);
-            Vector3 aabb = PriviewNetworkScene.ResolveSphereVsAabb(inc, r, bmin, bmax);
-            Vector3 obb = PriviewNetworkScene.ResolveSphereVsObb(inc, r, center, ax, ay, az, half);
+            Vector3 aabb = CollisionMath.ResolveSphereVsAabb(inc, r, bmin, bmax);
+            Vector3 obb = CollisionMath.ResolveSphereVsObb(inc, r, center, ax, ay, az, half);
             bool t = (obb - aabb).Length() < eps;
             Console.WriteLine($"  obb-identity: obb=({obb.X:F3},{obb.Y:F3},{obb.Z:F3}) vs aabb=({aabb.X:F3},{aabb.Y:F3},{aabb.Z:F3}) -> {(t ? "ok" : "BAD")}");
             ok &= t;
@@ -101,11 +101,11 @@ partial class Program
             const float s = 0.70710678f;                       // cos/sin 45°
             Vector3 ax = new(s, 0f, s), ay = new(0f, 1f, 0f), az = new(-s, 0f, s), half = new(1f, 1f, 1f), center = new(0f, 0f, 0f);
             Vector3 inc = ax * 1.1f;                            // local ex=1.1 (just past the face at 1.0), within r
-            Vector3 outc = PriviewNetworkScene.ResolveSphereVsObb(inc, r, center, ax, ay, az, half);
+            Vector3 outc = CollisionMath.ResolveSphereVsObb(inc, r, center, ax, ay, az, half);
             Vector3 want = ax * (1f + r);                       // pushed to face + r along the local X axis
             bool faceOk = (outc - want).Length() < eps;
             Vector3 farc = ax * (1f + r + 0.5f);                // clear of the face -> unchanged
-            Vector3 outf = PriviewNetworkScene.ResolveSphereVsObb(farc, r, center, ax, ay, az, half);
+            Vector3 outf = CollisionMath.ResolveSphereVsObb(farc, r, center, ax, ay, az, half);
             bool freeOk = (outf - farc).Length() < eps;
             Console.WriteLine($"  obb-rotated: face-push dist-from-want={(outc - want).Length():F4}, free-unchanged={freeOk} -> {(faceOk && freeOk ? "ok" : "BAD")}");
             ok &= faceOk && freeOk;
@@ -117,14 +117,14 @@ partial class Program
         {
             Vector3 hU = new(0.5f, 0.5f, 0.5f);
             Vector3 AX = new(1f, 0f, 0f), AY = new(0f, 1f, 0f), AZ = new(0f, 0f, 1f);
-            var (b3hit, b3n, b3d) = PriviewNetworkScene.SatBox3D(Vector3.Zero, AX, AY, AZ, hU, new Vector3(0.8f, 0f, 0f), AX, AY, AZ, hU);
+            var (b3hit, b3n, b3d) = CollisionMath.SatBox3D(Vector3.Zero, AX, AY, AZ, hU, new Vector3(0.8f, 0f, 0f), AX, AY, AZ, hU);
             bool b3Axis = b3hit && Math.Abs(b3n.X - 1f) < eps && Math.Abs(b3n.Y) < eps && Math.Abs(b3n.Z) < eps && Math.Abs(b3d - 0.2f) < eps;
-            var (b3vh, b3vn, b3vd) = PriviewNetworkScene.SatBox3D(Vector3.Zero, AX, AY, AZ, hU, new Vector3(0f, 0.8f, 0f), AX, AY, AZ, hU);
+            var (b3vh, b3vn, b3vd) = CollisionMath.SatBox3D(Vector3.Zero, AX, AY, AZ, hU, new Vector3(0f, 0.8f, 0f), AX, AY, AZ, hU);
             bool b3Vert = b3vh && Math.Abs(b3vn.Y - 1f) < eps && Math.Abs(b3vd - 0.2f) < eps;
-            var (b3fh, _, _) = PriviewNetworkScene.SatBox3D(Vector3.Zero, AX, AY, AZ, hU, new Vector3(3f, 0f, 0f), AX, AY, AZ, hU);
+            var (b3fh, _, _) = CollisionMath.SatBox3D(Vector3.Zero, AX, AY, AZ, hU, new Vector3(3f, 0f, 0f), AX, AY, AZ, hU);
             const float q = 0.70710678f;
             Vector3 rAX = new(q, q, 0f), rAY = new(-q, q, 0f);     // axes rotated 45° about Z
-            var (b3rh, b3rn, b3rd) = PriviewNetworkScene.SatBox3D(Vector3.Zero, AX, AY, AZ, hU, new Vector3(0.9f, 0f, 0f), rAX, rAY, AZ, hU);
+            var (b3rh, b3rn, b3rd) = CollisionMath.SatBox3D(Vector3.Zero, AX, AY, AZ, hU, new Vector3(0.9f, 0f, 0f), rAX, rAY, AZ, hU);
             bool b3Rot = b3rh && b3rd > 0f && Math.Abs(b3rn.Length() - 1f) < eps;
             bool satOk = b3Axis && b3Vert && !b3fh && b3Rot;
             Console.WriteLine($"  sat-box3d: axis(n={b3n.X:F2} d={b3d:F2}), vert={b3Vert}, far={!b3fh}, rot={b3Rot} -> {(satOk ? "ok" : "BAD")}");
@@ -152,18 +152,18 @@ partial class Program
         // stays unit-norm even integrating about two axes (where naive Euler integration would drift).
         {
             Vector3 e = new(0.3f, 0.5f, -0.2f);
-            var rt = PriviewNetworkScene.EulerFromQuat(PriviewNetworkScene.QuatFromEuler(e));
+            var rt = Quaternions.EulerFromQuat(Quaternions.QuatFromEuler(e));
             bool rtOk = Math.Abs(rt.X - e.X) < 1e-3f && Math.Abs(rt.Y - e.Y) < 1e-3f && Math.Abs(rt.Z - e.Z) < 1e-3f;
 
             // integrate ω=(0,2,0) for T=0.5 -> yaw 1.0 rad.
-            var q = PriviewNetworkScene.Quat.Identity; float dt = 1f / 600f;
-            for (int i = 0; i < 300; i++) q = PriviewNetworkScene.IntegrateQuat(q, new Vector3(0f, 2f, 0f), dt);
-            var eY = PriviewNetworkScene.EulerFromQuat(q);
+            var q = Quat.Identity; float dt = 1f / 600f;
+            for (int i = 0; i < 300; i++) q = Quaternions.IntegrateQuat(q, new Vector3(0f, 2f, 0f), dt);
+            var eY = Quaternions.EulerFromQuat(q);
             bool spinOk = Math.Abs(eY.Y - 1.0f) < 1e-2f && Math.Abs(eY.X) < 1e-2f && Math.Abs(eY.Z) < 1e-2f;
 
             // two-axis integration must keep the quaternion unit-norm (drift-free).
-            var q2 = PriviewNetworkScene.Quat.Identity;
-            for (int i = 0; i < 600; i++) q2 = PriviewNetworkScene.IntegrateQuat(q2, new Vector3(1.5f, -1f, 0.7f), dt);
+            var q2 = Quat.Identity;
+            for (int i = 0; i < 600; i++) q2 = Quaternions.IntegrateQuat(q2, new Vector3(1.5f, -1f, 0.7f), dt);
             float norm2 = MathF.Sqrt(q2.X * q2.X + q2.Y * q2.Y + q2.Z * q2.Z + q2.W * q2.W);
             bool normOk = Math.Abs(norm2 - 1f) < 1e-4f;
 
@@ -175,10 +175,10 @@ partial class Program
         // 3g) LerpAngle (rotation sync): eases along the SHORTEST arc — lerping from +3.0 toward -3.0
         // (≈ across the ±π seam) moves the SHORT way (magnitude grows past π / wraps), not back through 0.
         {
-            float half = PriviewNetworkScene.LerpAngle(3.0f, -3.0f, 0.5f);   // shortest delta ≈ +0.283, half -> ~3.14
+            float half = NetInterp.LerpAngle(3.0f, -3.0f, 0.5f);   // shortest delta ≈ +0.283, half -> ~3.14
             float midNoWrap = 3.0f + (-3.0f - 3.0f) * 0.5f;                  // naive lerp would give 0 (the long way)
             bool shortArc = MathF.Abs(half) > 3.0f && Math.Abs(midNoWrap) < eps;   // short arc leaves |angle|>3; naive collapses to 0
-            float plain = PriviewNetworkScene.LerpAngle(0.2f, 0.8f, 0.5f);   // no wrap -> simple midpoint 0.5
+            float plain = NetInterp.LerpAngle(0.2f, 0.8f, 0.5f);   // no wrap -> simple midpoint 0.5
             bool lerpOk = shortArc && Math.Abs(plain - 0.5f) < eps;
             Console.WriteLine($"  lerpangle: seam={half:F3}(|>3|), plain={plain:F3}(0.5) -> {(lerpOk ? "ok" : "BAD")}");
             ok &= lerpOk;
@@ -194,7 +194,7 @@ partial class Program
             float prevErr = MathF.Abs(cur.Y - tgt.Y); bool monotonic = true;
             for (int i = 0; i < 240; i++)
             {
-                (cur, tgt) = PriviewNetworkScene.StepInterpolate(cur, tgt, Vector3.Zero, dt, rate);
+                (cur, tgt) = NetInterp.StepInterpolate(cur, tgt, Vector3.Zero, dt, rate);
                 float err = MathF.Abs(cur.Y - tgt.Y);
                 if (err > prevErr + 1e-6f) monotonic = false;
                 prevErr = err;
@@ -206,7 +206,7 @@ partial class Program
             // dead-reckon: velY=-6, target starts at 0 and must descend ~velY*elapsed; cur tracks near it.
             Vector3 c2 = new(0f, 0f, 0f), t2 = new(0f, 0f, 0f);
             int steps = 120; float velY = -6f;
-            for (int i = 0; i < steps; i++) (c2, t2) = PriviewNetworkScene.StepInterpolate(c2, t2, new Vector3(0f, velY, 0f), dt, rate);
+            for (int i = 0; i < steps; i++) (c2, t2) = NetInterp.StepInterpolate(c2, t2, new Vector3(0f, velY, 0f), dt, rate);
             float expected = velY * steps * dt;                 // target's extrapolated Y
             bool fell = t2.Y < -1e-2f && MathF.Abs(t2.Y - expected) < 1e-2f && MathF.Abs(c2.Y - t2.Y) < 0.5f;
             Console.WriteLine($"  interp-deadreckon: tgt.Y={t2.Y:F3} (want {expected:F3}), cur.Y={c2.Y:F3} (tracks) -> {(fell ? "ok" : "BAD")}");
@@ -217,10 +217,10 @@ partial class Program
         // restitutions, so two elastic surfaces stay elastic, a dead one (0) kills the rebound, and a
         // negative ("inherit world") input clamps to 0 in the raw combine (callers resolve it first).
         {
-            float c11 = PriviewNetworkScene.CombineRestitution(1f, 1f);
-            float c10 = PriviewNetworkScene.CombineRestitution(1f, 0f);
-            float c55 = PriviewNetworkScene.CombineRestitution(0.5f, 0.5f);
-            float cNeg = PriviewNetworkScene.CombineRestitution(-1f, 0.5f);
+            float c11 = PhysicsMath.CombineRestitution(1f, 1f);
+            float c10 = PhysicsMath.CombineRestitution(1f, 0f);
+            float c55 = PhysicsMath.CombineRestitution(0.5f, 0.5f);
+            float cNeg = PhysicsMath.CombineRestitution(-1f, 0.5f);
             bool cok = MathF.Abs(c11 - 1f) < 1e-4f && c10 < 1e-4f && MathF.Abs(c55 - 0.5f) < 1e-4f && cNeg < 1e-4f;
             Console.WriteLine($"  combine-restitution: (1,1)={c11:F2} (1,0)={c10:F2} (.5,.5)={c55:F2} (-1,.5)={cNeg:F2} -> {(cok ? "ok" : "BAD")}");
             ok &= cok;
@@ -231,9 +231,9 @@ partial class Program
         // clamps onto the edge. Triangle in the y=0 plane: A(0,0,0) B(1,0,0) C(0,0,1).
         {
             Vector3 a = new(0f, 0f, 0f), b = new(1f, 0f, 0f), cc = new(0f, 0f, 1f);
-            Vector3 above = PriviewNetworkScene.ClosestPointOnTriangle(new Vector3(0.25f, 5f, 0.25f), a, b, cc);   // inside -> projects to (0.25,0,0.25)
-            Vector3 vert = PriviewNetworkScene.ClosestPointOnTriangle(new Vector3(-2f, 0f, -2f), a, b, cc);        // beyond A -> A
-            Vector3 edge = PriviewNetworkScene.ClosestPointOnTriangle(new Vector3(0.5f, 0f, -1f), a, b, cc);       // past AB -> (0.5,0,0)
+            Vector3 above = CollisionMath.ClosestPointOnTriangle(new Vector3(0.25f, 5f, 0.25f), a, b, cc);   // inside -> projects to (0.25,0,0.25)
+            Vector3 vert = CollisionMath.ClosestPointOnTriangle(new Vector3(-2f, 0f, -2f), a, b, cc);        // beyond A -> A
+            Vector3 edge = CollisionMath.ClosestPointOnTriangle(new Vector3(0.5f, 0f, -1f), a, b, cc);       // past AB -> (0.5,0,0)
             bool cptOk = MathF.Abs(above.X - 0.25f) < eps && MathF.Abs(above.Y) < eps && MathF.Abs(above.Z - 0.25f) < eps
                       && vert.Length() < eps
                       && MathF.Abs(edge.X - 0.5f) < eps && MathF.Abs(edge.Y) < eps && MathF.Abs(edge.Z) < eps;
@@ -317,8 +317,8 @@ partial class Program
             foreach (float dt in new[] { 1f / 60f, 1f / 30f, 1f / 15f, 1f / 8f, 1f / 4f, 1f / 2f, 1f / 1f })
             {
                 var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
-                var box = RigidBody.DynamicBox(new Vector3(0f, boxDrop, 0f), new Vector3(bh, bh, bh), PriviewNetworkScene.Quat.Identity, 1f);
+                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
+                var box = RigidBody.DynamicBox(new Vector3(0f, boxDrop, 0f), new Vector3(bh, bh, bh), Quat.Identity, 1f);
                 w.Bodies.Add(box);
                 float maxPen = 0f;
                 int steps = (int)(8f / dt);
@@ -343,7 +343,7 @@ partial class Program
         //    with a BOUNDED speed (friction caps the acceleration; it never runs away). Swept over frame times.
         {
             float theta = 0.2f;                                          // incline angle (rad); tan θ ≈ 0.203
-            PriviewNetworkScene.Quat tilt = PriviewNetworkScene.QuatFromEuler(new Vector3(0f, 0f, theta));
+            Quat tilt = Quaternions.QuatFromEuler(new Vector3(0f, 0f, theta));
             Vector3 topN = ImpulseMath.Rotate(tilt, new Vector3(0f, 1f, 0f));   // (-sinθ, cosθ, 0): downhill is -X
             Vector3 groundHalf = new Vector3(10f, 0.5f, 10f);
             Vector3 topFaceCenter = topN * groundHalf.Y;
@@ -374,8 +374,8 @@ partial class Program
         //    must NOT drift horizontally over many steps (friction cancels any numerical tangential velocity).
         {
             var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-            w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
-            var box = RigidBody.DynamicBox(new Vector3(2f, 0.5f, -1f), new Vector3(0.5f, 0.5f, 0.5f), PriviewNetworkScene.Quat.Identity, 1f);
+            w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
+            var box = RigidBody.DynamicBox(new Vector3(2f, 0.5f, -1f), new Vector3(0.5f, 0.5f, 0.5f), Quat.Identity, 1f);
             w.Bodies.Add(box);
             var sph = RigidBody.Sphere(new Vector3(-2f, 0.5f, 1f), 0.5f, 1f);
             w.Bodies.Add(sph);
@@ -406,9 +406,9 @@ partial class Program
             {
                 bool coarse = dt > 1f / 20f + 1e-4f;
                 var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
+                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
                 var st = new List<RigidBody>();
-                for (int k = 0; k < 4; k++) { var bx = RigidBody.DynamicBox(new Vector3(0f, bh + k * (2f * bh), 0f), new Vector3(bh, bh, bh), PriviewNetworkScene.Quat.Identity, 1f); st.Add(bx); w.Bodies.Add(bx); }
+                for (int k = 0; k < 4; k++) { var bx = RigidBody.DynamicBox(new Vector3(0f, bh + k * (2f * bh), 0f), new Vector3(bh, bh, bh), Quat.Identity, 1f); st.Add(bx); w.Bodies.Add(bx); }
 
                 float maxTilt = 0f, maxDrift = 0f, maxPen = 0f;
                 int steps = (int)(10f / dt);
@@ -437,9 +437,9 @@ partial class Program
         {
             const float bh = 0.5f;
             var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-            w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
-            var lo = RigidBody.DynamicBox(new Vector3(0f, bh, 0f), new Vector3(bh, bh, bh), PriviewNetworkScene.Quat.Identity, 1f);
-            var hi = RigidBody.DynamicBox(new Vector3(0f, 3f * bh, 0f), new Vector3(bh, bh, bh), PriviewNetworkScene.Quat.Identity, 1f);
+            w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
+            var lo = RigidBody.DynamicBox(new Vector3(0f, bh, 0f), new Vector3(bh, bh, bh), Quat.Identity, 1f);
+            var hi = RigidBody.DynamicBox(new Vector3(0f, 3f * bh, 0f), new Vector3(bh, bh, bh), Quat.Identity, 1f);
             var st = new List<RigidBody> { lo, hi }; w.Bodies.Add(lo); w.Bodies.Add(hi);
             for (int i = 0; i < 400; i++) w.Step(1f / 60f);
             Vector3 pLo = lo.Position, pHi = hi.Position; float maxJit = 0f, maxTilt = 0f;
@@ -458,9 +458,9 @@ partial class Program
             static (float rVel, float momA, float momB, float keA, float keB) HitTest(float mR, float g, float bh, float v0)
             {
                 var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-                var ground = RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity); ground.Friction = 0f; w.Bodies.Add(ground);
-                var L = RigidBody.DynamicBox(new Vector3(-1f, bh, 0f), new Vector3(bh, bh, bh), PriviewNetworkScene.Quat.Identity, 1f); L.Friction = 0f; L.LinVel = new Vector3(v0, 0f, 0f); w.Bodies.Add(L);
-                var Rb = RigidBody.DynamicBox(new Vector3(0.5f, bh, 0f), new Vector3(bh, bh, bh), PriviewNetworkScene.Quat.Identity, mR); Rb.Friction = 0f; w.Bodies.Add(Rb);
+                var ground = RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity); ground.Friction = 0f; w.Bodies.Add(ground);
+                var L = RigidBody.DynamicBox(new Vector3(-1f, bh, 0f), new Vector3(bh, bh, bh), Quat.Identity, 1f); L.Friction = 0f; L.LinVel = new Vector3(v0, 0f, 0f); w.Bodies.Add(L);
+                var Rb = RigidBody.DynamicBox(new Vector3(0.5f, bh, 0f), new Vector3(bh, bh, bh), Quat.Identity, mR); Rb.Friction = 0f; w.Bodies.Add(Rb);
                 float momA = 1f * v0;                                                     // initial X-momentum (only L moves)
                 float keA = 0.5f * 1f * v0 * v0;
                 for (int i = 0; i < 90; i++) w.Step(1f / 120f);                            // ~0.75 s: collide, then coast together
@@ -488,8 +488,8 @@ partial class Program
             foreach (float dt in new[] { 1f / 60f, 1f / 30f, 1f / 20f })
             {
                 var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
-                var box = RigidBody.DynamicBox(new Vector3(0f, bh, 0f), new Vector3(bh, bh, bh), PriviewNetworkScene.Quat.Identity, 1f);
+                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
+                var box = RigidBody.DynamicBox(new Vector3(0f, bh, 0f), new Vector3(bh, bh, bh), Quat.Identity, 1f);
                 w.Bodies.Add(box);
                 var ball = RigidBody.Sphere(new Vector3(0f, box.Position.Y + bh + rad + 0.5f, 0f), rad, 1f);   // small centred drop onto the box top
                 w.Bodies.Add(ball);
@@ -519,7 +519,7 @@ partial class Program
             static (float rVel, float momA, float momB, float keA, float keB) HitSphere(float mR, float g, float rad, float v0)
             {
                 var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-                var ground = RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity); ground.Friction = 0f; w.Bodies.Add(ground);
+                var ground = RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity); ground.Friction = 0f; w.Bodies.Add(ground);
                 var L = RigidBody.Sphere(new Vector3(-1f, rad, 0f), rad, 1f); L.Friction = 0f; L.LinVel = new Vector3(v0, 0f, 0f); w.Bodies.Add(L);
                 var Rb = RigidBody.Sphere(new Vector3(0.5f, rad, 0f), rad, mR); Rb.Friction = 0f; w.Bodies.Add(Rb);
                 for (int i = 0; i < 90; i++) w.Step(1f / 120f);
@@ -545,9 +545,9 @@ partial class Program
             {
                 bool coarse = dt > 1f / 20f + 1e-4f;
                 var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
+                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
                 var boxes = new List<RigidBody>();
-                for (int k = 0; k < 3; k++) { var bx = RigidBody.DynamicBox(new Vector3(0f, bh + k * 2f * bh, 0f), new Vector3(bh, bh, bh), PriviewNetworkScene.Quat.Identity, 1f); boxes.Add(bx); w.Bodies.Add(bx); }
+                for (int k = 0; k < 3; k++) { var bx = RigidBody.DynamicBox(new Vector3(0f, bh + k * 2f * bh, 0f), new Vector3(bh, bh, bh), Quat.Identity, 1f); boxes.Add(bx); w.Bodies.Add(bx); }
                 var ball = RigidBody.Sphere(new Vector3(-2.5f, 1.5f, 0f), rad, 1f); ball.LinVel = new Vector3(v0, 0f, 0f); w.Bodies.Add(ball);
                 var all = new List<RigidBody>(boxes) { ball };
                 Vector3[] start = boxes.Select(b => b.Position).ToArray();
@@ -592,7 +592,7 @@ partial class Program
             foreach (float dt in new[] { 1f / 60f, 1f / 30f, 1f / 20f })
             {
                 var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
+                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
                 w.Bodies.Add(Ramp(H, Xr, Zr));
                 float sx = -Xr + 1.5f, sy = H * (Xr - sx) / (2f * Xr);
                 var ball = RigidBody.Sphere(new Vector3(sx, sy + rad + 0.3f, 0f), rad, 1f); w.Bodies.Add(ball);
@@ -615,14 +615,14 @@ partial class Program
             const float bh = 0.5f, H = 2f, Xr = 6f, Zr = 4f;                    // slope 0.167, ~9.5°
             float theta = MathF.Atan(H / (2f * Xr));
             Vector3 nRamp = new Vector3(H / (2f * Xr), 1f, 0f); nRamp *= 1f / nRamp.Length();
-            var alignedQ = PriviewNetworkScene.QuatFromEuler(new Vector3(0f, 0f, -theta));
+            var alignedQ = Quaternions.QuatFromEuler(new Vector3(0f, 0f, -theta));
             foreach (var (mu, shouldStick) in new[] { (0.8f, true), (0.03f, false) })
             {
                 bool allDt = true; float lastTilt = 0f, lastDisp = 0f, lastSpeed = 0f;
                 foreach (float dt in new[] { 1f / 60f, 1f / 20f })
                 {
                     var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-                    w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
+                    w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
                     var ramp = Ramp(H, Xr, Zr); ramp.Friction = mu; w.Bodies.Add(ramp);
                     float sx0 = -1f, sy0 = H * (Xr - sx0) / (2f * Xr);
                     Vector3 start = new Vector3(sx0, sy0, 0f) + nRamp * (bh + 0.02f);
@@ -650,11 +650,11 @@ partial class Program
         {
             const float bh = 0.5f, H = 8f, Xr = 5f, Zr = 4f;                    // slope 0.8, ~38.7°
             float theta = MathF.Atan(H / (2f * Xr));
-            var q = PriviewNetworkScene.QuatFromEuler(new Vector3(0f, 0f, -theta - 0.5f));   // aligned + extra downhill lean (past its edge)
+            var q = Quaternions.QuatFromEuler(new Vector3(0f, 0f, -theta - 0.5f));   // aligned + extra downhill lean (past its edge)
             foreach (float dt in new[] { 1f / 60f, 1f / 30f })
             {
                 var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0.1f };
-                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
+                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
                 var ramp = Ramp(H, Xr, Zr); ramp.Friction = 0.8f; w.Bodies.Add(ramp);
                 float sx0 = -Xr + 2f, sy0 = H * (Xr - sx0) / (2f * Xr);
                 var box = RigidBody.DynamicBox(new Vector3(sx0, sy0 + bh + 0.3f, 0f), new Vector3(bh, bh, bh), q, 1f); box.Friction = 0.8f; w.Bodies.Add(box);
@@ -692,10 +692,10 @@ partial class Program
                 foreach (float dt in new[] { 1f / 60f, 1f / 20f })
                 {
                     var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-                    w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
+                    w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
                     var pyr = Pyramid(H, B); pyr.Friction = 0.6f; w.Bodies.Add(pyr);
                     Vector3 dropAbove = new Vector3(2f * B / 3f, H / 3f + 1.2f, 0f);     // above the +X face's centroid
-                    RigidBody obj = isBox ? RigidBody.DynamicBox(dropAbove, new Vector3(bh, bh, bh), PriviewNetworkScene.Quat.Identity, 1f) : RigidBody.Sphere(dropAbove, rad, 1f);
+                    RigidBody obj = isBox ? RigidBody.DynamicBox(dropAbove, new Vector3(bh, bh, bh), Quat.Identity, 1f) : RigidBody.Sphere(dropAbove, rad, 1f);
                     obj.Friction = 0.6f; w.Bodies.Add(obj);
                     Vector3 prev = obj.Position; float maxStep = 0f, maxY = obj.Position.Y;
                     int steps = (int)(6f / dt);
@@ -716,7 +716,7 @@ partial class Program
             const float bh = 0.5f;
             var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
             w.Bodies.Add(RigidBody.StaticMesh(new[] { new Vector3(-20f, 0f, -20f), new Vector3(-20f, 0f, 20f), new Vector3(20f, 0f, 20f), new Vector3(20f, 0f, -20f) }, new[] { 0, 1, 2, 0, 2, 3 }));
-            var box = RigidBody.DynamicBox(new Vector3(0.7f, 1f, -0.3f), new Vector3(bh, bh, bh), PriviewNetworkScene.Quat.Identity, 1f); w.Bodies.Add(box);
+            var box = RigidBody.DynamicBox(new Vector3(0.7f, 1f, -0.3f), new Vector3(bh, bh, bh), Quat.Identity, 1f); w.Bodies.Add(box);
             for (int i = 0; i < 400; i++) w.Step(1f / 60f);
             Vector3 p0 = box.Position; float maxJit = 0f, maxTilt = 0f;
             for (int i = 0; i < 120; i++) { w.Step(1f / 60f); maxJit = MathF.Max(maxJit, (box.Position - p0).Length()); maxTilt = MathF.Max(maxTilt, BoxTilt(box)); }
@@ -734,7 +734,7 @@ partial class Program
             foreach (float dt in new[] { 1f / 60f, 1f / 30f, 1f / 20f })
             {
                 var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
+                w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
                 var ball = RigidBody.Sphere(new Vector3(0f, rad, 0f), rad, 1f); ball.LinVel = new Vector3(4f, 0f, 0f); w.Bodies.Add(ball);
                 float startX = ball.Position.X; bool reversed = false;
                 int steps = (int)(40f / dt);
@@ -754,9 +754,9 @@ partial class Program
         {
             const float bh = 0.5f, rad = 0.5f, v0 = 8f;
             var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0f };
-            w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
+            w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
             var all = new List<RigidBody>();
-            for (int k = 0; k < 3; k++) { var bx = RigidBody.DynamicBox(new Vector3(0f, bh + k * 2f * bh, 0f), new Vector3(bh, bh, bh), PriviewNetworkScene.Quat.Identity, 1f); all.Add(bx); w.Bodies.Add(bx); }
+            for (int k = 0; k < 3; k++) { var bx = RigidBody.DynamicBox(new Vector3(0f, bh + k * 2f * bh, 0f), new Vector3(bh, bh, bh), Quat.Identity, 1f); all.Add(bx); w.Bodies.Add(bx); }
             var ball = RigidBody.Sphere(new Vector3(-2.5f, 1.5f, 0f), rad, 1f); ball.LinVel = new Vector3(v0, 0f, 0f); all.Add(ball); w.Bodies.Add(ball);
             bool allSleep = false; int sleptAt = 0;
             int steps = (int)(30f / (1f / 60f));
@@ -783,10 +783,10 @@ partial class Program
             const float bh = 0.5f, Hs = 8f;
             float thetaS = MathF.Atan(Hs / (2f * 5f));
             var w2 = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = 0.1f };
-            w2.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
+            w2.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
             var ramp2 = Ramp(Hs, 5f, 4f); ramp2.Friction = 0.8f; w2.Bodies.Add(ramp2);
             float s2 = -5f + 2f, sy2 = Hs * (5f - s2) / (2f * 5f);
-            var box = RigidBody.DynamicBox(new Vector3(s2, sy2 + bh + 0.3f, 0f), new Vector3(bh, bh, bh), PriviewNetworkScene.QuatFromEuler(new Vector3(0f, 0f, -thetaS - 0.5f)), 1f); box.Friction = 0.8f; w2.Bodies.Add(box);
+            var box = RigidBody.DynamicBox(new Vector3(s2, sy2 + bh + 0.3f, 0f), new Vector3(bh, bh, bh), Quaternions.QuatFromEuler(new Vector3(0f, 0f, -thetaS - 0.5f)), 1f); box.Friction = 0.8f; w2.Bodies.Add(box);
             float startTilt = BoxTilt(box), maxTilt = startTilt;
             for (int i = 0; i < (int)(6f / (1f / 60f)); i++) { w2.Step(1f / 60f); float t = BoxTilt(box); if (t > maxTilt) maxTilt = t; }
             bool stillTumbles = maxTilt > startTilt + 0.6f && box.Position.X > s2 + 1f;
@@ -899,7 +899,7 @@ partial class Program
     static ImpulseWorld MakeImpulseWorld(float e, float g, float radius, float dropY, out RigidBody ball)
     {
         var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f), Restitution = e };
-        w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), PriviewNetworkScene.Quat.Identity));
+        w.Bodies.Add(RigidBody.StaticBox(new Vector3(0f, -1f, 0f), new Vector3(50f, 1f, 50f), Quat.Identity));
         ball = RigidBody.Sphere(new Vector3(0f, dropY, 0f), radius, 1f);
         w.Bodies.Add(ball);
         return w;

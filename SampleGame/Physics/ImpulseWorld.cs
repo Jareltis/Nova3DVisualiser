@@ -156,7 +156,7 @@ public sealed class ImpulseWorld
             float ls2 = b.LinVel * b.LinVel; if (ls2 > MaxLinSpeed * MaxLinSpeed) b.LinVel *= MaxLinSpeed / MathF.Sqrt(ls2);
             float as2 = b.AngVel * b.AngVel; if (as2 > MaxAngSpeed * MaxAngSpeed) b.AngVel *= MaxAngSpeed / MathF.Sqrt(as2);
             b.Position += (b.LinVel + b.PseudoLin) * h;
-            b.Orientation = PriviewNetworkScene.IntegrateQuat(b.Orientation, b.AngVel + b.PseudoAng, h);
+            b.Orientation = Quaternions.IntegrateQuat(b.Orientation, b.AngVel + b.PseudoAng, h);
             if (MathF.Abs(b.Position.X) > RunawayBound || MathF.Abs(b.Position.Y) > RunawayBound || MathF.Abs(b.Position.Z) > RunawayBound)
             { b.LinVel = Vector3.Zero; b.AngVel = Vector3.Zero; }
         }

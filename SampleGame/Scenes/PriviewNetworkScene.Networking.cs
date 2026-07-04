@@ -262,6 +262,40 @@ public partial class PriviewNetworkScene
         catch (Exception ex) { Logger.Error($"Failed writing received texture '{name}'", ex); }
     }
 
+    // Reads texture `name` from `folder` and slices its PNG bytes into TextureChunkPacket(s) (a single
+    // chunk when small) — the EXACT packets the runtime-push + world-sync paths stream. Empty for a
+    // blank/missing name (so a texture-less edit no-ops). Same MeshChunkSize slicing as OnWorldRequested.
+    private static List<TextureChunkPacket> BuildTextureChunks(string? name, string folder)
+    {
+        var list = new List<TextureChunkPacket>();
+        if (string.IsNullOrWhiteSpace(name)) return list;
+        byte[] bytes;
+        try { bytes = File.ReadAllBytes(Path.Combine(folder, name)); }
+        catch (Exception ex) { Logger.Error($"Texture push: failed reading '{name}' from {folder}", ex); return list; }
+        int total = Math.Max(1, (bytes.Length + MeshChunkSize - 1) / MeshChunkSize);
+        for (int i = 0; i < total; i++)
+        {
+            int start = i * MeshChunkSize;
+            int len = Math.Min(MeshChunkSize, bytes.Length - start);
+            byte[] slice = new byte[len];
+            Array.Copy(bytes, start, slice, 0, len);
+            list.Add(new TextureChunkPacket { TextureName = name, Index = i, Total = total, Data = slice });
+        }
+        return list;
+    }
+
+    // Server (A1 runtime push): stream a texture's PNG bytes to connected peers BEFORE the WorldEdit that
+    // names it — so a peer WITHOUT the file materializes it (OnTextureChunkReceived -> MaterializeTexture)
+    // before ApplyToInstance loads it (TCP is reliable + FIFO, exactly like the mesh add-on-edit path).
+    // Authority-only + idempotent: a peer that already has the file just overwrites it harmlessly.
+    private void StreamTextureToPeers(string? name)
+    {
+        if (!_online || !_isServer || string.IsNullOrWhiteSpace(name)) return;
+        var chunks = BuildTextureChunks(name, AppPaths.TexturesFolder);
+        foreach (var c in chunks) _netManager?.SendPacket(c, _myNetId);
+        if (chunks.Count > 0) Logger.Info($"Runtime texture push: streamed '{name}' in {chunks.Count} chunk(s) to peers.");
+    }
+
     private void ApplyReceivedWorld(WorldConfig world, IReadOnlyDictionary<string, string> meshTexts,
                                     IReadOnlyDictionary<string, byte[]> textureData)
     {

@@ -58,9 +58,10 @@ public abstract class GameObject(Vector3 position, Vector3 localRotate)
     // tags its 6 sides 0..5 (+X,-X,+Y,-Y,+Z,-Z); other shapes are a single "whole" group 0.
     public int TextureFace = -1;
 
-    // Texture magnification filter: Nearest (default, bit-exact CPU↔GPU) or Bilinear (smooths blocky
-    // magnification via a 4-texel float blend — opt-in, tolerated thin parity band). Picked at the single
-    // sampling site (Object3d.SurfaceColor / Sphere textured path) and mirrored in the GPU kernel.
+    // Texture filter: Nearest (default, bit-exact CPU↔GPU), Bilinear (4-texel float blend — smooths
+    // magnification), or Mipmapped (trilinear — a ray-cone mip level blended, reduces distant-minification
+    // aliasing). Bilinear/Mipmapped are opt-in (a tolerated thin parity band from float math). Picked at the
+    // single sampling site (Object3d.SurfaceColor / Sphere textured path) and mirrored in the GPU kernel.
     public TextureFilterMode TextureFilter = TextureFilterMode.Nearest;
 
     // The surface colour after paling: RGB lerped toward white by ColorFade, alpha preserved.

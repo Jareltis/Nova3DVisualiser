@@ -421,6 +421,61 @@ partial class Program
             try { File.Delete(jpgPath); } catch { }
         }
 
+        // 12) MIPMAPPING (opt-in, per-object) — (a) box-filter mip-chain generation, (b) the pure
+        // footprint→LOD selection, (c) trilinear level blending. All CPU; the GPU replicates the same math
+        // (a thin tolerated band, verified by gputest). Untextured/nearest/bilinear content is untouched.
+
+        // (a) CHAIN GEN — a 4×4 texture: level count = floor(log2(4))+1 = 3 (4×4, 2×2, 1×1); level 0 aliases
+        // the source; each level halves; the top is 1×1; a box-averaged texel matches (a+b+c+d+2)/4.
+        const int MW = 4, MH = 4;
+        var mpx = new Rgba32[MW * MH];
+        for (int y = 0; y < MH; y++)
+            for (int x = 0; x < MW; x++)
+                mpx[y * MW + x] = new Rgba32((byte)(x * 16), (byte)(y * 16), 100, 255);
+        var mtex = new Texture(MW, MH, mpx, "mip.png");
+        var chain = mtex.Mips;
+        bool chainCount = mtex.LevelCount == 3 && chain.Length == 3;
+        bool level0Alias = ReferenceEquals(chain[0], mtex.Pixels);
+        bool halved = chain[1].Length == 2 * 2 && chain[2].Length == 1 * 1 &&
+                      Texture.MipDim(4, 0) == 4 && Texture.MipDim(4, 1) == 2 && Texture.MipDim(4, 2) == 1;
+        // level1[0,0] = box average of source (0,0)(1,0)(0,1)(1,1): R={0,16,0,16}->8, G={0,0,16,16}->8, B=100.
+        Rgba32 boxTexel = chain[1][0];
+        byte Avg4b(byte a, byte b, byte c, byte d) => (byte)((a + b + c + d + 2) / 4);
+        bool boxAvg = boxTexel.R == Avg4b(0, 16, 0, 16) && boxTexel.G == Avg4b(0, 0, 16, 16) && boxTexel.B == 100;
+        // 1×1 top = mean of the four level-1 texels (down to a single averaged colour).
+        Rgba32 t10 = chain[1][0], t11 = chain[1][1], t12 = chain[1][2], t13 = chain[1][3];
+        bool top1x1 = chain[2][0].R == Avg4b(t10.R, t11.R, t12.R, t13.R) && chain[2][0].G == Avg4b(t10.G, t11.G, t12.G, t13.G);
+        bool chainOk = chainCount && level0Alias && halved && boxAvg && top1x1;
+        Console.WriteLine($"  mip chain: levels={mtex.LevelCount} (want 3), lvl0=alias -> {level0Alias}, halved -> {halved}, " +
+                          $"box-avg[0]=({boxTexel.R},{boxTexel.G}) want (8,8) -> {boxAvg}, 1×1 top -> {top1x1} -> {(chainOk ? "ok" : "BAD")}");
+        ok &= chainOk;
+
+        // (b) FOOTPRINT → LOD (Texture.MipLod): a NEAR/small-footprint hit selects level 0; a FAR hit
+        // selects a higher level; a GRAZING incidence (small |cos|) widens the footprint → higher level than
+        // head-on at the same distance. Deliberately-simple scalar estimate, identical on CPU and GPU.
+        const int LW = 32; int LC = new Texture(LW, LW, new Rgba32[LW * LW]).LevelCount;   // 6
+        float lodNear = Texture.MipLod(LW, LC, 0.05f, 0.02f, 1f, 1f);
+        float lodFar  = Texture.MipLod(LW, LC, 40f, 0.02f, 1f, 1f);
+        float lodHead = Texture.MipLod(LW, LC, 10f, 0.02f, 1f, 1f);
+        float lodGraze = Texture.MipLod(LW, LC, 10f, 0.02f, 0.1f, 1f);   // |cos|=0.1 (clamped) → 4× footprint
+        bool lodOk = lodNear == 0f && lodFar > lodNear + 1f && lodGraze > lodHead && lodFar <= LC - 1;
+        Console.WriteLine($"  mip LOD: near={lodNear:F2} (want 0), far={lodFar:F2} (>near), head={lodHead:F2} < graze={lodGraze:F2}, maxLevel={LC - 1} -> {(lodOk ? "ok" : "BAD")}");
+        ok &= lodOk;
+
+        // (c) TRILINEAR BLEND — at lod 0 == base bilinear; at the coarsest level == that level's bilinear;
+        // at a FRACTIONAL lod == the per-channel round-blend of the two straddling levels (recomputed here
+        // independently from the two level samples).
+        float mu = 0.3f, mv = 0.7f;
+        bool triBase = mtex.SampleTrilinear(mu, mv, 0f) == mtex.SampleBilinear(mu, mv);
+        bool triTop = mtex.SampleTrilinear(mu, mv, mtex.LevelCount - 1) == mtex.SampleBilinearLevel(mtex.LevelCount - 1, mu, mv);
+        Rgba32 c0 = mtex.SampleBilinearLevel(0, mu, mv), c1 = mtex.SampleBilinearLevel(1, mu, mv);
+        byte Blend(byte a, byte b) => (byte)(a + (b - a) * 0.5f + 0.5f);
+        Rgba32 wantHalf = new Rgba32(Blend(c0.R, c1.R), Blend(c0.G, c1.G), Blend(c0.B, c1.B), Blend(c0.A, c1.A));
+        bool triHalf = mtex.SampleTrilinear(mu, mv, 0.5f) == wantHalf;
+        bool triOk = triBase && triTop && triHalf;
+        Console.WriteLine($"  mip trilinear: lod0=base -> {triBase}, lodMax=coarsest -> {triTop}, lod0.5=blend -> {triHalf} -> {(triOk ? "ok" : "BAD")}");
+        ok &= triOk;
+
         Console.WriteLine(ok ? "TEXTURE TEST PASSED" : "TEXTURE TEST FAILED");
     }
 
@@ -858,6 +913,42 @@ partial class Program
         public override void Update() { }
     }
 
+    // MIPMAPPED (trilinear) parity: a large, tilted mip-filtered textured cube. The mip level comes from a
+    // ray-cone footprint the CPU and GPU compute from the SAME formula (PixelConeSpread + Texture.MipLod),
+    // but level selection (Log2) + trilinear blending are float math that rounds slightly differently on
+    // GPU (XMath) vs CPU (MathF) — so, like bilinear, a THIN band may differ (NOT Δ=0). A 32×32 texture on a
+    // big receding cube spans several mip levels so trilinear genuinely engages. Shadows off.
+    sealed class GpuMipTextureTestScene : Scene
+    {
+        public GpuMipTextureTestScene() : base(new DisplayManagerAsync()) { }
+
+        public override void Start()
+        {
+            Exposure = 0.05f; Ambient = 0.1f; EnableShadows = false;
+
+            const int TW = 32, TH = 32;
+            var px = new Rgba32[TW * TH];
+            for (int y = 0; y < TH; y++)
+                for (int x = 0; x < TW; x++)
+                    px[y * TW + x] = new Rgba32((byte)(x * 8), (byte)(y * 8), 128, 255);
+            var tex = new Texture(TW, TH, px, "gpumip");
+
+            var cube = PriviewNetworkScene.CreateCube();
+            cube.Position = new Vector3(9f, 0f, 0f);
+            cube.Scale = 3.0f;
+            cube.LocalRotate = new Vector3(0.3f, 0.6f, 0.15f);
+            cube.Texture = tex;
+            cube.TextureFilter = TextureFilterMode.Mipmapped;   // the opt-in trilinear minification under test
+            cube.UpdateGeometry();
+            AddDisplaysObject(cube);
+
+            AddLight(new Light(new Vector3(2f, 5f, 1f), 600f) { Rgb = new Vector3(1f, 0.95f, 0.9f) });
+            SetMainCamera(new Camera(new Vector3(0f, 0f, 0f), Vector3.Zero));
+        }
+
+        public override void Update() { }
+    }
+
     // Stage-5 imported-mesh parity: a TEXTURED .obj mesh (loaded via ObjLoader, so its per-corner UVs came
     // from the file's `vt` with the v-flip) beside an untextured cube. Imported UVs interpolate linearly
     // like the cube, so CPU↔GPU must be Δ=0. Shadows off. The mesh is supplied by the caller (a fixture).
@@ -935,13 +1026,17 @@ partial class Program
                 SceneSnapshot snap = s.BuildSnapshot();
                 rt.Render(snap, W, H, aspect, brightness, color);
 
+                // Feed the CPU the SAME per-pixel ray-cone the GPU uses (mip-level selection depends on it);
+                // it is ignored by nearest/bilinear/untextured content, so the earlier passes are unaffected.
+                float cone = ConsoleScreenAsync.PixelConeSpread(W, H, aspect, snap.Focal);
+
                 int nb = 0, edge = 0, interior = 0; float wb = 0f; int wc = 0;
                 for (int j = 0; j < H; j++)
                     for (int i = 0; i < W; i++)
                     {
                         float uvx = ((float)i / (W - 1) * 2f - 1f) * aspect;
                         float uvy = -((float)j / (H - 1) * 2f - 1f);
-                        var cpu = s.GetPixelData(new Vector2(uvx, uvy));
+                        var cpu = s.GetPixelData(new Vector2(uvx, uvy), cone);
                         int idx = j * W + i;
                         if (cpu.Brightness > 0.01f) nb++;
 
@@ -1024,6 +1119,17 @@ partial class Program
             var ph = Compare(bilScene, 0.004f, 1);
             Console.WriteLine($"  [tex-bilinear] nonBlack={ph.nonBlack}, edge={ph.edge}, band={ph.interior} (worstΔb={ph.worstB:F4}, worstΔc={ph.worstC})");
 
+            // Pass I — MIPMAPPED (trilinear), shadows OFF: an opt-in mip-filtered cube. The CPU and GPU derive
+            // the mip level from the SAME ray-cone footprint (fed to the CPU via GetPixelData's cone), but
+            // Log2 level-selection + trilinear blending are float math (XMath vs MathF), so — like bilinear —
+            // a THIN band may differ. We tolerate ±1 per pixel and require the band (Δc>=2) to stay THIN, NOT
+            // Δ=0. The nearest passes above prove the default filter is still exact. Report the band + worstΔ.
+            var mipScene = new GpuMipTextureTestScene();
+            mipScene.Start();
+            rt.ResetGeometryCache();
+            var pi = Compare(mipScene, 0.004f, 1);
+            Console.WriteLine($"  [tex-mip] nonBlack={pi.nonBlack}, edge={pi.edge}, band={pi.interior} (worstΔb={pi.worstB:F4}, worstΔc={pi.worstC})");
+
             // A3 — TARGETED TEXTURE RE-UPLOAD. (correctness) a texture-version-only bump re-renders the same
             // image BYTE-IDENTICALLY via the pool-only upload path; (behaviour) it re-uploads the texture pool
             // but NOT the geometry, while a geometry-version bump does re-upload geometry — proving the swap is
@@ -1064,6 +1170,122 @@ partial class Program
                 Console.WriteLine($"  [tex-reupload] first(g={gFirst},t={tFirst}), texSwap(g={gTex},t={tTex},identical={identical}), geomChange(g={gGeom}) -> {(reuploadOk ? "ok" : "BAD")}");
             }
 
+            // ---- Region-mapping helper (pure): a region + pixel -> region-relative uv in [-1,1] using the
+            // REGION's aspect. The full-screen region reproduces the old CalculateUV formula exactly; a
+            // half-width region maps its corners to ±aspect/±1 with a HALVED aspect and honors the x0 offset.
+            bool regionMapOk;
+            {
+                const float pa = 11f / 24f;
+                bool NearF(float u, float v) => Math.Abs(u - v) < 1e-4f;
+                bool rm = true;
+
+                float fullA = ConsoleScreenAsync.RegionAspect(W, H, pa);
+                var tl = ConsoleScreenAsync.RegionUV(0, 0, 0, 0, W, H, pa);
+                var br = ConsoleScreenAsync.RegionUV(W - 1, H - 1, 0, 0, W, H, pa);
+                rm &= NearF(tl.X, -fullA) && NearF(tl.Y, 1f) && NearF(br.X, fullA) && NearF(br.Y, -1f);   // full-screen corners
+
+                // Full-screen RegionUV == the old CalculateUV formula (same mapping) at an interior pixel.
+                var mn = ConsoleScreenAsync.RegionUV(W / 3, H / 3, 0, 0, W, H, pa);
+                float exX = ((float)(W / 3) / (W - 1) * 2f - 1f) * fullA, exY = -((float)(H / 3) / (H - 1) * 2f - 1f);
+                rm &= NearF(mn.X, exX) && NearF(mn.Y, exY);
+
+                // Half-width region [W/2,0, W-W/2, H]: aspect HALVED; its corners still hit ±aspect/±1; the
+                // x0 offset maps the region's own top-left/bottom-right (not the screen's).
+                int hw = W / 2, rw = W - hw;
+                float rA = ConsoleScreenAsync.RegionAspect(rw, H, pa);
+                var rtl = ConsoleScreenAsync.RegionUV(hw, 0, hw, 0, rw, H, pa);
+                var rbr = ConsoleScreenAsync.RegionUV(W - 1, H - 1, hw, 0, rw, H, pa);
+                rm &= rA < fullA && NearF(rA, (float)rw / H * pa)
+                   && NearF(rtl.X, -rA) && NearF(rtl.Y, 1f) && NearF(rbr.X, rA) && NearF(rbr.Y, -1f);
+
+                regionMapOk = rm;
+                Console.WriteLine($"  [region-map] fullA={fullA:F3}, halfA={rA:F3}, corners+offset -> {(regionMapOk ? "ok" : "BAD")}");
+            }
+
+            // ---- 2-WAY SPLIT parity (shadows OFF): render two regions (LEFT|RIGHT) from two DIFFERENT
+            // cameras via RenderViews, then compare each region's GPU pixels to the CPU render of THAT region
+            // (region-relative uv + the region's own camera). Interior must be EXACT (Δ=0) per region, edge 0
+            // (deterministic silhouettes), and both regions must hold geometry (a camera/region swap or a
+            // region-index bug would show up as interior/edge mismatches). The two cameras differ so the two
+            // regions are DIFFERENT images — a mixup can't pass by coincidence.
+            bool splitOk; int splitInterior, splitEdge, splitNbL, splitNbR;
+            {
+                const float pa = 11f / 24f;
+                var s = new GpuTestScene(); s.Start(); s.EnableShadows = false;
+                rt.ResetGeometryCache();                                   // new scene -> force a geometry re-upload
+                SceneSnapshot snap = s.BuildSnapshot();
+
+                int leftW = W / 2, rightW = W - leftW;
+                var camL = new Camera(new Vector3(0f, 0f, 0f), Vector3.Zero);                    // straight down +X
+                var camR = new Camera(new Vector3(0f, 0f, 0f), new Vector3(0f, 0.2f, 0.05f));    // panned -> a different image
+                CameraView cvL = s.BuildCameraView(camL), cvR = s.BuildCameraView(camR);
+                var views = new[]
+                {
+                    new Nova3DVisualiser.Gpu.GpuViewport { X0 = 0, Y0 = 0, W = leftW, H = H, Aspect = ConsoleScreenAsync.RegionAspect(leftW, H, pa),
+                        CamPos = cvL.CamPos, BasisX = cvL.BasisX, BasisY = cvL.BasisY, BasisZ = cvL.BasisZ, Focal = cvL.Focal },
+                    new Nova3DVisualiser.Gpu.GpuViewport { X0 = leftW, Y0 = 0, W = rightW, H = H, Aspect = ConsoleScreenAsync.RegionAspect(rightW, H, pa),
+                        CamPos = cvR.CamPos, BasisX = cvR.BasisX, BasisY = cvR.BasisY, BasisZ = cvR.BasisZ, Focal = cvR.Focal },
+                };
+                var sb = new float[W * H]; var sc = new Rgb24[W * H];
+                rt.RenderViews(snap, W, H, views, sb, sc);
+
+                (int interior, int edge, int nb) CompareRegion(int x0, int w, Camera cam)
+                {
+                    int interior = 0, edge = 0, nb = 0;
+                    for (int j = 0; j < H; j++)
+                        for (int i = x0; i < x0 + w; i++)
+                        {
+                            Vector2 uv = ConsoleScreenAsync.RegionUV(i, j, x0, 0, w, H, pa);
+                            var cpu = s.GetPixelData(uv, cam);
+                            int idx = j * W + i;
+                            if (sb[idx] > 0.01f) nb++;
+                            float db = Math.Abs(cpu.Brightness - sb[idx]);
+                            int dc = Math.Max(Math.Abs(cpu.Color.R - sc[idx].R), Math.Max(Math.Abs(cpu.Color.G - sc[idx].G), Math.Abs(cpu.Color.B - sc[idx].B)));
+                            if (db <= 0.004f && dc <= 1) continue;
+                            bool cpuHit = cpu.Brightness > 0.01f, gpuHit = sb[idx] > 0.01f;
+                            if (cpuHit != gpuHit) edge++; else interior++;
+                        }
+                    return (interior, edge, nb);
+                }
+                var L = CompareRegion(0, leftW, camL);
+                var R = CompareRegion(leftW, rightW, camR);
+                splitInterior = L.interior + R.interior; splitEdge = L.edge + R.edge; splitNbL = L.nb; splitNbR = R.nb;
+                splitOk = splitInterior == 0 && splitEdge == 0 && splitNbL > 20 && splitNbR > 20;
+                Console.WriteLine($"  [split 2-way] leftNB={splitNbL}, rightNB={splitNbR}, interior={splitInterior}, edge={splitEdge} -> {(splitOk ? "ok" : "BAD")}");
+            }
+
+            // ---- BVH TOGGLE (F3 on the GPU): render the scene (high-poly mesh, shadows OFF) with UseBvh=true
+            // AND false. (a) BOTH must match the CPU EXACTLY (Δ=0) — the CPU respects UseBvh too; (b) the two
+            // GPU frames must be BIT-IDENTICAL, proving the brute-force path finds the same closest hits as the
+            // BVH (a BVH only prunes which triangles are tested, never the result — so only the speed differs).
+            bool bvhToggleOk;
+            {
+                var bs = new GpuTestScene(); bs.Start(); bs.EnableShadows = false;
+                rt.ResetGeometryCache();
+                bool savedBvh = Object3d.UseBvh;
+
+                Object3d.UseBvh = true;
+                var aOn = Compare(bs, 0.004f, 1);                                  // GPU(BVH) vs CPU(BVH)
+                var bvhOnB = (float[])brightness.Clone(); var bvhOnC = (Rgb24[])color.Clone();
+
+                Object3d.UseBvh = false;
+                var aOff = Compare(bs, 0.004f, 1);                                 // GPU(brute) vs CPU(non-BVH)
+                var bvhOffB = (float[])brightness.Clone(); var bvhOffC = (Rgb24[])color.Clone();
+
+                Object3d.UseBvh = savedBvh;
+
+                bool gpuIdentical = true;                                          // (b) BVH-on frame == BVH-off frame, bit-for-bit
+                for (int i = 0; i < total; i++)
+                    if (bvhOnB[i] != bvhOffB[i] || bvhOnC[i].R != bvhOffC[i].R || bvhOnC[i].G != bvhOffC[i].G || bvhOnC[i].B != bvhOffC[i].B)
+                    { gpuIdentical = false; break; }
+
+                bvhToggleOk = aOn.nonBlack > 50 && aOn.interior == 0 && aOn.edge == 0
+                           && aOff.nonBlack > 50 && aOff.interior == 0 && aOff.edge == 0
+                           && gpuIdentical;
+                Console.WriteLine($"  [bvh-toggle] on(nb={aOn.nonBlack},int={aOn.interior},edge={aOn.edge}) off(nb={aOff.nonBlack},int={aOff.interior},edge={aOff.edge}) gpuOn==gpuOff={gpuIdentical} -> {(bvhToggleOk ? "ok" : "BAD")}");
+                rt.ResetGeometryCache();   // leave a clean cache for anything after
+            }
+
             bool ok = a.nonBlack > 50
                       && a.interior == 0 && a.edge == 0                                          // untextured shading exact (Δ=0)
                       && (float)b.interior / total < 0.06f && (float)b.edge / total < 0.06f      // shadow boundary thin
@@ -1075,7 +1297,12 @@ partial class Program
                       && pg.nonBlack > 50 && pg.edge == 0 && pg.interior == 0                    // imported textured mesh exact (Δ=0)
                       && ph.nonBlack > 50 && (float)ph.edge / total < 0.02f
                       && (float)ph.interior / total < 0.05f                                      // bilinear band thin (NOT Δ=0 — float rounding)
-                      && reuploadOk;                                                             // A3: texture swap is targeted + output unchanged
+                      && pi.nonBlack > 50 && (float)pi.edge / total < 0.02f
+                      && (float)pi.interior / total < 0.08f                                      // mip band thin (NOT Δ=0 — float level-select + blend)
+                      && reuploadOk                                                              // A3: texture swap is targeted + output unchanged
+                      && regionMapOk                                                             // region→uv mapping correct (full + half-width)
+                      && splitOk                                                                  // 2-way split: each region CPU↔GPU exact (Δ=0)
+                      && bvhToggleOk;                                                             // F3 GPU BVH<->brute: CPU-exact in both + the two GPU frames identical
             Console.WriteLine(ok ? "GPU TEST PASSED" : "GPU TEST FAILED");
         }
         catch (Exception ex)

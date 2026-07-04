@@ -25,12 +25,15 @@ public struct SnapFace
     public int Group;   // face-group id (for per-object texture-face selection); 0 = whole/default
 }
 
-// One decoded texture's placement in the flat SceneSnapshot.TexPixels array: a contiguous run of
-// Width*Height Rgba32 pixels (row-major, row 0 first) starting at Offset. Sampled exactly like the CPU
-// Texture.Sample (nearest-neighbour + wrap).
+// One decoded texture's placement in the flat SceneSnapshot.TexPixels array. The WHOLE box-filter mip
+// chain lives contiguously from Offset (level 0 == the full Width×Height image, row-major, row 0 first;
+// then each halved level). Nearest/bilinear touch only level 0 at Offset (so they are unchanged); the
+// trilinear sampler walks the chain using LevelCount + per-level dims (max(1, dim>>level)). Level L's
+// offset = Offset + Σ_{k<L} dim(k). LevelCount = floor(log2(max(W,H))) + 1.
 public struct SnapTexture
 {
     public int Offset, Width, Height;
+    public int LevelCount;   // mip levels present from Offset (>=1); level 0 is the full image
 }
 
 // One flattened, STACKLESS BVH node (local space). Traversal carries a single node index: on an AABB
@@ -56,13 +59,14 @@ public struct SnapObject
     public float InvScale;             // 1 / Scale
     public Vector3 WorldMin, WorldMax; // per-frame world AABB — a cheap pre-cull before transforming
     public int VertBase, FaceBase, NodeBase, TriIdxBase;
+    public int FaceCount;              // mesh triangle count (faces[FaceBase .. FaceBase+FaceCount]) — for the BVH-off brute-force path
     public float R, G, B, A;
     public int CastsShadow;
     public int TextureIndex;           // index into SceneSnapshot.Textures, or -1 for none (flat colour)
     public float ColorFade;            // paleness 0..1 — applied to the SAMPLED texel when textured (the flat R/G/B already bakes it)
     public float TextureScale;         // UV tiling factor (multiply UV before sampling); 1 = 1:1
     public int TextureFace;            // -1 = all faces textured; >=0 = only faces whose Group matches
-    public int TextureFilter;          // 0 = Nearest (exact), 1 = Bilinear (4-texel blend; tolerated band)
+    public int TextureFilter;          // 0 = Nearest (exact), 1 = Bilinear, 2 = Mipmapped/trilinear (both a tolerated band)
 }
 
 public struct SnapSphere
@@ -76,7 +80,7 @@ public struct SnapSphere
     public float ColorFade;            // paleness 0..1 — applied to the SAMPLED texel when textured (the flat R/G/B already bakes it)
     public float TextureScale;         // UV tiling factor (multiply the equirect UV before sampling); 1 = 1:1
     public int TextureFace;            // -1 or 0 texture the (whole) sphere; any other value = flat (sphere is a single group 0)
-    public int TextureFilter;          // 0 = Nearest (exact), 1 = Bilinear (4-texel blend; tolerated band)
+    public int TextureFilter;          // 0 = Nearest (exact), 1 = Bilinear, 2 = Mipmapped/trilinear (both a tolerated band)
 }
 
 public struct SnapLight
@@ -125,4 +129,5 @@ public class SceneSnapshot
     public float Ambient;
     public float Exposure;
     public int EnableShadows;                // 1/0
+    public int UseBvh = 1;                    // 1 = traverse the two-level BVH; 0 = brute-force all triangles (F3; output IDENTICAL, only speed differs)
 }

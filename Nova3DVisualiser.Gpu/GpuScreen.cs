@@ -42,7 +42,24 @@ public sealed class GpuScreen : ConsoleScreenAsync, IDisposable
     protected override void FillBuffers(Scene scene)
     {
         SceneSnapshot snap = scene.BuildSnapshot();
-        _raytracer.Render(snap, Width, Height, _aspectRatio, BrightnessBuffer, ColorBuffer);
+
+        // One GPU dispatch per viewport (region + its camera). Single view = one full-screen viewport with
+        // the render camera, byte-identical to before. The region aspect + camera reduction come from the
+        // SAME engine helpers the CPU path uses (RegionAspect / BuildCameraView), keeping them in lockstep.
+        var viewports = scene.GetViewports(Width, Height);
+        var gviews = new GpuViewport[viewports.Count];
+        for (int k = 0; k < viewports.Count; k++)
+        {
+            var vp = viewports[k];
+            CameraView cv = scene.BuildCameraView(vp.Camera);
+            gviews[k] = new GpuViewport
+            {
+                X0 = vp.X0, Y0 = vp.Y0, W = vp.W, H = vp.H,
+                Aspect = RegionAspect(vp.W, vp.H, _pixelAspect),
+                CamPos = cv.CamPos, BasisX = cv.BasisX, BasisY = cv.BasisY, BasisZ = cv.BasisZ, Focal = cv.Focal,
+            };
+        }
+        _raytracer.RenderViews(snap, Width, Height, gviews, BrightnessBuffer, ColorBuffer);
     }
 
     public void Dispose() => _raytracer.Dispose();

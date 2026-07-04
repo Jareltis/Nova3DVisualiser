@@ -1,6 +1,6 @@
 using Nova3DVisualiser;
 using SampleGame.Scenes;
-using Quat = SampleGame.Scenes.PriviewNetworkScene.Quat;
+using Quat = SampleGame.Physics.Quat;
 
 namespace SampleGame.Physics;
 
@@ -100,7 +100,7 @@ public sealed class RigidBody
     {
         HalfExtents = halfExtents;
         InvMass = mass > 0f ? 1f / mass : 0f;
-        Vector3 I = PriviewNetworkScene.BoxInertia(mass, 2f * halfExtents.X, 2f * halfExtents.Y, 2f * halfExtents.Z);
+        Vector3 I = PhysicsMath.BoxInertia(mass, 2f * halfExtents.X, 2f * halfExtents.Y, 2f * halfExtents.Z);
         InvInertiaLocal = new Vector3(
             I.X > 0f ? 1f / I.X : 0f,
             I.Y > 0f ? 1f / I.Y : 0f,

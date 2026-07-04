@@ -32,6 +32,17 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
 
     public bool EnableShadows = true;
 
+    // Whether the render loop (Frame.MainLoop) draws its standalone top-left "Fps: N" readout. A scene can
+    // suppress it when it shows fps inside its OWN HUD (e.g. the docked editor's Status bar), so the two
+    // don't collide. Default true (unchanged for every other scene).
+    public virtual bool ShowFrameFps => true;
+
+    // Whether the render loop's ESC→quit may fire this frame. A scene captures ESC for its own use (e.g. the
+    // chat / field-entry cancel) by returning false while doing so, so ESC closes that instead of quitting.
+    // Default true (unchanged for every other scene). Frame also edge-triggers the quit so a held ESC that
+    // closed the chat can't quit the following frame.
+    public virtual bool AllowQuit => true;
+
     // Render detail level: 1 = full resolution (one ray per cell, default); 2-4 cast a ray every
     // Nth cell and block-fill the gaps (~N^2 fewer rays), trading resolution for speed. The screen
     // reads this each frame; the scene sets it from input. World-agnostic (just an int).
@@ -72,6 +83,28 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
     
     public abstract void Start();
     public abstract void Update();
+
+    // The viewports to render this frame: each a screen region + the camera to render into it. The default
+    // is a SINGLE full-screen viewport with the render camera (unchanged output). A scene overrides this to
+    // split the screen (e.g. 2-way) across several cameras. Called once per frame by the screen, which then
+    // renders each region from its camera via the region-relative uv path (CPU FillBuffers / GPU RenderViews).
+    public virtual IReadOnlyList<Viewport> GetViewports(int width, int height)
+        => new[] { new Viewport(0, 0, width, height, _renderCamera) };
+
+    // The per-view camera reduction (position + trig-free basis + focal) shared by the CPU and GPU paths;
+    // mirrors Camera.GetRayForUv's rotation order via CameraAxis. Public so a split-screen scene / test can
+    // build a view for an ARBITRARY camera (not just the render camera).
+    public CameraView BuildCameraView(Camera cam)
+    {
+        Vector3 rot = cam.LocalRotate;
+        float focal = 1f / MathF.Tan(cam.Fov * (MathF.PI / 360f));
+        return new CameraView(
+            cam.Position,
+            CameraAxis(new Vector3(1f, 0f, 0f), rot),
+            CameraAxis(new Vector3(0f, 1f, 0f), rot),
+            CameraAxis(new Vector3(0f, 0f, 1f), rot),
+            focal);
+    }
 
     // ---- GPU geometry cache: the concatenated local verts / faces / BVH nodes / triangle indices of
     // every mesh, rebuilt only when the mesh set changes (versioned). Per-object transforms refresh
@@ -159,8 +192,7 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
                 if (!texMap.TryGetValue(tex, out texIndex))
                 {
                     texIndex = textures.Count;
-                    textures.Add(new SnapTexture { Offset = texPixels.Count, Width = tex.Width, Height = tex.Height });
-                    texPixels.AddRange(tex.Pixels);
+                    textures.Add(AppendTexture(tex, texPixels));
                     texMap[tex] = texIndex;
                 }
             }
@@ -176,8 +208,7 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
             if (!texMap.TryGetValue(stex, out int si))
             {
                 si = textures.Count;
-                textures.Add(new SnapTexture { Offset = texPixels.Count, Width = stex.Width, Height = stex.Height });
-                texPixels.AddRange(stex.Pixels);
+                textures.Add(AppendTexture(stex, texPixels));
                 texMap[stex] = si;
             }
             _cSphereTex[sp] = si;
@@ -186,6 +217,20 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
         _cTextures = textures.ToArray();
         _cTexPixels = texPixels.ToArray();
         _cachedTextureVersion = _textureVersion;
+    }
+
+    // Appends a texture's WHOLE box-filter mip chain (levels 0..LevelCount-1, contiguous, level 0 first) to
+    // the flat pool and returns its SnapTexture record. Offset points at level 0 (== Pixels), so nearest/
+    // bilinear sampling is unchanged (they only touch level 0); the extra levels ride along for the GPU's
+    // trilinear sampler, gated by the same version as the geometry. LevelCount lets the kernel find each
+    // level's offset/dims. The chain is always uploaded (a small ~33% overhead) so a live switch to the
+    // Mipmapped filter needs no re-upload — it is already resident.
+    private static SnapTexture AppendTexture(Texture tex, List<Rgba32> texPixels)
+    {
+        var rec = new SnapTexture { Offset = texPixels.Count, Width = tex.Width, Height = tex.Height, LevelCount = tex.LevelCount };
+        Rgba32[][] mips = tex.Mips;
+        for (int l = 0; l < mips.Length; l++) texPixels.AddRange(mips[l]);
+        return rec;
     }
 
     // Builds a flat, value-only snapshot of the current frame for the GPU renderer. Mesh geometry +
@@ -214,6 +259,8 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
                 InvScale = 1f / o.Scale,
                 WorldMin = o.WorldMin, WorldMax = o.WorldMax,
                 VertBase = e.VertBase, FaceBase = e.FaceBase, NodeBase = e.NodeBase, TriIdxBase = e.TriIdxBase,
+                FaceCount = o.FaceCount,
+
                 R = c.R / 255f, G = c.G / 255f, B = c.B / 255f, A = c.A / 255f,
                 CastsShadow = e.Casts ? 1 : 0,
                 TextureIndex = _cObjTexIndex[k],
@@ -279,11 +326,10 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
             });
         }
 
-        // Camera basis: replicate Camera.GetRayForUv's rotation order (roll X -> pitch Z -> yaw Y)
-        // applied to the three unit axes. Because rotation is linear, the per-pixel ray reduces to
-        // BasisX*Focal + BasisY*uv.Y + BasisZ*uv.X (normalized on the GPU).
-        Vector3 rotc = _renderCamera.LocalRotate;
-        float focal = 1f / MathF.Tan(_renderCamera.Fov * (MathF.PI / 360f));
+        // Camera basis (the render camera): reduced via BuildCameraView, which replicates
+        // Camera.GetRayForUv's rotation order. Carried in the snapshot for the single-view GPU path; the
+        // multi-view (split) path overrides it per viewport with each region's own camera.
+        CameraView cv = BuildCameraView(_renderCamera);
 
         return new SceneSnapshot
         {
@@ -298,14 +344,15 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
             Objects = objects,
             Spheres = spheres.ToArray(),
             Lights = lights.ToArray(),
-            CamPos = _renderCamera.Position,
-            BasisX = CameraAxis(new Vector3(1f, 0f, 0f), rotc),
-            BasisY = CameraAxis(new Vector3(0f, 1f, 0f), rotc),
-            BasisZ = CameraAxis(new Vector3(0f, 0f, 1f), rotc),
-            Focal = focal,
+            CamPos = cv.CamPos,
+            BasisX = cv.BasisX,
+            BasisY = cv.BasisY,
+            BasisZ = cv.BasisZ,
+            Focal = cv.Focal,
             Ambient = Ambient,
             Exposure = Exposure,
             EnableShadows = EnableShadows ? 1 : 0,
+            UseBvh = Object3d.UseBvh ? 1 : 0,   // F3: the GPU switches BVH<->brute-force too (identical output, measurable FPS)
         };
     }
 
@@ -324,9 +371,17 @@ public abstract class Scene(IDisplaysManagerAsync displaysManager)
         return v;
     }
 
-    public virtual (float Brightness, Rgb24 Color) GetPixelData(Vector2 uv)
+    // Single-view entry point: raytrace one pixel from the RENDER camera. The split-screen path calls the
+    // camera-taking overload with each region's own camera. The optional `cone` is the per-pixel ray-cone
+    // spread for texture mip selection (0 = base level; the default keeps nearest/bilinear content exact).
+    public virtual (float Brightness, Rgb24 Color) GetPixelData(Vector2 uv) => GetPixelData(uv, _renderCamera, 0f);
+    public (float Brightness, Rgb24 Color) GetPixelData(Vector2 uv, float cone) => GetPixelData(uv, _renderCamera, cone);
+    public (float Brightness, Rgb24 Color) GetPixelData(Vector2 uv, Camera camera) => GetPixelData(uv, camera, 0f);
+
+    public (float Brightness, Rgb24 Color) GetPixelData(Vector2 uv, Camera camera, float cone)
     {
-        Ray ray = _renderCamera.GetRayForUv(uv);
+        Ray ray = camera.GetRayForUv(uv);
+        ray.Cone = cone;   // carried to the texture sampler for mip-level selection (0 for non-mip content)
         var hits = _displaysManager.FindSortedIntersections(ray, _allDisplays);
         if (hits.Count == 0) return (0f, Rgb24.Black);
 

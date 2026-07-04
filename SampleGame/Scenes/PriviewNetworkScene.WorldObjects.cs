@@ -54,7 +54,12 @@ public partial class PriviewNetworkScene
             Logger.Warning($"Object id={o.Id} type='{o.Type}': texture '{o.Texture}' did NOT attach (missing file or unsupported format — see the texture log line above). Rendering flat colour.");
         instance.TextureScale = o.TextureScale > 0f ? o.TextureScale : 1f;   // UV tiling (guard a 0/neg value to 1)
         instance.TextureFace = o.TextureFace;              // which face-group wears the texture (-1 = all)
-        instance.TextureFilter = o.TextureFilter == 1 ? TextureFilterMode.Bilinear : TextureFilterMode.Nearest;   // magnification filter
+        instance.TextureFilter = o.TextureFilter switch   // texture filter: 0 Nearest, 1 Bilinear, 2 Mipmapped (trilinear)
+        {
+            2 => TextureFilterMode.Mipmapped,
+            1 => TextureFilterMode.Bilinear,
+            _ => TextureFilterMode.Nearest,
+        };
 
         if (instance is Object3d mesh)
         {
@@ -116,6 +121,9 @@ public partial class PriviewNetworkScene
             ConeShape = light != null ? ConeShapeToString(light.ConeShape) : descriptor.ConeShape,
             AreaShape = light != null ? ConeShapeToString(light.AreaShape) : descriptor.AreaShape,
             ColorInfluence = light?.ColorInfluence ?? descriptor.ColorInfluence,
+            // camera-only: kind + follow-target ride the descriptor (no engine companion to read back from).
+            CameraKind = descriptor.CameraKind,
+            FollowTargetId = descriptor.FollowTargetId,
         };
     }
 

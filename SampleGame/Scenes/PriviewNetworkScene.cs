@@ -40,16 +40,28 @@ public partial class PriviewNetworkScene : Scene
     // ---- Local player = BODY + CAMERA (B-camera) ----
     // The player is two linked things: a BODY (the physical/movement anchor — physics + collision act on
     // it, its transform is streamed so peers see the avatar) and a CAMERA that DERIVES from the body via a
-    // per-mode offset (the camera RIG the future multi-view work builds on). FIRSTPERSON/THIRDPERSON are
-    // live; FIXED/FOLLOW/SECONDPERSON are reserved (a clean seam) — not implemented this stage.
+    // per-mode offset (the camera RIG the future multi-view work builds on). FIRSTPERSON/THIRDPERSON/
+    // SECONDPERSON are the live body views (F7 cycles them); FIXED/FOLLOW are the placed-camera kinds.
     public enum CameraMode { FirstPerson, ThirdPerson, Fixed, Follow, SecondPerson }
-    private CameraMode _cameraMode = CameraMode.FirstPerson;   // default 1st-person (F7 toggles 1st/3rd)
+    private CameraMode _cameraMode = CameraMode.FirstPerson;   // default 1st-person (F7 cycles 1st->3rd->2nd)
     private Object3d _localBody = null!;   // the local player's visible avatar (created in Start); the movement anchor
-    private bool _bodyDisplayed = false;   // whether the body avatar is currently drawn (only in 3rd person)
+    private bool _bodyDisplayed = false;   // whether the body avatar is currently drawn (3rd + 2nd person)
     private int _localBodyId;              // the local player's stable id (= network id); name is "player #<id>"
-    // 3rd-person rig: the camera sits this far BEHIND the body along the look direction and this far ABOVE.
-    private const float ThirdPersonBack = 4f;
-    private const float ThirdPersonUp = 1.5f;
+    // Camera-rig distances + the body→camera offset math moved to CameraMath (SampleGame.Scenes).
+
+    // ---- Active view (Plan B: spawnable Fixed/Follow cameras) ----
+    // A LOCAL, per-peer choice (like F7, NOT world state): which viewpoint _myCamera renders from.
+    // -1 = the player body view (1st/3rd person); otherwise the id of a placed "camera" object we look
+    // through. _bodyLook persists the player's OWN facing so a placed-camera render override never leaks
+    // into control (WASD/aim are relative to the body's look, not the camera we happen to watch through).
+    private int _activeCameraId = -1;
+    private Vector3 _bodyLook;
+
+    // ---- Split-screen (stage 1: SINGLE | 2-way LEFT|RIGHT). A LOCAL view choice toggled by F9. In 2-way,
+    // the left region shows the current active view (_myCamera) and the right region the NEXT active view
+    // in the F8 cycle, rendered into _splitCamera (a scratch camera, never the render camera). ----
+    private bool _splitScreen = false;
+    private readonly Camera _splitCamera = new Camera(Vector3.Zero, Vector3.Zero);
 
     private WorldConfig _world;
     private readonly List<Object3d> _models = new();   // spinnable Object3d objects (meshes + cubes)
@@ -74,7 +86,12 @@ public partial class PriviewNetworkScene : Scene
     private string _entryBuffer = "";
     private Field _entryField = Field.Name;   // which field the buffer is being typed into
     private readonly List<string> _chatHistory = new();
-    private const int MaxHistory = 5;
+    private const int MaxHistory = 50;    // enough history to scroll through; the box shows a wrapped window of it
+    // Chat scroll offset in WRAPPED lines from the bottom (0 = newest/at-bottom; higher = scrolled to older),
+    // clamped each frame by ChatVisibleSlice. _chatShowTimer keeps the box shown briefly after a message
+    // (recency) so it isn't only visible while typing.
+    private int _chatScroll = 0;
+    private int _chatShowTimer = 0;
 
     // ---- In-scene editor (3b-i: toggle, spawn, select, move, save) ----
     // Pairs a saved WorldObject descriptor (Type/Mesh/Anchor/Radius metadata) with its
@@ -91,7 +108,29 @@ public partial class PriviewNetworkScene : Scene
         public PlatformConfig? Platform;
     }
 
-    private bool _editMode = false;
+    // The HUD has three modes: PLAY (minimal HUD over full-screen 3D), OVERLAY-EDIT (the existing overlay
+    // editor boxes, toggled by Tab), and DOCKED-EDIT (a Unity/Blender-style docked layout, toggled by `).
+    // EditActive is true for BOTH edit modes — the editing CONTROLS are identical; only the HUD differs.
+    private enum HudMode { Play, OverlayEdit, DockedEdit }
+    private HudMode _hudMode = HudMode.Play;
+    private bool EditActive => _hudMode != HudMode.Play;
+    // In DOCKED mode the Status bar shows fps, so suppress the render loop's standalone top-left "Fps:" (Fix 1).
+    public override bool ShowFrameFps => _hudMode != HudMode.DockedEdit;
+    // While capturing text (chat OR inline field-entry) ESC cancels THAT — not quit the app — so the render
+    // loop's ESC→quit is suppressed for those frames (Fix A). Same "is the user typing?" state as EditorProcessesInput.
+    public override bool AllowQuit => !_isChatting && !_entryMode;
+
+    // ASCII-safe HUD markers (Fix 2 — the old Unicode ▾/▸/▸ rendered as "?" on terminals lacking those
+    // glyphs). Distinct + non-conflicting: [-]/[+] = an expanded/collapsed Inspector section; "*" = the
+    // SELECTED hierarchy object; ">" (the field cursor) marks the active Inspector row. Public so a test
+    // can assert they are pure ASCII (rendered everywhere).
+    public const string MarkerExpanded  = "[-]";
+    public const string MarkerCollapsed = "[+]";
+    public const string MarkerSelected  = "*";
+    // DOCKED Inspector: which section headers (Transform/Appearance/Physics/Texture/Object) are collapsed —
+    // LOCAL HUD state (per-section by name, persists across selections; not world state). Empty = all expanded.
+    // Collapsing hides a section's fields; the field cursor navigates headers + VISIBLE fields (see BuildInspectorRows).
+    private readonly HashSet<string> _collapsedSections = new();
     private readonly List<EditEntry> _editables = new();
     private int _selected = -1;
     // The platform reserves id 0 (a real, stable id in the same space); ordinary objects start at 1, so
@@ -139,7 +178,7 @@ public partial class PriviewNetworkScene : Scene
     private enum Field { Name, PosX, PosY, PosZ, RotX, RotY, RotZ, Scale, RotateSpeed, ColorR, ColorG, ColorB, ColorA, Radius,
                          Power, ClrInf, Kind, DirX, DirY, DirZ, ConeAngle, AreaSize, AreaShape, Spin, Beams, Shape,
                          PlatShape, PlatSize, PlatWidth, PlatDepth, Collides, Gravity, Collider, Mass, Restitution, Friction, RollingFriction, ColorFade,
-                         Texture, TextureScale, TextureFace, TextureFilter }
+                         Texture, TextureScale, TextureFace, TextureFilter, CamKind, FollowTargetId }
     private int _fieldIndex = 0;
 
     // Editable fields for the selected entry. A light's set depends on its Kind: every light shows
@@ -177,6 +216,11 @@ public partial class PriviewNetworkScene : Scene
             f.Add(Field.Name);
             return f.ToArray();
         }
+        // A camera is a placeable VIEWPOINT: the standard transform (position + orientation) + its
+        // Fixed/Follow kind + (Follow) which object id it tracks. No physics/colour fields (its marker is a
+        // visual-only indicator).
+        if (type == "camera")
+            return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.CamKind, Field.FollowTargetId, Field.Name };
         return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.Scale, Field.RotateSpeed, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Texture, Field.TextureScale, Field.TextureFace, Field.TextureFilter, Field.Collides, Field.Gravity, Field.Collider, Field.Mass, Field.Restitution, Field.Friction, Field.RollingFriction, Field.Name };
     }
 
@@ -259,6 +303,7 @@ public partial class PriviewNetworkScene : Scene
         if (_ownLightEnabled) AddLight(_mainLight);
 
         SetMainCamera(_myCamera);
+        _bodyLook = _myCamera.LocalRotate;   // seed the player's persisted facing (survives a placed-camera view)
 
         // The local player's BODY: the movement anchor, seeded at the camera's start (so 1st-person feel is
         // identical). It carries a stable id (= this peer's network id) + a system name "player #<id>", is
@@ -279,6 +324,7 @@ public partial class PriviewNetworkScene : Scene
         _spawnTypes.Add("ramp");
         _spawnTypes.Add("flatpicture");
         _spawnTypes.Add("light");
+        _spawnTypes.Add("camera");
         _spawnTypes.Add("platform");
         _spawnTypes.AddRange(WorldManager.ListAvailableMeshes());
 
@@ -437,6 +483,26 @@ public partial class PriviewNetworkScene : Scene
                 break;
             }
 
+            // A camera = a placeable VIEWPOINT with a small visible marker (non-colliding, non-shadow, like
+            // a light marker). No engine companion: its CameraKind (Fixed/Follow) rides the descriptor and
+            // the active-view logic reads the marker's transform. The marker is hidden while you view THROUGH
+            // it (SetActiveView). Built on both authority + client so any peer can look through placed cameras.
+            case "camera":
+            {
+                Object3d marker = CreateCameraMarker();
+                marker.Position = ToVec(o.Position);
+                marker.LocalRotate = ToVec(o.Rotation);   // a Fixed camera's aim = its marker's orientation
+                marker.Color = ParseColor(o.Color, new Rgba32(90, 200, 255));   // distinct blue so it reads as a camera
+                marker.ColorFade = o.ColorFade;
+                marker.Collides = false;   // a camera marker is visual-only — never a collider
+                marker.Gravity = false;
+                marker.UpdateGeometry();
+                _models.Add(marker);
+                AddDisplaysObject(marker, castsShadow: false);   // visual-only; it must not cast shadows
+                instance = marker;
+                break;
+            }
+
             default:
                 Logger.Warning($"Unknown world object type '{o.Type}'; skipping.");
                 return null;
@@ -489,10 +555,15 @@ public partial class PriviewNetworkScene : Scene
         }
         else
         {
-            // Tab toggles the editor; camera fly stays active in edit mode.
-            if (Pressed(ConsoleKey.Tab)) _editMode = !_editMode;
+            // HUD mode: Tab toggles PLAY <-> OVERLAY-EDIT; ` (backtick) toggles PLAY <-> DOCKED-EDIT.
+            // Pressing one while the OTHER edit mode is active switches to it. Camera fly stays active in edit.
+            if (Pressed(ConsoleKey.Tab))
+                _hudMode = _hudMode == HudMode.OverlayEdit ? HudMode.Play : HudMode.OverlayEdit;
+            if (Pressed(ConsoleKey.Oem3))   // the `/~ key (verified free — Oem4/Oem6 are [ / ])
+                _hudMode = _hudMode == HudMode.DockedEdit ? HudMode.Play : HudMode.DockedEdit;
 
             float dt = GameTime.GetDeltaTime();
+            _myCamera.LocalRotate = _bodyLook;   // player controls act on the body's OWN facing, not a placed camera we watch through
             HandleGameInput(dt);
             if (PlayerWalking)
             {
@@ -504,9 +575,9 @@ public partial class PriviewNetworkScene : Scene
                 _playerVelY = 0f; _onGround = false;       // reset so re-entering walk starts clean
             }
             StepPhysics(dt);
-            SyncCameraToBody();   // camera = body + mode offset, every frame after the body settles
+            ApplyActiveView();   // camera = the active view: the player body (SyncCameraToBody) or a placed camera
 
-            if (_editMode) HandleEditorInput();
+            if (EditActive) HandleEditorInput();
 
             if (Input.IsGetKey(ConsoleKey.T))
             {
@@ -514,6 +585,12 @@ public partial class PriviewNetworkScene : Scene
                 _currentInput = "";
                 while (Console.KeyAvailable) Console.ReadKey(true);
             }
+
+            // Scroll the chat history while the box is shown (PgUp = older, PgDn = newer). While actively
+            // typing these + the Up/Down arrows are handled in HandleChatInput instead (the arrows must not
+            // move the camera then); the draw re-clamps the offset either way.
+            if (Pressed(ConsoleKey.PageUp))   ScrollChat(+1);
+            if (Pressed(ConsoleKey.PageDown)) ScrollChat(-1);
         }
 
         // Physics position sync: the server streams what moved (throttled), clients ease toward it.
@@ -536,8 +613,10 @@ public partial class PriviewNetworkScene : Scene
         if (!_isChatting && _netManager != null)
         {
             // Stream the BODY transform (in 1st person the body IS at the old camera position, so remote
-            // avatars look exactly as before; in 3rd person peers still see your body, not your camera).
-            var packet = new TransformPacket(_localBody.Position, _myCamera.LocalRotate);
+            // avatars look exactly as before; in 3rd person peers still see your body, not your camera). Use
+            // the player's OWN facing (_bodyLook), not the render camera's LocalRotate — 2nd person / a placed
+            // camera override the latter to look back/at a target, which must not rotate the streamed avatar.
+            var packet = new TransformPacket(_localBody.Position, _bodyLook);
             _netManager.SendPacket(packet, _myNetId);
         }
 
@@ -547,25 +626,70 @@ public partial class PriviewNetworkScene : Scene
 
         if (_ownLightEnabled) _mainLight.Position = _myCamera.Position;
         if (_saveFlash > 0) _saveFlash--;
-        DrawChatInterface();
-        if (_awaitingWorld)
-            UI.AddText("Waiting for world from server...", new Vector2Int(2, 10), ConsoleColor.Yellow);
-        if (RenderScale > 1)
-            UI.AddText($"Detail {RenderScale}/4 [P]", new Vector2Int(2, 11), ConsoleColor.DarkGray);
-        DrawEditorOverlay();
-        if (_editMode)
+        if (_chatShowTimer > 0) _chatShowTimer--;   // the chat box's recency window (collapses to a hint when it hits 0)
+
+        // Part A — DOCKED-EDIT draws ONLY its own panels (+ the viewport crosshair, + the chat input WHILE
+        // actively typing). Every other standalone indicator/hint is gated to the full-screen PLAY/OVERLAY
+        // modes so nothing bleeds over the docked panels (the docked Status bar carries fps/net/hints).
+        bool docked = _hudMode == HudMode.DockedEdit;
+        if (!docked)
         {
-            DrawCrosshair();
-            DrawPropertiesPanel();
+            if (_awaitingWorld)
+                UI.AddText("Waiting for world from server...", new Vector2Int(2, 10), ConsoleColor.Yellow);
+            if (RenderScale > 1)
+                UI.AddText($"Detail {RenderScale}/4 [P]", new Vector2Int(2, 11), ConsoleColor.DarkGray);
+            if (_splitScreen) DrawSplitDivider();
         }
+
+        // The HUD, per mode. Editing works identically in both edit modes — only the presentation differs.
+        switch (_hudMode)
+        {
+            case HudMode.Play:
+                DrawPlayHud();                 // minimal: chat hint + crosshair (over full-screen 3D)
+                break;
+            case HudMode.OverlayEdit:
+                DrawEditorOverlay();           // the existing overlay editor (EDIT MODE + KEYS boxes)
+                DrawCrosshair();
+                DrawPropertiesPanel();
+                break;
+            default:                           // DockedEdit — docked panels around a centre viewport, nothing else
+                DrawDockedHud();
+                break;
+        }
+
+        // Chat composites LAST (on top). It is now a CONTAINED box placed clear of the HUD (ChatBoxRect), so
+        // it's safe to draw in EVERY mode — it handles its own visibility (box while chatting/recent, else a
+        // subtle hint) and never bleeds outside its rectangle.
+        DrawChatInterface();
     }
 
-    // Center-screen aim reticle, shown only in edit mode.
+    // Vertical divider between the two split-screen regions (a full-screen overlay line at the mid-column,
+    // where the right region begins). Drawn on top of the composited frame like the rest of the HUD.
+    private void DrawSplitDivider()
+    {
+        int x = Console.WindowWidth / 2, h = Console.WindowHeight;
+        string bar = BoxCharsSupported ? "│" : "|";
+        for (int y = 0; y < h; y++) UI.AddText(bar, new Vector2Int(x, y), ConsoleColor.DarkGray);
+    }
+
+    // Aim reticle, shown only in edit mode. It sits at the centre of the region that shows the interactive
+    // BODY view: the full screen in single view, the body-view half in split, and nowhere when neither split
+    // region shows the body (both are placed cameras). Its position matches the ray the editor aims (the
+    // body-view camera through region-relative uv (0,0)) — see BodyAimCamera.
     private void DrawCrosshair()
     {
-        int cx = Console.WindowWidth / 2;
-        int cy = Console.WindowHeight / 2;
-        UI.AddText("+", new Vector2Int(cx, cy), ConsoleColor.Red);
+        // DOCKED: at the centre of the docked viewport rect (single view this stage). Otherwise the full
+        // screen, following the body-view region when split (BodyViewRegion / CrosshairCell) — unchanged.
+        if (_hudMode == HudMode.DockedEdit)
+        {
+            DockRect vp = DockLayout(Console.WindowWidth, Console.WindowHeight).Viewport;
+            var (ds, dx, dy) = CrosshairCell(false, vp.X, vp.Y, vp.W, vp.H, 0);
+            if (ds) UI.AddText("+", new Vector2Int(dx, dy), ConsoleColor.Red);
+            return;
+        }
+        int region = _splitScreen ? BodyViewRegion(true, _activeCameraId, NextActiveViewId()) : 0;
+        var (show, x, y) = CrosshairCell(_splitScreen, 0, 0, Console.WindowWidth, Console.WindowHeight, region);
+        if (show) UI.AddText("+", new Vector2Int(x, y), ConsoleColor.Red);
     }
 
     // Inspection/test accessor: the live editable entries (each pairs a descriptor with its
@@ -614,6 +738,17 @@ public partial class PriviewNetworkScene : Scene
     // editable count so a test can assert the spawn worked.
     public int SpawnForTest() { SpawnCurrent(); return _editables.Count; }
 
+    // Test hook: select spawn palette entry `type` (if present) and spawn it; returns the new editable
+    // count, or -1 when the type isn't in the palette. Lets a test spawn a SPECIFIC type (e.g. "camera").
+    public int SpawnTypeForTest(string type)
+    {
+        int idx = _spawnTypes.FindIndex(t => string.Equals(t, type, StringComparison.OrdinalIgnoreCase));
+        if (idx < 0) return -1;
+        _spawnIndex = idx;
+        SpawnCurrent();
+        return _editables.Count;
+    }
+
     // Inspection/test accessors for the local player body (B-camera): its stable id + system name, whether
     // it leaked into the editables list (it must NOT — it's the player, not world content), and its current
     // world position + the derived camera position.
@@ -622,7 +757,50 @@ public partial class PriviewNetworkScene : Scene
     public bool LocalBodyInEditables => _editables.Any(e => ReferenceEquals(e.Instance, _localBody));
     public Vector3 LocalBodyPosition => _localBody.Position;
     public Vector3 CameraPosition => _myCamera.Position;
+    // Active-view render orientation + hooks to drive the view resolution headlessly (Fix-1 diagnosis/test).
+    public Vector3 CameraLook => _myCamera.LocalRotate;
+    public void SetActiveViewForTest(int id) => SetActiveView(id);
+    public void ApplyActiveViewForTest() => ApplyActiveView();
     public CameraMode CurrentCameraMode => _cameraMode;
+
+    // Plan-B active-view test hooks: which viewpoint is active (-1 = player body; else a placed-camera id),
+    // and the F8 cycle (body -> each placed camera -> back to body).
+    public int ActiveViewCameraId => _activeCameraId;
+    public void CycleActiveViewForTest() => CycleActiveView();
+
+    // Fix-1 test hooks: force split mode on/off, and read the editor aim — whether the body view is on
+    // screen (else pick is suppressed) + the body-view camera it aims THROUGH (position + look), so a test
+    // can assert the aim tracks the body region, not a placed camera in the other split region.
+    public void SetSplitForTest(bool on) => _splitScreen = on;
+    public (bool bodyVisible, Vector3 pos, Vector3 look) BodyAimForTest()
+    { var (v, c) = BodyAimCamera(); return (v, c.Position, c.LocalRotate); }
+
+    // Stage-3 test hook: force the DOCKED HUD mode (else PLAY), so a test can assert ShowFrameFps flips
+    // (the standalone top-left fps is suppressed in docked — Fix 1).
+    public void SetDockedForTest(bool docked) => _hudMode = docked ? HudMode.DockedEdit : HudMode.Play;
+
+    // Body-view clip-avoidance test hooks (headless): the clip result for a body + look in a given body
+    // view — (full boom d, nearest obstacle hit distance, resolved target boom) via the REAL raycast over
+    // the scene's editables; one eased boom step (same path the live loop uses); and the current smoothed
+    // boom length. The 3rd/2nd-person wrappers pick the matching mode (2nd person's boom points in FRONT).
+    public (float full, float hit, float target) BodyViewClipForTest(Vector3 body, Vector3 look, CameraMode mode)
+    {
+        Vector3 off = CameraMath.CameraOffsetFor(look, mode);
+        float hit = NearestObstacleAlongRay(body, off.Norm());
+        return (off.Length(), hit, ResolveCameraBackDistance(off, hit, CamClipMinDist, CamClipMargin));
+    }
+    public (float full, float hit, float target) ThirdPersonClipForTest(Vector3 body, Vector3 look) => BodyViewClipForTest(body, look, CameraMode.ThirdPerson);
+    public (float full, float hit, float target) SecondPersonClipForTest(Vector3 body, Vector3 look) => BodyViewClipForTest(body, look, CameraMode.SecondPerson);
+    public Vector3 StepThirdPersonCameraForTest(Vector3 body, Vector3 look, float dt) => BodyOffsetCameraPosition(body, look, CameraMode.ThirdPerson, dt);
+    public Vector3 StepSecondPersonCameraForTest(Vector3 body, Vector3 look, float dt) => BodyOffsetCameraPosition(body, look, CameraMode.SecondPerson, dt);
+    public float CameraBoomLengthForTest => _camBackDist;
+
+    // F7 body-view cycle (1st -> 3rd -> 2nd -> 1st) and the current mode, for headless assertions.
+    public void CycleBodyViewForTest() => CycleBodyView();
+
+    // Resolves a follow camera's aim point for a given FollowTargetId: the matching editable's live
+    // position, or the player body for -1 / an unresolved id. Lets a test verify tracking + fallback.
+    public Vector3 FollowTargetPositionForTest(int followTargetId) => FollowTargetPosition(followTargetId);
 
     // Test hook: advance the authority physics one step (so a headless test can verify stability
     // without the interactive render loop). Same call the Update loop makes.
@@ -648,6 +826,12 @@ public partial class PriviewNetworkScene : Scene
     // (same code the real client runs, minus the CanEdit gate).
     public void ReceivePhysicsSyncForTest(NetworkPackets.PhysicsSyncPacket p) => OnPhysicsSyncReceived(p, 0);
     public void StepNetworkPhysicsForTest(float dt) => DoNetworkInterp(dt);
+
+    // ---- A1 runtime-texture-push test hooks (headless) ----
+    // The EXACT TextureChunkPacket(s) the edit path streams for `name` (read from the authority textures/),
+    // and the peer-side receive that reassembles + materializes them to received/textures/ (as on world sync).
+    public static IReadOnlyList<TextureChunkPacket> EmitTextureChunksForTest(string name) => BuildTextureChunks(name, AppPaths.TexturesFolder);
+    public void ReceiveTextureChunkForTest(TextureChunkPacket p) => OnTextureChunkReceived(p, 0);
 
     // Inspection/test accessor: the world config built from the CURRENT live instances (the same
     // projection SaveWorld/OnWorldRequested use), WITHOUT writing to disk.

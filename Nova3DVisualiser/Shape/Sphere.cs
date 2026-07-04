@@ -43,9 +43,12 @@ public class Sphere(Vector3 position, Vector3 localRotate, float r = 1) : GameOb
 
         Vector2 uv = EquirectangularUv(normal.RotateInverse(LocalRotate));
         float s = this.TextureScale;
-        Rgba32 texel = this.TextureFilter == TextureFilterMode.Bilinear
-            ? this.Texture.SampleBilinear(uv.X * s, uv.Y * s)
-            : this.Texture.Sample(uv.X * s, uv.Y * s);
+        // Bilinear OR Mipmapped both sample the base level here: the sphere's analytic equirect UV is not
+        // mip-selected this stage (its footprint is awkward — a future stage), so Mipmapped degrades to the
+        // bilinear smoothing. Nearest is exact. The GPU kernel mirrors this fallback (sphere kind → bilinear).
+        Rgba32 texel = this.TextureFilter == TextureFilterMode.Nearest
+            ? this.Texture.Sample(uv.X * s, uv.Y * s)
+            : this.Texture.SampleBilinear(uv.X * s, uv.Y * s);
         return new RenderData(intersection, normal, intersectionPoint, ShadeTexel(texel), uv);
     }
 

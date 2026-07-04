@@ -40,6 +40,7 @@ partial class Program
         if (args.Length > 0 && args[0] == "physicstest") { PhysicsSelfTest(); return; }
         if (args.Length > 0 && args[0] == "gputest") { GpuSelfTest(); return; }
         if (args.Length > 0 && args[0] == "texturetest") { TextureSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "splashtest") { SplashSelfTest(); return; }
 
         // Crash net: the render loop is async + parallel (Parallel.For), so a crash on a worker
         // thread or an unobserved task never reaches the try/catch below. Capture those globally
@@ -72,6 +73,11 @@ partial class Program
         Logger.Init(AppPaths.LogsFolder);
         Logger.Info("Application started");
 
+        // Styled title splash (~2.5s, any key skips). Drawn with the plain Console BEFORE
+        // Application.Init so it never fights Terminal.Gui. The self-test arg branches in Main
+        // return before RunApp, so no `*test` invocation ever renders it.
+        ShowSplash();
+
         // ---- Setup choices ----
         bool online = false;
         bool isServer = false;
@@ -87,18 +93,25 @@ partial class Program
         Application.Init();
         try
         {
-            // Neutral grey-on-dark scheme with green accents (no default blue theme).
+            // Cohesive dark scheme that echoes the splash/HUD palette: readable grey labels on black, a CYAN
+            // accent for focus (matching the splash title + docked panel titles), cyan hotkeys. Replaces the
+            // old green accents so the setup feels part of the same product.
             var scheme = new ColorScheme
             {
-                Normal    = Application.Driver.MakeAttribute(Color.Gray,        Color.Black),
-                Focus     = Application.Driver.MakeAttribute(Color.Black,       Color.Green),
-                HotNormal = Application.Driver.MakeAttribute(Color.BrightGreen, Color.Black),
-                HotFocus  = Application.Driver.MakeAttribute(Color.BrightGreen, Color.Green),
-                Disabled  = Application.Driver.MakeAttribute(Color.DarkGray,    Color.Black),
+                Normal    = Application.Driver.MakeAttribute(Color.Gray,       Color.Black),      // labels / text / borders
+                Focus     = Application.Driver.MakeAttribute(Color.Black,      Color.BrightCyan), // focused button / field — cyan accent
+                HotNormal = Application.Driver.MakeAttribute(Color.BrightCyan, Color.Black),      // hotkey letters
+                HotFocus  = Application.Driver.MakeAttribute(Color.Black,      Color.BrightCyan),
+                Disabled  = Application.Driver.MakeAttribute(Color.DarkGray,   Color.Black),
             };
             Colors.Base = scheme;
             Colors.Dialog = scheme;
             Colors.Menu = scheme;
+
+            // Branding schemes (splash-consistent): a bright cyan title + a dim grey tagline, drawn on the
+            // wizard host by RunStepDialog so every step feels part of the same product.
+            _brandScheme = SolidScheme(Color.BrightCyan, Color.Black);
+            _tagScheme   = SolidScheme(Color.DarkGray,   Color.Black);
 
             // Each step's Dialog is run inside a full-screen host toplevel (see RunStepDialog), so
             // running a step overdraws the WHOLE screen and the previous step cannot linger behind
@@ -221,13 +234,265 @@ partial class Program
         //new Frame(new PreviewScene(new DisplayManagerAsync()), new ConsoleScreenAsync()).MainLoop();
     }
 
+    // ================= Startup splash screen =================
+    // A styled block-letter "NOVA 3D / VISUALISER" title, centered for the current console size,
+    // shown for ~2.5s at startup and skippable with any key. Kept out of the self-tests (they return
+    // in Main before RunApp). The pure helpers (BuildSplashBlock / SplashUsesArt / SplashLeft) are
+    // exercised by `splashtest`; the render/timing below is visual-only.
+
+    // Draws the centered splash, waits (skippable), then clears the screen for the wizard. Robust
+    // to odd/narrow terminals (degrades to a one-line title) and never throws out to the caller.
+    static void ShowSplash()
+    {
+        try
+        {
+            int w = SafeConsole(() => Console.WindowWidth, 80);
+            int h = SafeConsole(() => Console.WindowHeight, 25);
+
+            try { Console.CursorVisible = false; } catch { }
+            DrawSplash(w, h);
+            WaitForSplashDismiss(2500, w, h);
+        }
+        catch { /* the splash must never break startup on an odd terminal */ }
+        finally
+        {
+            // Leave a clean screen for the Terminal.Gui wizard.
+            try { Console.ResetColor(); Console.Clear(); Console.CursorVisible = true; } catch { }
+        }
+    }
+
+    // Clears the screen and draws the centered splash for the CURRENT console size (w,h): the block art
+    // (or a one-line fallback when the terminal is too small), a tagline, and the version. Re-callable so a
+    // resize re-centres it. Never throws (each line is guarded).
+    static void DrawSplash(int w, int h)
+    {
+        var block = BuildSplashBlock();
+        int blockW = block.Length > 0 ? block[0].Length : 0;
+
+        var content = new List<(string text, ConsoleColor color)>();
+        if (SplashUsesArt(w, h, blockW))
+            foreach (var line in block) content.Add((line, ConsoleColor.Cyan));
+        else
+            content.Add(("Nova 3D Visualiser", ConsoleColor.Cyan));
+
+        content.Add(("", ConsoleColor.Gray));
+        content.Add(("A S C I I   3 D   E N G I N E", ConsoleColor.Gray));
+        string ver = SplashVersion();
+        if (ver.Length > 0) content.Add((ver, ConsoleColor.DarkGray));
+
+        try { Console.Clear(); } catch { }
+
+        int top = Math.Max(0, (h - content.Count) / 2);
+        for (int i = 0; i < content.Count && top + i < h; i++)
+        {
+            var (text, color) = content[i];
+            if (text.Length == 0) continue;
+            int left = SplashLeft(w, text.Length);
+            int room = Math.Max(0, w - left);
+            string shown = text.Length > room ? text.Substring(0, room) : text;
+            try
+            {
+                Console.SetCursorPosition(left, top + i);
+                Console.ForegroundColor = color;
+                Console.Write(shown);
+            }
+            catch { /* skip a line that won't fit the current buffer */ }
+        }
+        Console.ResetColor();
+    }
+
+    // Waits up to `ms`, returning early on any keypress (so repeat launches aren't slowed). During the wait
+    // it also polls for a CONSOLE SIZE CHANGE (window stretch / Ctrl+scroll font zoom) and RE-DRAWS the
+    // splash centred for the new size — so it never "flies to the corner". `w`/`h` are the last-drawn size.
+    // When input is redirected (no interactive console) it just sleeps out the duration.
+    static void WaitForSplashDismiss(int ms, int w, int h)
+    {
+        if (Console.IsInputRedirected) { Thread.Sleep(ms); return; }
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < ms)
+        {
+            try { if (Console.KeyAvailable) { Console.ReadKey(true); return; } }
+            catch { Thread.Sleep(ms); return; }
+            int nw = SafeConsole(() => Console.WindowWidth, w);
+            int nh = SafeConsole(() => Console.WindowHeight, h);
+            if (nw != w || nh != h) { w = nw; h = nh; DrawSplash(w, h); }   // re-centre for the new size
+            Thread.Sleep(30);
+        }
+    }
+
+    // The app version line for the splash (blank if it can't be resolved).
+    static string SplashVersion()
+    {
+        try
+        {
+            var v = System.Reflection.Assembly.GetEntryAssembly()?.GetName().Version;
+            return v != null ? $"v{v.Major}.{v.Minor}.{v.Build}" : "";
+        }
+        catch { return ""; }
+    }
+
+    // Reads a console property that can throw on odd terminals, falling back to a sane default.
+    static T SafeConsole<T>(Func<T> get, T fallback)
+    {
+        try { return get(); } catch { return fallback; }
+    }
+
+    // ---- Pure splash helpers (testable via `splashtest`) ----
+
+    // 5x5 block-letter font for the splash title. Unknown chars render as a blank glyph so the
+    // banner text can be tweaked later without crashing.
+    static string SplashGlyphRow(char c, int row)
+    {
+        string[] g = char.ToUpperInvariant(c) switch
+        {
+            'N' => new[] { "#   #", "##  #", "# # #", "#  ##", "#   #" },
+            'O' => new[] { " ### ", "#   #", "#   #", "#   #", " ### " },
+            'V' => new[] { "#   #", "#   #", "#   #", " # # ", "  #  " },
+            'A' => new[] { " ### ", "#   #", "#####", "#   #", "#   #" },
+            '3' => new[] { "#### ", "    #", " ### ", "    #", "#### " },
+            'D' => new[] { "###  ", "#  # ", "#   #", "#  # ", "###  " },
+            'I' => new[] { "#####", "  #  ", "  #  ", "  #  ", "#####" },
+            'S' => new[] { " ####", "#    ", " ### ", "    #", "#### " },
+            'U' => new[] { "#   #", "#   #", "#   #", "#   #", " ### " },
+            'L' => new[] { "#    ", "#    ", "#    ", "#    ", "#####" },
+            'E' => new[] { "#####", "#    ", "#### ", "#    ", "#####" },
+            'R' => new[] { "#### ", "#   #", "#### ", "#  # ", "#   #" },
+            _   => new[] { "     ", "     ", "     ", "     ", "     " },
+        };
+        return g[row];
+    }
+
+    // Builds one line of block-letter text as 5 equal-width rows (glyphs joined by a 1-col gap).
+    static string[] BuildSplashLine(string text)
+    {
+        const int rows = 5;
+        var lines = new string[rows];
+        for (int r = 0; r < rows; r++)
+        {
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < text.Length; i++)
+            {
+                if (i > 0) sb.Append(' ');
+                sb.Append(SplashGlyphRow(text[i], r));
+            }
+            lines[r] = sb.ToString();
+        }
+        return lines;
+    }
+
+    // Builds the stacked "NOVA 3D" / "VISUALISER" banner: two block-letter lines (each 5 rows), the
+    // narrower one centered, separated by a blank row. All rows are padded to the wider line's width,
+    // so the banner is a rectangular block of equal-width rows.
+    static string[] BuildSplashBlock()
+    {
+        var topLine = BuildSplashLine("NOVA 3D");
+        var bottomLine = BuildSplashLine("VISUALISER");
+        int w = Math.Max(topLine[0].Length, bottomLine[0].Length);
+
+        var rows = new List<string>();
+        foreach (var r in topLine) rows.Add(CenterPad(r, w));
+        rows.Add(new string(' ', w));          // gap between the two block-letter lines
+        foreach (var r in bottomLine) rows.Add(CenterPad(r, w));
+        return rows.ToArray();
+    }
+
+    // Centers `s` within width `w` by padding both sides with spaces (returns `s` unchanged if it is
+    // already at least `w` wide).
+    static string CenterPad(string s, int w)
+    {
+        if (s.Length >= w) return s;
+        int left = (w - s.Length) / 2;
+        return new string(' ', left) + s + new string(' ', w - s.Length - left);
+    }
+
+    // Whether the terminal is roomy enough for the stacked block art (else the one-line title
+    // fallback). The banner is ~11 rows tall plus the tagline/version, so it needs more height than
+    // a single-line banner would; the width threshold rides the (now wider) passed block width.
+    static bool SplashUsesArt(int width, int height, int blockWidth) =>
+        blockWidth > 0 && width >= blockWidth + 2 && height >= 16;
+
+    // Start column that centers `textLen` in `width` (never negative; oversized text clamps to 0).
+    static int SplashLeft(int width, int textLen) => Math.Max(0, (width - textLen) / 2);
+
+    // Headless check of the pure splash helpers (block dimensions + degrade/centering logic).
+    static void SplashSelfTest()
+    {
+        bool ok = true;
+        void Check(bool cond, string msg) { if (!cond) { ok = false; Console.WriteLine($"  FAIL: {msg}"); } }
+
+        // Single-line builder: "NOVA 3D" is 7 cells (incl. the space) x 5 cols + 6 one-col gaps = 41.
+        var line = BuildSplashLine("NOVA 3D");
+        Check(line.Length == 5, "line has 5 rows");
+        int lw = line.Length > 0 ? line[0].Length : 0;
+        foreach (var row in line) Check(row.Length == lw, "line rows equal width");
+        Check(lw == 41, $"expected line width 41, got {lw}");
+
+        // Unknown chars degrade to a blank glyph — still 5 equal-width rows, no throw.
+        var q = BuildSplashLine("?");
+        Check(q.Length == 5 && q[0].Trim().Length == 0, "unknown char -> blank glyph");
+
+        // Stacked banner: "NOVA 3D" over "VISUALISER" (10 cells x 5 + 9 gaps = 59 wide), separated by
+        // a blank row: 5 + 1 + 5 = 11 rows, all padded to the wider (59) line.
+        var block = BuildSplashBlock();
+        Check(block.Length == 11, $"expected 11 stacked rows, got {block.Length}");
+        int bw = block.Length > 0 ? block[0].Length : 0;
+        foreach (var row in block) Check(row.Length == bw, "block rows equal width");
+        Check(bw == 59, $"expected block width 59, got {bw}");
+
+        // Roomy terminal shows the art; too-narrow or too-short degrades to the fallback line.
+        Check(SplashUsesArt(bw + 2, 24, bw), "wide+tall uses art");
+        Check(!SplashUsesArt(bw + 1, 24, bw), "too narrow -> fallback");
+        Check(!SplashUsesArt(bw + 2, 8, bw), "too short -> fallback");
+
+        // Centering clamps and never goes negative.
+        Check(SplashLeft(80, 10) == 35, "centered left column");
+        Check(SplashLeft(10, 40) == 0, "oversized text clamps to 0");
+
+        // Terminal-resize plan (pure, ConsoleScreenAsync.ResizePlan) — the in-game resize path's decision.
+        // A grow re-sizes buffers to newW*newH with the new aspect and flags a resize; an UNCHANGED size is
+        // a no-op (so fixed-size renders / gputest are never perturbed); a tiny/zero/negative size clamps to
+        // the minimum (no 0-length buffer / divide-by-zero) with a finite aspect.
+        const float pa = 11f / 24f;
+        var grow = ConsoleScreenAsync.ResizePlan(80, 25, 120, 40, pa);
+        Check(grow.needsResize && grow.w == 120 && grow.h == 40, "resize: grow updates dims");
+        Check(grow.w * grow.h == 120 * 40, "resize: buffer length == newW*newH");
+        Check(Math.Abs(grow.aspect - ConsoleScreenAsync.RegionAspect(120, 40, pa)) < 1e-6f, "resize: aspect from new size");
+        var same = ConsoleScreenAsync.ResizePlan(80, 25, 80, 25, pa);
+        Check(!same.needsResize && same.w == 80 && same.h == 25, "resize: unchanged size is a no-op");
+        var zero = ConsoleScreenAsync.ResizePlan(80, 25, 0, 0, pa);
+        Check(zero.needsResize && zero.w == 1 && zero.h == 1 && zero.w * zero.h == 1, "resize: zero clamps to min");
+        var neg = ConsoleScreenAsync.ResizePlan(80, 25, -5, -3, pa);
+        Check(neg.w == 1 && neg.h == 1 && !float.IsNaN(neg.aspect) && !float.IsInfinity(neg.aspect), "resize: negative clamps to min, finite aspect");
+
+        Console.WriteLine(ok ? "splashtest: PASS" : "splashtest: FAIL");
+    }
+
     // Runs one wizard step's centered Dialog inside a full-screen host toplevel. Because the host
     // fills and overdraws the WHOLE screen when it draws, running a step fully covers the previous
     // step — fixing the lingering-frame bug with NO manual Clear/Refresh. The inner Dialog keeps
     // its centered, fixed-size box look (border, title, buttons); the host is borderless and fills
     // the screen with the wizard's grey-on-black scheme. The Dialog's buttons still call
     // Application.RequestStop(), which stops this host, so each ShowXxxDialog returns as before.
-    static void RunStepDialog(Dialog dialog)
+    // Branding schemes for the wizard host header (set in RunApp after Application.Init).
+    private static ColorScheme? _brandScheme;
+    private static ColorScheme? _tagScheme;
+
+    // A one-attribute scheme (same colour for every state) — for the non-interactive branding labels.
+    static ColorScheme SolidScheme(Color fg, Color bg)
+    {
+        var a = Application.Driver.MakeAttribute(fg, bg);
+        return new ColorScheme { Normal = a, Focus = a, HotNormal = a, HotFocus = a, Disabled = a };
+    }
+
+    // The branded header occupies the top HeaderRows; the step Dialog is centred below it. A dialog never
+    // shrinks below these (it just overflows a truly tiny terminal — unavoidable).
+    private const int HeaderRows = 3;
+    private const int MinDialogW = 24;
+    private const int MinDialogH = 7;
+
+    // desiredW/H are the step's natural size; the dialog is clamped to the CURRENT console so a font zoom
+    // (Ctrl+scroll → fewer/more cells) never clips it or sticks it in a corner.
+    static void RunStepDialog(Dialog dialog, int desiredW, int desiredH)
     {
         var host = new Window
         {
@@ -235,8 +500,37 @@ partial class Program
             ColorScheme = Colors.Base,
         };
         host.Border.BorderStyle = BorderStyle.None;
+
+        // Splash-consistent branding across the top — Pos.Center() re-centres it on resize automatically.
+        host.Add(new Label("Nova 3D Visualiser") { X = Pos.Center(), Y = 1, ColorScheme = _brandScheme ?? Colors.Base });
+        host.Add(new Label("A S C I I   3 D   E N G I N E") { X = Pos.Center(), Y = 2, ColorScheme = _tagScheme ?? Colors.Base });
+
         host.Add(dialog);
-        Application.Run(host);
+
+        // Clamp the fixed-size Dialog to the CURRENT console and centre it in the area below the header — this
+        // is re-applied whenever Terminal.Gui reports a resize (a window STRETCH) so the dialog reflows and
+        // never clips. NOTE: a Ctrl+scroll FONT ZOOM raises no resize event in Terminal.Gui v1's Windows/Net
+        // driver, so the wizard does not live-reflow on a font zoom (a v1 limitation — the in-game 3D does).
+        void Fit()
+        {
+            int cols = Application.Driver?.Cols ?? desiredW;
+            int rows = Application.Driver?.Rows ?? desiredH;
+            int w = Math.Min(desiredW, Math.Max(MinDialogW, cols - 2));
+            int h = Math.Min(desiredH, Math.Max(MinDialogH, rows - HeaderRows - 1));
+            dialog.Width  = w;
+            dialog.Height = h;
+            dialog.X = Pos.Center();
+            dialog.Y = HeaderRows + Math.Max(0, (rows - HeaderRows - h) / 2);   // centred below the header
+            host.SetNeedsDisplay();
+        }
+        Fit();
+
+        // WINDOW STRETCH: Terminal.Gui's driver detects it and fires Resized → re-fit immediately.
+        void OnResized(Application.ResizedEventArgs _) { Fit(); Application.Refresh(); }
+        Application.Resized += OnResized;
+
+        try { Application.Run(host); }
+        finally { Application.Resized -= OnResized; }
     }
 
     // Writes the full exception (type, message, stack, and every InnerException) to the log with a
@@ -289,7 +583,7 @@ partial class Program
 
         var dialog = new Dialog("Session mode", 50, 9, ok, btnQuit);
         dialog.Add(new Label("Run a local solo session or go online?") { X = 1, Y = 0 }, radio);
-        RunStepDialog(dialog);
+        RunStepDialog(dialog, 50, 9);
 
         if (result == DlgResult.Ok) online = radio.SelectedItem == 1;
         return result;
@@ -311,7 +605,7 @@ partial class Program
 
         var dialog = new Dialog("Network role", 50, 9, ok, back);
         dialog.Add(new Label("Host a server or join one?") { X = 1, Y = 0 }, radio);
-        RunStepDialog(dialog);
+        RunStepDialog(dialog, 50, 9);
 
         if (result == DlgResult.Ok) isServer = radio.SelectedItem == 0;
         return result;
@@ -375,7 +669,7 @@ partial class Program
                 portField);
         }
 
-        RunStepDialog(dialog);
+        RunStepDialog(dialog, 56, 11);
 
         if (result == DlgResult.Ok)
         {
@@ -398,7 +692,7 @@ partial class Program
 
         var dialog = new Dialog("World", 50, 9, ok, back);
         dialog.Add(new Label("Create a new world or load a saved one?") { X = 1, Y = 0 }, radio);
-        RunStepDialog(dialog);
+        RunStepDialog(dialog, 50, 9);
 
         create = radio.SelectedItem == 0;
         return result;
@@ -500,7 +794,7 @@ partial class Program
             new Label("Physics (Space toggles):") { X = 1, Y = 13 }, cbGravity, cbCollision,
             new Label("Gravity strength:") { X = 1, Y = 15 }, gravityField,
             new Label("Bounce:") { X = 31, Y = 15 }, restitutionField);
-        RunStepDialog(dialog);
+        RunStepDialog(dialog, 56, 20);
 
         world = built;
         return result;
@@ -539,7 +833,7 @@ partial class Program
         int height = Math.Min(20, 7 + Math.Max(1, names.Count));
         var dialog = new Dialog("Load world", 50, height, load, back);
         dialog.Add(new Label("Select a saved world:") { X = 1, Y = 0 }, radio);
-        RunStepDialog(dialog);
+        RunStepDialog(dialog, 50, height);
 
         world = loaded;
         return result;

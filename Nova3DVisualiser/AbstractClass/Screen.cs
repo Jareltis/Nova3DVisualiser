@@ -7,13 +7,26 @@ using System.Threading.Tasks;
 namespace Nova3DVisualiser.AbstractClass;
 public abstract class Screen
 {
-    public int Width { get; }
-    public int Height { get; }
+    // Dimensions + the frame buffers are no longer fixed for the screen's lifetime: a terminal resize
+    // (window stretch or Ctrl+scroll font zoom changes the cell grid) re-sizes them via ResizeBuffers.
+    public int Width { get; protected set; }
+    public int Height { get; protected set; }
 
-    protected readonly float[] BrightnessBuffer;
-    protected readonly Rgb24[] ColorBuffer;
+    protected float[] BrightnessBuffer;
+    protected Rgb24[] ColorBuffer;
 
     protected Screen(int width, int height)
+    {
+        Width = width;
+        Height = height;
+        BrightnessBuffer = new float[width * height];
+        ColorBuffer = new Rgb24[width * height];
+    }
+
+    // Re-sizes the screen dimensions + the shared frame buffers to a new console size (already clamped to
+    // a positive minimum by the caller). Used by the per-frame resize check so both the CPU and GPU render
+    // paths fill correctly-sized buffers after a stretch/zoom.
+    protected void ResizeBuffers(int width, int height)
     {
         Width = width;
         Height = height;

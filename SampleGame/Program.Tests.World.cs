@@ -651,8 +651,8 @@ partial class Program
         {
             var body = new Vector3(3f, 1.5f, -2f);
             var look = new Vector3(0f, 0.7f, 0f);   // yaw 0.7 rad
-            var camFp = PriviewNetworkScene.CameraPositionFor(body, look, PriviewNetworkScene.CameraMode.FirstPerson);
-            var camTp = PriviewNetworkScene.CameraPositionFor(body, look, PriviewNetworkScene.CameraMode.ThirdPerson);
+            var camFp = CameraMath.CameraPositionFor(body, look, PriviewNetworkScene.CameraMode.FirstPerson);
+            var camTp = CameraMath.CameraPositionFor(body, look, PriviewNetworkScene.CameraMode.ThirdPerson);
             Vector3 fwd = new Vector3(1, 0, 0).Rotate(new Vector3(0, look.Y, 0));
             Vector3 wantTp = body + fwd * (-4f) + new Vector3(0, 1.5f, 0);   // ThirdPersonBack=4, Up=1.5
             bool fpOk = (camFp - body).Length() < 1e-4f;                     // 1st person: camera AT the body
@@ -764,6 +764,547 @@ partial class Program
             ok &= dvin;
         }
 
+        // Plan B — spawnable Fixed/Follow cameras + active-view switching. (1) A "camera" object builds as a
+        // non-colliding VIEWPOINT (from a world + via the editor spawn path) and its CamKind cycles
+        // Fixed<->Follow on N/M. (2) The view-transform math: a FIXED camera renders from its placed
+        // transform; a FOLLOW camera aims its forward AT the body (verified through Camera.GetRayForUv, the
+        // real center ray). (3) Cycling the active view steps body(-1) -> camera id -> back to body(-1).
+        {
+            var camViewWorld = new WorldConfig
+            {
+                Name = "camview",
+                Platform = new PlatformConfig { Enabled = false },   // the world camera is editable index 0
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 1, Type = "camera", Collides = false, CameraKind = "fixed",
+                        Position = new Vec3Config { X = 2f, Y = 5f, Z = 3f },
+                        Rotation = new Vec3Config { X = 0f, Y = 0.4f, Z = -0.3f } },
+                },
+            };
+            var cs = new PriviewNetworkScene(new DisplayManagerAsync(), camViewWorld, isServer: false, "127.0.0.1", 0, online: false);
+            cs.Start();
+
+            var camEntry = cs.EditableEntries.FirstOrDefault(e => e.Descriptor.Type == "camera");
+            bool built = camEntry != null && !camEntry.Instance.Collides;
+            Console.WriteLine($"  camera-obj: built={camEntry != null}, non-colliding={(camEntry != null && !camEntry.Instance.Collides)} -> {(built ? "ok" : "BAD")}");
+            bool camOk = built;
+
+            // Spawn a camera through the editor spawn path -> Type "camera", non-colliding.
+            int before = cs.EditableEntries.Count;
+            int after = cs.SpawnTypeForTest("camera");
+            var spawned = cs.EditableEntries.Last();
+            bool spawnCam = after == before + 1 && spawned.Descriptor.Type == "camera" && !spawned.Instance.Collides;
+            Console.WriteLine($"  camera-spawn: editables {before}->{after}, type={spawned.Descriptor.Type}, non-colliding={!spawned.Instance.Collides} -> {(spawnCam ? "ok" : "BAD")}");
+            camOk &= spawnCam;
+
+            // CamKind cycles Fixed <-> Follow on N/M (editable 0 = the world camera).
+            string k0 = cs.FieldValueForTest(0, "CamKind");
+            cs.StepFieldForTest(0, "CamKind", +1); string k1 = cs.FieldValueForTest(0, "CamKind");
+            cs.StepFieldForTest(0, "CamKind", +1); string k2 = cs.FieldValueForTest(0, "CamKind");
+            bool kindCycles = k0 == "Fixed" && k1 == "Follow" && k2 == "Fixed";
+            Console.WriteLine($"  camera-kind: {k0}->{k1}->{k2} (Fixed/Follow/Fixed) -> {(kindCycles ? "ok" : "BAD")}");
+            camOk &= kindCycles;
+
+            // View-transform math (pure): FIXED = placed transform verbatim; FOLLOW forward reaches the body.
+            var camPos = new Vector3(2f, 5f, 3f);
+            var placedLook = new Vector3(0f, 0.4f, -0.3f);
+            var body = new Vector3(-1f, 1f, 4f);
+            var (fp, fl) = PriviewNetworkScene.PlacedCameraView(PriviewNetworkScene.CameraMode.Fixed, camPos, placedLook, body);
+            bool fixedOk = (fp - camPos).Length() < 1e-5f && (fl - placedLook).Length() < 1e-5f;
+            var (op, ol) = PriviewNetworkScene.PlacedCameraView(PriviewNetworkScene.CameraMode.Follow, camPos, placedLook, body);
+            Vector3 fwd = new Camera(op, ol).GetRayForUv(Vector2.Zero).RayDirection;   // the ACTUAL rendered center ray
+            Vector3 want = (body - camPos).Norm();
+            bool followOk = (op - camPos).Length() < 1e-5f && (fwd - want).Length() < 1e-3f;
+            Console.WriteLine($"  camera-view: Fixed=placed({fixedOk}); Follow forward·toBody={(fwd * want):F4} (want ~1) -> {((fixedOk && followOk) ? "ok" : "BAD")}");
+            camOk &= fixedOk && followOk;
+
+            // Active-view cycling: body(-1) -> the placed camera id -> back to body(-1). (One camera; the
+            // authority re-stamps ids on Start, so read the camera's live id rather than assuming it.)
+            var vs = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig { Name = "vc",
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject> { new WorldObject { Type = "camera", Collides = false, CameraKind = "fixed" } } },
+                isServer: false, "127.0.0.1", 0, online: false);
+            vs.Start();
+            int camId = vs.EditableEntries.First(e => e.Descriptor.Type == "camera").Descriptor.Id;
+            int v0 = vs.ActiveViewCameraId;
+            vs.CycleActiveViewForTest(); int v1 = vs.ActiveViewCameraId;
+            vs.CycleActiveViewForTest(); int v2 = vs.ActiveViewCameraId;
+            bool cycleOk = v0 == -1 && v1 == camId && v2 == -1;
+            Console.WriteLine($"  camera-cycle: view {v0}->{v1}->{v2} (body/-1 -> cam#{camId} -> body/-1) -> {(cycleOk ? "ok" : "BAD")}");
+            camOk &= cycleOk;
+
+            // Fix 1a — pure helpers. BodyViewRegion picks which region shows the interactive body view from
+            // the two regions' view ids (left=active, right=next); CrosshairCell places the reticle at that
+            // region's centre (single → screen centre; none → suppressed).
+            const int CW = 200, CH = 50; int lw = CW / 2;   // left region [0,100), right [100,200)
+            bool regOk =
+                PriviewNetworkScene.BodyViewRegion(false, -1, 0) == 0 &&          // single: whole screen
+                PriviewNetworkScene.BodyViewRegion(false, 7, 9) == 0 &&
+                PriviewNetworkScene.BodyViewRegion(true, -1, 3) == 0 &&           // split: body LEFT
+                PriviewNetworkScene.BodyViewRegion(true, 3, -1) == 1 &&           // split: body RIGHT
+                PriviewNetworkScene.BodyViewRegion(true, 3, 4) == -1;             // split: neither (two cameras)
+            var xS = PriviewNetworkScene.CrosshairCell(false, CW, CH, 0);
+            var xL = PriviewNetworkScene.CrosshairCell(true, CW, CH, 0);
+            var xR = PriviewNetworkScene.CrosshairCell(true, CW, CH, 1);
+            var xN = PriviewNetworkScene.CrosshairCell(true, CW, CH, -1);
+            bool cellOk =
+                xS.show && xS.x == CW / 2 && xS.y == CH / 2 &&                    // single → screen centre
+                xL.show && xL.x == lw / 2 && xL.y == CH / 2 &&                    // split body-left → left centre (50)
+                xR.show && xR.x == lw + (CW - lw) / 2 && xR.y == CH / 2 &&        // split body-right → right centre (150)
+                !xN.show;                                                          // no body view → suppressed
+            Console.WriteLine($"  crosshair-helpers: region(single/L/R/none)={regOk}, cell single={xS.x},L={xL.x},R={xR.x},none.show={xN.show} -> {((regOk && cellOk) ? "ok" : "BAD")}");
+            camOk &= regOk && cellOk;
+
+            // Fix 1b — the editor aim tracks the BODY view in split, never the placed camera shown in the
+            // other region. Camera at (5,2,3), body elsewhere (1st-person body view ≈ body position).
+            var aimWorld = new WorldConfig { Name = "aim", Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject> { new WorldObject { Type = "camera", Collides = false, CameraKind = "fixed",
+                    Position = new Vec3Config { X = 5f, Y = 2f, Z = 3f } } } };
+            var asc = new PriviewNetworkScene(new DisplayManagerAsync(), aimWorld, isServer: false, "127.0.0.1", 0, online: false);
+            asc.Start();
+            var camInst0 = asc.EditableEntries.First(e => e.Descriptor.Type == "camera");
+            int aimCamId = camInst0.Descriptor.Id;
+            Vector3 markerPos = camInst0.Instance.Position;
+            asc.SetSplitForTest(true);
+            asc.SetActiveViewForTest(-1); asc.ApplyActiveViewForTest();
+            var aimL = asc.BodyAimForTest();                                   // active=body → body view is the LEFT region
+            asc.SetActiveViewForTest(aimCamId); asc.ApplyActiveViewForTest();  // now viewing THROUGH the camera (left region)
+            var aimR = asc.BodyAimForTest();                                   // body view is the RIGHT region — aim must be it
+            bool aimOk = aimL.bodyVisible && aimR.bodyVisible
+                && (aimL.pos - markerPos).Length() > 0.1f                      // left-region aim is the body, not the marker
+                && (aimR.pos - markerPos).Length() > 0.1f;                     // right-region aim is the body, NOT the placed camera
+            Console.WriteLine($"  crosshair-aim: bodyL={aimL.bodyVisible}, bodyR={aimR.bodyVisible}, aim≠camera(|R−cam|={(aimR.pos - markerPos).Length():F2}) -> {(aimOk ? "ok" : "BAD")}");
+            camOk &= aimOk;
+
+            // Fix 1c — two placed cameras, viewing through the first: NEITHER split region shows the body, so
+            // the aim (and crosshair) is suppressed.
+            var nbWorld = new WorldConfig { Name = "nb", Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject> {
+                    new WorldObject { Type = "camera", Collides = false, CameraKind = "fixed", Position = new Vec3Config { X = 5f } },
+                    new WorldObject { Type = "camera", Collides = false, CameraKind = "fixed", Position = new Vec3Config { X = -5f } } } };
+            var nbs = new PriviewNetworkScene(new DisplayManagerAsync(), nbWorld, isServer: false, "127.0.0.1", 0, online: false);
+            nbs.Start();
+            int firstCam = nbs.EditableEntries.Where(e => e.Descriptor.Type == "camera").Min(e => e.Descriptor.Id);
+            nbs.SetSplitForTest(true);
+            nbs.SetActiveViewForTest(firstCam); nbs.ApplyActiveViewForTest();
+            var aimNone = nbs.BodyAimForTest();
+            bool noBodyOk = !aimNone.bodyVisible;
+            Console.WriteLine($"  crosshair-none: both regions cameras → aim suppressed (bodyVisible={aimNone.bodyVisible}) -> {(noBodyOk ? "ok" : "BAD")}");
+            camOk &= noBodyOk;
+
+            // Fix 2 — a placed camera's marker is NOT globally removed while viewed through: it self-hides
+            // from its OWN camera (rays start at the marker centre → every face is back-face-culled) yet is a
+            // visible object from elsewhere (so it renders in the OTHER split region). Geometry-level proof.
+            var camMesh = camInst0.Instance as Object3d;
+            Vector3 mc = camMesh!.Position;
+            var fromCentre = camMesh.GetRenderData(new Ray(mc, new Vector3(0f, 0f, -1f)));           // its own view: invisible
+            var fromAfar = camMesh.GetRenderData(new Ray(mc + new Vector3(0f, 0f, 6f), new Vector3(0f, 0f, -1f)));  // elsewhere: visible
+            bool markerOk = fromCentre.Intersection < 0f && fromAfar.Intersection > 0f;
+            Console.WriteLine($"  marker-per-region: self-view hit={fromCentre.Intersection:F2} (want <0), other-view hit={fromAfar.Intersection:F2} (want >0) -> {(markerOk ? "ok" : "BAD")}");
+            camOk &= markerOk;
+
+            ok &= camOk;
+        }
+
+        // HUD stage 1 — the DOCKED-editor layout (pure DockLayout): given a screen W×H it splits into a
+        // toolbar/status/hierarchy/inspector/viewport that TILE the screen EXACTLY (every cell covered once →
+        // cover + no overlap), keep the viewport ≥ a minimum with no negative dims, clamp on tiny sizes, and
+        // the viewport centre == the docked crosshair cell (so the region→uv aim matches the reticle).
+        {
+            bool dockOk = true;
+
+            // Exact-tiling check: mark each cell by how many of the 5 rects cover it — must be exactly 1.
+            bool Tiles(int W, int H)
+            {
+                var L = PriviewNetworkScene.DockLayout(W, H);
+                var rects = new[] { L.Toolbar, L.Status, L.Hierarchy, L.Inspector, L.Viewport };
+                foreach (var r in rects) if (r.W < 0 || r.H < 0) return false;   // never negative dims
+                var cover = new int[W * H];
+                foreach (var r in rects)
+                    for (int y = r.Y; y < r.Y + r.H; y++)
+                        for (int x = r.X; x < r.X + r.W; x++)
+                        {
+                            if (x < 0 || x >= W || y < 0 || y >= H) return false;   // in bounds
+                            cover[y * W + x]++;
+                        }
+                foreach (var c in cover) if (c != 1) return false;   // exactly once = cover + non-overlap
+                return true;
+            }
+
+            (int, int)[] sizes = { (200, 50), (120, 40), (100, 30), (80, 25), (40, 12), (20, 6), (10, 4), (5, 3), (1, 1) };
+            foreach (var (W, H) in sizes)
+            {
+                bool t = Tiles(W, H);
+                if (!t) { dockOk = false; Console.WriteLine($"  dock-tiles {W}x{H} -> BAD"); }
+            }
+            Console.WriteLine($"  dock-tiling (9 sizes, exact cover + no overlap, no negative) -> {(dockOk ? "ok" : "BAD")}");
+
+            // Roomy screen: the viewport keeps a sensible minimum and sits between the two side panels.
+            var big = PriviewNetworkScene.DockLayout(200, 50);
+            bool vpOk = big.Viewport.W >= 16 && big.Viewport.H >= 3
+                && big.Hierarchy.W >= 18 && big.Inspector.W >= 28
+                && big.Viewport.X == big.Hierarchy.W && big.Toolbar.H == 1 && big.Status.H == 1;
+            Console.WriteLine($"  dock-viewport 200x50: vp={big.Viewport.W}x{big.Viewport.H}, hier={big.Hierarchy.W}, insp={big.Inspector.W} -> {(vpOk ? "ok" : "BAD")}");
+            dockOk &= vpOk;
+
+            // The docked crosshair (CrosshairCell over the viewport rect, single view) == the viewport centre,
+            // so what the reticle marks is exactly what the region→uv pick aims at.
+            var (cshow, ccx, ccy) = PriviewNetworkScene.CrosshairCell(false, big.Viewport.X, big.Viewport.Y, big.Viewport.W, big.Viewport.H, 0);
+            bool crossOk = cshow && ccx == big.Viewport.CenterX && ccy == big.Viewport.CenterY;
+            Console.WriteLine($"  dock-crosshair: cell=({ccx},{ccy}) viewport-centre=({big.Viewport.CenterX},{big.Viewport.CenterY}) -> {(crossOk ? "ok" : "BAD")}");
+            dockOk &= crossOk;
+
+            // HUD stage 2 — COLLAPSIBLE docked Inspector (pure BuildInspectorRows). Given each field's section
+            // (in order) + the collapsed set, the visible rows = a header per section + its fields ONLY when
+            // expanded; the field cursor navigates these rows so it can NEVER land on a hidden field.
+            var secs = new[] { "Transform", "Transform", "Transform", "Appearance", "Appearance", "Physics" };
+
+            // (a) all expanded → header + all fields, in order (headers at 0/4/7; fields carry their source index).
+            var rAll = PriviewNetworkScene.BuildInspectorRows(secs, new HashSet<string>());
+            bool allOk = rAll.Count == 9
+                && rAll[0].IsHeader && rAll[0].Section == "Transform"
+                && !rAll[1].IsHeader && rAll[1].FieldIndex == 0 && !rAll[3].IsHeader && rAll[3].FieldIndex == 2
+                && rAll[4].IsHeader && rAll[4].Section == "Appearance"
+                && rAll[7].IsHeader && rAll[7].Section == "Physics" && !rAll[8].IsHeader && rAll[8].FieldIndex == 5;
+            Console.WriteLine($"  inspector-rows all-expanded: {rAll.Count} rows (want 9) -> {(allOk ? "ok" : "BAD")}");
+            dockOk &= allOk;
+
+            // (b) one collapsed (Appearance) → its header shows, its 2 fields HIDDEN (no cursorable field row).
+            var rOne = PriviewNetworkScene.BuildInspectorRows(secs, new HashSet<string> { "Appearance" });
+            bool noHiddenField = !rOne.Any(r => !r.IsHeader && r.Section == "Appearance");
+            bool headerKept = rOne.Any(r => r.IsHeader && r.Section == "Appearance");
+            bool oneOk = rOne.Count == 7 && noHiddenField && headerKept;
+            Console.WriteLine($"  inspector-rows one-collapsed: {rOne.Count} rows (want 7), hidden fields skipped={noHiddenField}, header kept={headerKept} -> {(oneOk ? "ok" : "BAD")}");
+            dockOk &= oneOk;
+
+            // (c) all collapsed → headers only, no field rows.
+            var rNone = PriviewNetworkScene.BuildInspectorRows(secs, new HashSet<string> { "Transform", "Appearance", "Physics" });
+            bool allHeaders = rNone.Count == 3 && rNone.All(r => r.IsHeader);
+            Console.WriteLine($"  inspector-rows all-collapsed: {rNone.Count} rows (want 3, all headers={rNone.All(r => r.IsHeader)}) -> {(allHeaders ? "ok" : "BAD")}");
+            dockOk &= allHeaders;
+
+            // (d) toggling flips the state + the visible-row count: collapse Transform (→6) then re-expand (→9).
+            var st = new HashSet<string> { "Transform" };
+            int collapsedCount = PriviewNetworkScene.BuildInspectorRows(secs, st).Count;
+            st.Remove("Transform");
+            int expandedCount = PriviewNetworkScene.BuildInspectorRows(secs, st).Count;
+            bool toggleOk = collapsedCount == 6 && expandedCount == 9;
+            Console.WriteLine($"  inspector-rows toggle: collapsed={collapsedCount} (want 6), re-expanded={expandedCount} (want 9) -> {(toggleOk ? "ok" : "BAD")}");
+            dockOk &= toggleOk;
+
+            // HUD stage 3 — Fix 2: the collapse/selection markers are pure ASCII (the old Unicode ▾/▸ rendered
+            // as "?" on terminals lacking those glyphs).
+            bool asciiMarkers = PriviewNetworkScene.MarkerExpanded.All(c => c <= 127)
+                && PriviewNetworkScene.MarkerCollapsed.All(c => c <= 127)
+                && PriviewNetworkScene.MarkerSelected.All(c => c <= 127);
+            Console.WriteLine($"  hud-markers ASCII: exp='{PriviewNetworkScene.MarkerExpanded}' col='{PriviewNetworkScene.MarkerCollapsed}' sel='{PriviewNetworkScene.MarkerSelected}' -> {(asciiMarkers ? "ok" : "BAD")}");
+            dockOk &= asciiMarkers;
+
+            // HUD stage 3 — Fix 1: the render loop's standalone top-left fps is drawn in PLAY, SUPPRESSED in
+            // DOCKED (the docked Status bar shows fps instead).
+            var fpsScene = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig { Name = "fps",
+                Platform = new PlatformConfig { Enabled = false } }, isServer: false, "127.0.0.1", 0, online: false);
+            fpsScene.Start();
+            bool fpsPlay = fpsScene.ShowFrameFps;                 // PLAY (default) -> true
+            fpsScene.SetDockedForTest(true);
+            bool fpsDocked = fpsScene.ShowFrameFps;               // DOCKED -> false
+            fpsScene.SetDockedForTest(false);
+            bool fpsBack = fpsScene.ShowFrameFps;                 // back to PLAY -> true
+            bool fpsOk = fpsPlay && !fpsDocked && fpsBack;
+            Console.WriteLine($"  hud-fps gate: play={fpsPlay} docked={fpsDocked} back={fpsBack} (want T/F/T) -> {(fpsOk ? "ok" : "BAD")}");
+            dockOk &= fpsOk;
+
+            // CHAT rework — pure helpers.
+            // (1) WrapText: no line exceeds the width; a long unbroken token hard-splits; short text passes.
+            var wA = PriviewNetworkScene.WrapText("hello world foo", 5);
+            bool wrapShort = wA.All(l => l.Length <= 5) && wA.Count == 3 && wA[0] == "hello" && wA[2] == "foo";
+            var wB = PriviewNetworkScene.WrapText("abcdefghijk", 4);           // -> abcd/efgh/ijk
+            bool wrapSplit = wB.All(l => l.Length <= 4) && wB.Count == 3 && wB[0] == "abcd" && wB[2] == "ijk";
+            var wC = PriviewNetworkScene.WrapText("hi", 10);
+            bool wrapPass = wC.Count == 1 && wC[0] == "hi";
+            Console.WriteLine($"  chat-wrap: short[{string.Join('/', wA)}]={wrapShort}, split[{string.Join('/', wB)}]={wrapSplit}, pass={wrapPass} -> {((wrapShort && wrapSplit && wrapPass) ? "ok" : "BAD")}");
+            dockOk &= wrapShort && wrapSplit && wrapPass;
+
+            // (2) ChatVisibleSlice: correct window; clamps [0,max]; at-bottom auto-shows newest; scrolled-up does NOT.
+            var vAll = PriviewNetworkScene.ChatVisibleSlice(3, 8, 0);          // few lines: all shown
+            var vBot = PriviewNetworkScene.ChatVisibleSlice(20, 8, 0);         // newest 8
+            var vUp  = PriviewNetworkScene.ChatVisibleSlice(20, 8, 5);         // scrolled up
+            var vTop = PriviewNetworkScene.ChatVisibleSlice(20, 8, 999);       // clamp to top
+            var vNeg = PriviewNetworkScene.ChatVisibleSlice(20, 8, -4);        // clamp to bottom
+            bool sliceOk = vAll == (0, 3, 0) && vBot == (12, 8, 0) && vUp == (7, 8, 5)
+                        && vTop == (0, 8, 12) && vNeg == (12, 8, 0);
+            // auto-bottom vs scrolled-up when a message is appended (8 -> 9 wrapped lines, box 4 rows):
+            var after0 = PriviewNetworkScene.ChatVisibleSlice(9, 4, 0);        // at bottom -> newest shown
+            var afterU = PriviewNetworkScene.ChatVisibleSlice(9, 4, 3);        // scrolled up -> NOT jumped to bottom
+            bool autoBottom = after0.start + after0.count == 9;                // includes the newest line
+            bool notJump = afterU.start + afterU.count < 9;                    // still above the bottom
+            Console.WriteLine($"  chat-scroll: slices={sliceOk}, auto-bottom={autoBottom}, scrolled-up-stays={notJump} -> {((sliceOk && autoBottom && notJump) ? "ok" : "BAD")}");
+            dockOk &= sliceOk && autoBottom && notJump;
+
+            // (3) Placement: the chat box never intersects the HUD panels (per mode).
+            bool Hit(PriviewNetworkScene.DockRect a, PriviewNetworkScene.DockRect b)
+                => a.W > 0 && a.H > 0 && b.W > 0 && b.H > 0
+                && a.X < b.X + b.W && b.X < a.X + a.W && a.Y < b.Y + b.H && b.Y < a.Y + a.H;
+            int CW = 200, CH = 50;
+            var CL = PriviewNetworkScene.DockLayout(CW, CH);
+            // DOCKED: inside the viewport -> clear of toolbar/status/hierarchy/inspector.
+            var chatD = PriviewNetworkScene.ChatBoxRect(2, CW, CH, CL);
+            var vp = CL.Viewport;
+            bool dInside = chatD.W > 0 && chatD.X >= vp.X && chatD.X + chatD.W <= vp.X + vp.W && chatD.Y >= vp.Y && chatD.Y + chatD.H <= vp.Y + vp.H;
+            bool dClear = !Hit(chatD, CL.Toolbar) && !Hit(chatD, CL.Status) && !Hit(chatD, CL.Hierarchy) && !Hit(chatD, CL.Inspector);
+            // OVERLAY: below the reserved top-HUD rows -> clear of EDIT MODE/KEYS (top-left) + PROPERTIES (top-right).
+            var chatO = PriviewNetworkScene.ChatBoxRect(1, 120, CH, PriviewNetworkScene.DockLayout(120, CH));
+            var editBox = new PriviewNetworkScene.DockRect(2, 12, 55, 8);
+            var keysBox = new PriviewNetworkScene.DockRect(2, 21, 40, 11);
+            var propBox = new PriviewNetworkScene.DockRect(120 - 40, 0, 40, 30);
+            bool oClear = chatO.W > 0 && chatO.Y >= PriviewNetworkScene.OverlayHudBottom
+                       && !Hit(chatO, editBox) && !Hit(chatO, keysBox) && !Hit(chatO, propBox);
+            // PLAY: below the top hint line.
+            var chatP = PriviewNetworkScene.ChatBoxRect(0, 120, CH, PriviewNetworkScene.DockLayout(120, CH));
+            bool pClear = chatP.W > 0 && chatP.Y >= PriviewNetworkScene.PlayHudBottom;
+            bool placeOk = dInside && dClear && oClear && pClear;
+            Console.WriteLine($"  chat-place: docked inside-vp={dInside} clear={dClear}, overlay clear={oClear}, play clear={pClear} -> {(placeOk ? "ok" : "BAD")}");
+            dockOk &= placeOk;
+
+            // PART A — the editor input is SUPPRESSED while chatting (chat/field-entry has exclusive input),
+            // so a send-Enter can't also begin Inspector field-entry. (fpsScene is reused from the fps test.)
+            bool editWhenIdle = fpsScene.EditorProcessesInputForTest;   // not chatting -> editor runs
+            fpsScene.SetChattingForTest(true);
+            bool editWhenChatting = fpsScene.EditorProcessesInputForTest;   // chatting -> editor suppressed
+            fpsScene.SetChattingForTest(false);
+            bool gateOk = editWhenIdle && !editWhenChatting;
+            Console.WriteLine($"  chat-enter-gate: editor idle={editWhenIdle}, chatting={editWhenChatting} (want T/F) -> {(gateOk ? "ok" : "BAD")}");
+            dockOk &= gateOk;
+
+            // PART B — HierarchyWindow keeps the SELECTED item visible + clamps at the ends (Unity-hierarchy scroll).
+            bool InWin(int listCount, int rows, int sel)
+            {
+                var (s, c) = PriviewNetworkScene.HierarchyWindow(listCount, rows, sel);
+                return s >= 0 && c >= 0 && s + c <= listCount && sel >= s && sel < s + c;   // selection is inside the window
+            }
+            var wFit = PriviewNetworkScene.HierarchyWindow(3, 8, 1);          // fits -> all shown from 0
+            var wTop = PriviewNetworkScene.HierarchyWindow(20, 6, 0);         // selected at top
+            var wMid = PriviewNetworkScene.HierarchyWindow(20, 6, 10);        // selected mid -> centred, in view
+            var wBot = PriviewNetworkScene.HierarchyWindow(20, 6, 19);        // selected last -> clamped to the bottom
+            bool hierOk = wFit == (0, 3)
+                       && wTop.start == 0 && wTop.count == 6
+                       && wBot.start == 14 && wBot.count == 6                  // last 6 of 20 -> start 14
+                       && InWin(20, 6, 0) && InWin(20, 6, 10) && InWin(20, 6, 19) && InWin(50, 7, 25) && InWin(3, 8, 2);
+            Console.WriteLine($"  hierarchy-window: fit={wFit}, top={wTop}, mid={wMid}, bot={wBot}, selection-always-visible={hierOk} -> {(hierOk ? "ok" : "BAD")}");
+            dockOk &= hierOk;
+
+            // FIX A — the render loop's ESC→quit is SUPPRESSED while chatting (ESC cancels the chat instead),
+            // and allowed otherwise. (fpsScene reused; SetChattingForTest drives _isChatting.)
+            bool quitIdle = fpsScene.AllowQuit;             // not chatting -> quit allowed
+            fpsScene.SetChattingForTest(true);
+            bool quitChatting = fpsScene.AllowQuit;         // chatting -> quit suppressed
+            fpsScene.SetChattingForTest(false);
+            bool quitOk = quitIdle && !quitChatting;
+            Console.WriteLine($"  chat-esc-gate: quit idle={quitIdle}, chatting={quitChatting} (want T/F) -> {(quitOk ? "ok" : "BAD")}");
+            dockOk &= quitOk;
+
+            // FIX B — the chat scroll responds to the arrow/PgUp-PgDn inputs (same ScrollChat path): up = older
+            // (offset++), down = newer (offset--), clamped at the bottom (0); ChatVisibleSlice reflects it.
+            var scScene = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig { Name = "sc",
+                Platform = new PlatformConfig { Enabled = false } }, isServer: false, "127.0.0.1", 0, online: false);
+            scScene.Start();
+            int s0 = scScene.ChatScrollForTest;             // starts at 0 (bottom)
+            scScene.ScrollChatForTest(+1); scScene.ScrollChatForTest(+1);   // two "up" (arrow/PgUp)
+            int sUp = scScene.ChatScrollForTest;            // -> 2
+            var slcUp = PriviewNetworkScene.ChatVisibleSlice(20, 8, sUp);   // scrolled up: not at the bottom
+            scScene.ScrollChatForTest(-1);                  // one "down" (arrow/PgDn)
+            int sDn = scScene.ChatScrollForTest;            // -> 1
+            scScene.ScrollChatForTest(-5);                  // over-scroll down -> clamps at 0
+            int sClamp = scScene.ChatScrollForTest;         // -> 0
+            bool scrollOk = s0 == 0 && sUp == 2 && sDn == 1 && sClamp == 0 && slcUp.clampedOffset == 2 && slcUp.start == 10;
+            Console.WriteLine($"  chat-scroll-keys: start={s0}, up={sUp}, down={sDn}, clamp={sClamp}, sliceScrolled={slcUp.clampedOffset} -> {(scrollOk ? "ok" : "BAD")}");
+            dockOk &= scrollOk;
+
+            ok &= dockOk;
+        }
+
+        // 3rd-person camera clip-avoidance — the body camera pulls IN past a wall so it never sees through
+        // it, and GLIDES (eased) rather than snapping. (1) the pure clamp math; (2) the REAL raycast: a wall
+        // between the body and the 3rd-person camera pulls the target boom in, nothing-in-the-way keeps the
+        // full boom; (3) the eased boom converges toward the target and never overshoots past the wall.
+        {
+            var off = CameraMath.CameraOffsetFor(Vector3.Zero, PriviewNetworkScene.CameraMode.ThirdPerson);
+            float full = off.Length();
+
+            // (1) Pure clamp: a hit closer than the boom -> (hit - margin), floored at minDist; a hit at/
+            //     beyond the boom (or none) -> the full boom.
+            bool pNear  = Math.Abs(PriviewNetworkScene.ResolveCameraBackDistance(off, 2.0f, 0.6f, 0.3f) - 1.7f) < 1e-4f;   // 2.0<full -> 2.0-0.3
+            bool pFloor = Math.Abs(PriviewNetworkScene.ResolveCameraBackDistance(off, 0.5f, 0.6f, 0.3f) - 0.6f) < 1e-4f;   // 0.5-0.3=0.2 -> floored to 0.6
+            bool pMax   = Math.Abs(PriviewNetworkScene.ResolveCameraBackDistance(off, float.MaxValue, 0.6f, 0.3f) - full) < 1e-4f;
+            bool pFar   = Math.Abs(PriviewNetworkScene.ResolveCameraBackDistance(off, full + 5f, 0.6f, 0.3f) - full) < 1e-4f;
+            bool pureOk = pNear && pFloor && pMax && pFar;
+            Console.WriteLine($"  clip-pure: near={pNear}, floor={pFloor}, none(max)={pMax}, none(far)={pFar} (full={full:F2}) -> {(pureOk ? "ok" : "BAD")}");
+            bool clipOk = pureOk;
+
+            // (2) Raycast: a wall cube ON the body->camera ray (body at origin, level look -> boom goes
+            //     back+up). Place a unit cube centered ~2.2 along the boom direction, well inside the boom.
+            Vector3 body = Vector3.Zero, look = Vector3.Zero;
+            Vector3 dir = off.Norm();
+            Vector3 wallPos = dir * 2.2f;
+            var wallWorld = new WorldConfig { Name = "clip", Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Scale = 1f,
+                    Position = new Vec3Config { X = wallPos.X, Y = wallPos.Y, Z = wallPos.Z } } } };
+            var clipScene = new PriviewNetworkScene(new DisplayManagerAsync(), wallWorld, isServer: false, "127.0.0.1", 0, online: false);
+            clipScene.Start();
+
+            var withWall = clipScene.ThirdPersonClipForTest(body, look);
+            bool pulledIn = withWall.hit > 0f && withWall.hit < withWall.full && withWall.target < withWall.full && withWall.target >= 0.6f - 1e-4f;
+            var noWall = clipScene.ThirdPersonClipForTest(body, new Vector3(0f, MathF.PI, 0f));   // look 180° -> boom aims away from the wall
+            bool fullWhenClear = noWall.hit >= noWall.full && Math.Abs(noWall.target - noWall.full) < 1e-4f;
+            bool rayOk = pulledIn && fullWhenClear;
+            Console.WriteLine($"  clip-ray: wall hit={withWall.hit:F2}<full={withWall.full:F2} -> target={withWall.target:F2}(pulled={pulledIn}); clear hit={(noWall.hit > 1e6f ? "none" : noWall.hit.ToString("F2"))} target={noWall.target:F2}==full({fullWhenClear}) -> {(rayOk ? "ok" : "BAD")}");
+            clipOk &= rayOk;
+
+            // (3) Smoothing: from full extension the eased boom glides DOWN toward the wall target — monotone
+            //     and never below the target (no overshoot past the wall) — converging within a few steps.
+            float tgt = withWall.target;
+            float prev = float.MaxValue; bool monotone = true, noOver = true;
+            for (int i = 0; i < 60; i++)
+            {
+                clipScene.StepThirdPersonCameraForTest(body, look, 1f / 60f);
+                float boom = clipScene.CameraBoomLengthForTest;
+                if (boom > prev + 1e-4f) monotone = false;   // never grows while pulling in
+                if (boom < tgt - 1e-4f) noOver = false;      // never past the wall
+                prev = boom;
+            }
+            bool converged = Math.Abs(clipScene.CameraBoomLengthForTest - tgt) < 1e-2f;
+            bool smoothOk = monotone && noOver && converged && tgt < withWall.full;
+            Console.WriteLine($"  clip-smooth: boom -> {clipScene.CameraBoomLengthForTest:F3} (target {tgt:F3}), monotone={monotone}, no-overshoot={noOver}, converged={converged} -> {(smoothOk ? "ok" : "BAD")}");
+            clipOk &= smoothOk;
+
+            ok &= clipOk;
+        }
+
+        // Plan B — 2nd-person body view + Follow-camera arbitrary targets.
+        {
+            bool camOk = true;
+
+            // (1) 2nd-person rig: the camera sits IN FRONT of the body (offset sign OPPOSITE 3rd person
+            //     along the look) and its orientation faces BACK at the body (forward·toBody ≈ 1 via the
+            //     REAL center ray).
+            var body2 = new Vector3(1f, 1f, -2f);
+            var look2 = new Vector3(0f, 0.6f, 0f);   // yaw
+            Vector3 fwdYaw = new Vector3(1, 0, 0).Rotate(new Vector3(0, look2.Y, 0));
+            float behind3 = CameraMath.CameraOffsetFor(look2, PriviewNetworkScene.CameraMode.ThirdPerson) * fwdYaw;
+            float front2  = CameraMath.CameraOffsetFor(look2, PriviewNetworkScene.CameraMode.SecondPerson) * fwdYaw;
+            bool oppositeSide = front2 > 0f && behind3 < 0f;
+            var cam2 = CameraMath.CameraPositionFor(body2, look2, PriviewNetworkScene.CameraMode.SecondPerson);
+            var look2back = PriviewNetworkScene.LookRotationTo(body2 - cam2);
+            Vector3 fwd2 = new Camera(cam2, look2back).GetRayForUv(Vector2.Zero).RayDirection;
+            Vector3 want2 = (body2 - cam2).Norm();
+            bool looksBack = (fwd2 * want2) > 0.999f;
+            bool rig2Ok = oppositeSide && looksBack;
+            Console.WriteLine($"  2nd-person: front2={front2:F2}>0 & behind3={behind3:F2}<0 ({oppositeSide}); look·toBody={(fwd2 * want2):F4} (want ~1) -> {(rig2Ok ? "ok" : "BAD")}");
+            camOk &= rig2Ok;
+
+            // (2) F7 body-view cycle: 1st -> 3rd -> 2nd -> 1st person.
+            var f7 = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig { Name = "f7",
+                Platform = new PlatformConfig { Enabled = false }, Objects = new List<WorldObject>() },
+                isServer: false, "127.0.0.1", 0, online: false);
+            f7.Start();
+            var m0 = f7.CurrentCameraMode;
+            f7.CycleBodyViewForTest(); var m1 = f7.CurrentCameraMode;
+            f7.CycleBodyViewForTest(); var m2 = f7.CurrentCameraMode;
+            f7.CycleBodyViewForTest(); var m3 = f7.CurrentCameraMode;
+            bool cycleOk = m0 == PriviewNetworkScene.CameraMode.FirstPerson && m1 == PriviewNetworkScene.CameraMode.ThirdPerson
+                        && m2 == PriviewNetworkScene.CameraMode.SecondPerson && m3 == PriviewNetworkScene.CameraMode.FirstPerson;
+            Console.WriteLine($"  2nd-cycle: {m0}->{m1}->{m2}->{m3} (1st/3rd/2nd/1st) -> {(cycleOk ? "ok" : "BAD")}");
+            camOk &= cycleOk;
+
+            // (3) Clip-avoidance for 2nd person: a wall on the FRONT boom pulls the camera in (same clamp as
+            //     3rd person, just the front-facing boom direction).
+            Vector3 body = Vector3.Zero, look = Vector3.Zero;
+            Vector3 dir2 = CameraMath.CameraOffsetFor(look, PriviewNetworkScene.CameraMode.SecondPerson).Norm();
+            Vector3 wallPos2 = dir2 * 2.2f;
+            var clip2 = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig { Name = "clip2",
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Scale = 1f,
+                    Position = new Vec3Config { X = wallPos2.X, Y = wallPos2.Y, Z = wallPos2.Z } } } },
+                isServer: false, "127.0.0.1", 0, online: false);
+            clip2.Start();
+            var withWall2 = clip2.SecondPersonClipForTest(body, look);
+            bool pulled2 = withWall2.hit > 0f && withWall2.hit < withWall2.full && withWall2.target < withWall2.full && withWall2.target >= 0.6f - 1e-4f;
+            Console.WriteLine($"  2nd-clip: wall hit={withWall2.hit:F2}<full={withWall2.full:F2} -> target={withWall2.target:F2} (pulled={pulled2}) -> {(pulled2 ? "ok" : "BAD")}");
+            camOk &= pulled2;
+
+            // (4) Follow-camera arbitrary targets: a follow camera resolves its aim to the TRACKED object's
+            //     live position; the -1 sentinel resolves to the player body; an unresolved id FALLS BACK to
+            //     the player body (never breaks). Read the object's LIVE id (the authority may re-stamp ids).
+            var ft = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig { Name = "follow",
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 5, Type = "cube", Position = new Vec3Config { X = 7f, Y = 2f, Z = -3f } },
+                    new WorldObject { Id = 6, Type = "camera", Collides = false, CameraKind = "follow" },
+                } },
+                isServer: false, "127.0.0.1", 0, online: false);
+            ft.Start();
+            var cubeEntry = ft.EditableEntries.First(e => e.Descriptor.Type == "cube");
+            int cubeId = cubeEntry.Descriptor.Id;
+            Vector3 cubePos = cubeEntry.Instance.Position;
+            bool tracksObj = (ft.FollowTargetPositionForTest(cubeId) - cubePos).Length() < 1e-5f;
+            bool tracksBody = (ft.FollowTargetPositionForTest(-1) - ft.LocalBodyPosition).Length() < 1e-5f;
+            bool fallsBack = (ft.FollowTargetPositionForTest(999999) - ft.LocalBodyPosition).Length() < 1e-5f;
+            bool followOk = tracksObj && tracksBody && fallsBack;
+            Console.WriteLine($"  follow-target: obj#{cubeId}@{cubePos.X:F1} tracked={tracksObj}, sentinel->body={tracksBody}, unresolved->body={fallsBack} -> {(followOk ? "ok" : "BAD")}");
+            camOk &= followOk;
+
+            ok &= camOk;
+        }
+
+        // Fix 1 — a placed FIXED camera's ACTIVE VIEW always reflects its CURRENT rotation, before AND
+        // after a position edit (PlacedCameraView(Fixed) reads the marker's LIVE LocalRotate each frame;
+        // moving calls UpdateGeometry, which never touches LocalRotate). Both edit orders must end with the
+        // resolved view orientation == the object's rotation and position == the object's position; and the
+        // set yaw/pitch must actually steer the rendered center ray.
+        {
+            bool fixOk = true;
+
+            PriviewNetworkScene NewFixedCamActive()
+            {
+                var w = new WorldConfig { Name = "fixcam", Platform = new PlatformConfig { Enabled = false },
+                    Objects = new List<WorldObject> { new WorldObject { Id = 1, Type = "camera", Collides = false, CameraKind = "fixed",
+                        Position = new Vec3Config { X = 2f, Y = 3f, Z = 1f } } } };
+                var sc = new PriviewNetworkScene(new DisplayManagerAsync(), w, isServer: false, "127.0.0.1", 0, online: false);
+                sc.Start();
+                sc.SetActiveViewForTest(sc.EditableEntries.First(e => e.Descriptor.Type == "camera").Descriptor.Id);
+                return sc;   // the camera is editable index 0
+            }
+            bool ViewMatches(PriviewNetworkScene sc)
+            {
+                sc.ApplyActiveViewForTest();
+                var m = sc.EditableEntries[0].Instance;
+                return (sc.CameraLook - m.LocalRotate).Length() < 1e-4f && (sc.CameraPosition - m.Position).Length() < 1e-4f;
+            }
+
+            // Order A: position THEN rotation. After moving, set all three rotation fields -> the view must match.
+            var a = NewFixedCamActive();
+            a.TypeFieldForTest(0, "PosX", "5", true); a.TypeFieldForTest(0, "PosZ", "-4", true);         // move first
+            a.TypeFieldForTest(0, "RotX", "0.3", true); a.TypeFieldForTest(0, "RotY", "0.5", true); a.TypeFieldForTest(0, "RotZ", "0.2", true);
+            bool aMatch = ViewMatches(a);
+            var aRay = new Camera(a.CameraPosition, a.CameraLook).GetRayForUv(Vector2.Zero).RayDirection;
+            bool aSteers = (aRay - new Vector3(1f, 0f, 0f)).Length() > 0.1f;                             // yaw/pitch actually steer the look
+            Console.WriteLine($"  fixcam-pos-then-rot: view==transform={aMatch}, ray steered={aSteers} -> {((aMatch && aSteers) ? "ok" : "BAD")}");
+            fixOk &= aMatch && aSteers;
+
+            // Order B: rotation THEN position. A later move must NOT disturb the orientation.
+            var b = NewFixedCamActive();
+            b.TypeFieldForTest(0, "RotX", "0.3", true); b.TypeFieldForTest(0, "RotY", "0.5", true); b.TypeFieldForTest(0, "RotZ", "0.2", true);
+            b.ApplyActiveViewForTest(); var rotBeforeMove = b.CameraLook;
+            b.TypeFieldForTest(0, "PosX", "5", true); b.TypeFieldForTest(0, "PosY", "-2", true);         // move after
+            bool bMatch = ViewMatches(b);
+            bool bStable = (b.CameraLook - rotBeforeMove).Length() < 1e-4f;                              // move didn't rotate the view
+            Console.WriteLine($"  fixcam-rot-then-pos: view==transform={bMatch}, rot stable across move={bStable} -> {((bMatch && bStable) ? "ok" : "BAD")}");
+            fixOk &= bMatch && bStable;
+
+            ok &= fixOk;
+        }
+
         Console.WriteLine(ok ? "EDITOR TEST PASSED" : "EDITOR TEST FAILED");
     }
 
@@ -823,7 +1364,7 @@ partial class Program
                     Scale = 1.5f, Color = "Red", Anchor = "Center", RotateSpeed = 0.5f, Radius = 1f, Collider = "obb" },
                 new WorldObject { Id = 11, Type = "cube", Name = "my crate",
                     Position = new Vec3Config { X = -1f, Y = 0f, Z = 2f },
-                    Scale = 2f, Color = "Green", Collides = false, Gravity = true, Mass = 3.5f, Restitution = 0.8f, Friction = 0.35f, RollingFriction = 0.12f, ColorFade = 0.5f, Texture = "brick.png", TextureScale = 2f, TextureFace = 4, TextureFilter = 1 },
+                    Scale = 2f, Color = "Green", Collides = false, Gravity = true, Mass = 3.5f, Restitution = 0.8f, Friction = 0.35f, RollingFriction = 0.12f, ColorFade = 0.5f, Texture = "brick.png", TextureScale = 2f, TextureFace = 4, TextureFilter = 2 },
                 new WorldObject { Id = 12, Type = "sphere",
                     Position = new Vec3Config { X = 4f, Y = 1f, Z = -2f },
                     Radius = 2.5f, Color = "Blue" },
@@ -842,6 +1383,10 @@ partial class Program
                     Position = new Vec3Config { X = 2f, Y = 1.5f, Z = -3f },
                     Rotation = new Vec3Config { X = 0f, Y = 1.57f, Z = 0f },
                     Scale = 1.8f, Color = "Yellow", ColorFade = 0.2f, Collides = false, Texture = "poster.png" },
+                new WorldObject { Id = 16, Type = "camera", Name = "watchtower",
+                    Position = new Vec3Config { X = -6f, Y = 3f, Z = 4f },
+                    Rotation = new Vec3Config { X = 0f, Y = 0.5f, Z = -0.2f },
+                    Collides = false, CameraKind = "follow", FollowTargetId = 11 },
             }
         };
 
@@ -1093,6 +1638,48 @@ partial class Program
             finally { try { File.Delete(recvPath); } catch { } }
         }
 
+        // (5) Runtime texture PUSH (A1 tail): a LIVE texture-change edit streams the PNG bytes on the EDIT
+        // path (not only on world sync). Emit the EXACT chunks the edit path sends for an on-disk PNG, then
+        // feed them to a peer that LACKS the file and assert it materialises + attaches — reusing the A1
+        // peer-without-file end, now triggered by the edit path (StreamTextureToPeers) rather than world sync.
+        {
+            Directory.CreateDirectory(AppPaths.TexturesFolder);
+            Directory.CreateDirectory(AppPaths.ReceivedTexturesFolder);
+            string name = "__edit_push_tex__.png";
+            string authPath = Path.Combine(AppPaths.TexturesFolder, name);
+            string recvPath = Path.Combine(AppPaths.ReceivedTexturesFolder, name);
+            byte[] png = PngEncode(2, 2, texPixels, 6, 0);
+            try
+            {
+                // Authority has the texture in textures/; the edit path emits the chunks it would stream.
+                File.WriteAllBytes(authPath, png);
+                var chunks = PriviewNetworkScene.EmitTextureChunksForTest(name);
+
+                // The emitted chunks reassemble to the on-disk PNG bit-for-bit (the real texture bytes go out).
+                byte[] emitted = new byte[chunks.Sum(c => c.Data.Length)];
+                int eoff = 0; foreach (var c in chunks) { Array.Copy(c.Data, 0, emitted, eoff, c.Data.Length); eoff += c.Data.Length; }
+                bool emitOk = chunks.Count >= 1 && chunks.All(c => c.TextureName == name && c.Total == chunks.Count) && emitted.SequenceEqual(png);
+
+                // The peer LACKS the file locally — remove any local copies so only the stream can carry it.
+                try { File.Delete(authPath); } catch { }
+                try { if (File.Exists(recvPath)) File.Delete(recvPath); } catch { }
+
+                // A peer receives the streamed chunks -> OnTextureChunkReceived reassembles -> MaterializeTexture.
+                var peer = new PriviewNetworkScene(new DisplayManagerAsync(),
+                    new WorldConfig { Name = "peer", Platform = new PlatformConfig { Enabled = false } }, isServer: false, "127.0.0.1", 0, online: false);
+                foreach (var c in chunks) peer.ReceiveTextureChunkForTest(c);
+
+                bool wrote = File.Exists(recvPath) && File.ReadAllBytes(recvPath).SequenceEqual(png);
+                var fromReceived = TextureLoader.Get(AppPaths.ReceivedTexturesFolder, name);   // attaches from where the stream landed
+                var fromDefault = TextureLoader.Get(AppPaths.TexturesFolder, name);            // the peer's default still lacks it
+                bool attachOk = fromReceived != null && fromReceived.Width == 2 && fromReceived.Height == 2 && fromDefault == null;
+                bool pushOk = emitOk && wrote && attachOk;
+                Console.WriteLine($"Runtime texture push: emit {chunks.Count} chunk(s) bytes-match={emitOk}, peer materialised={wrote}, attach received={(fromReceived != null ? $"{fromReceived.Width}x{fromReceived.Height}" : "NULL")}/default={(fromDefault == null ? "null (absent)" : "present")} -> {(pushOk ? "ok" : "BAD")}");
+                if (!pushOk) { Fail("Runtime texture push: edit-path stream did not reach the peer / attach."); return; }
+            }
+            finally { try { File.Delete(authPath); } catch { } try { File.Delete(recvPath); } catch { } }
+        }
+
         Console.WriteLine("WORLD SYNC TEST PASSED");
     }
 
@@ -1161,6 +1748,9 @@ partial class Program
             if (x.ConeShape != y.ConeShape) return $"object[{i}].ConeShape '{x.ConeShape}' != '{y.ConeShape}'";
             if (x.AreaShape != y.AreaShape) return $"object[{i}].AreaShape differs";
             if (!Eq(x.ColorInfluence, y.ColorInfluence)) return $"object[{i}].ColorInfluence differs";
+            // ---- camera-only fields ----
+            if (x.CameraKind != y.CameraKind) return $"object[{i}].CameraKind '{x.CameraKind}' != '{y.CameraKind}'";
+            if (x.FollowTargetId != y.FollowTargetId) return $"object[{i}].FollowTargetId {x.FollowTargetId} != {y.FollowTargetId}";
         }
         return null;
     }
