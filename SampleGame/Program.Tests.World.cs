@@ -1,6 +1,5 @@
 using System.Net;
 using System.Runtime.InteropServices;
-using NStack;
 using Nova3DVisualiser;
 using Nova3DVisualiser.AbstractClass;
 using Nova3DVisualiser.Implementation;
@@ -16,7 +15,6 @@ using SampleGame.Textures;
 using SampleGame.Worlds;
 using System.IO.Compression;
 using System.Text.Json;
-using Terminal.Gui;
 
 namespace SampleGame;
 

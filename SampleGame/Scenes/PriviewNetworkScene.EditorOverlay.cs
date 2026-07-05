@@ -112,8 +112,8 @@ public partial class PriviewNetworkScene
     private static string DescribeEntry(EditEntry e) =>
         e.Descriptor.Type == "mesh" ? $"mesh:{e.Descriptor.Mesh}" : e.Descriptor.Type;
 
-    // Visual-Studio-style properties panel for the selected object, framed like the Terminal.Gui
-    // setup dialogs (a titled, bordered box) but drawn via the in-scene UI overlay. The box
+    // Visual-Studio-style properties panel for the selected object — a titled, bordered box drawn
+    // via the in-scene UI overlay. The box
     // auto-sizes to the current content each frame and sits in the top-right corner.
     private void DrawPropertiesPanel()
     {
@@ -180,7 +180,7 @@ public partial class PriviewNetworkScene
         catch { return false; }
     }
 
-    // Draws a bordered box (Terminal.Gui-dialog feel: grey frame, inset green title) via the UI
+    // Draws a bordered box (grey frame, inset green title) via the UI
     // overlay: a top border with the title seated in it, blank framed side rows with the content
     // overlaid, and a bottom border. Auto-sizes to the widest content line. Anchors to the top-right
     // corner by default (the PROPERTIES panel); pass anchorRight:false for a top-left box (the EDIT

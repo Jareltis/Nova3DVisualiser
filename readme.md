@@ -1,8 +1,8 @@
 # Nova3DVisualiser
 
-A real-time 3D engine that renders to the terminal as ASCII art, written in C# / .NET 8. It is a CPU raytracer: every frame it traces rays into the scene, maps brightness to a character gradient, and (on truecolor terminals) tints each cell with 24-bit RGB, drawing the result directly in the console.
+A real-time 3D engine that renders to the terminal as ASCII art, written in C# / .NET 10. It is a raytracer — CPU by default, with an optional GPU path (ILGPU / CUDA) at full parity: every frame it traces rays into the scene, maps brightness to a character gradient, and (on truecolor terminals) tints each cell with 24-bit RGB, drawing the result directly in the console.
 
-It ships with a multiplayer sample app that has a full **in-scene editor**, a **world system** (each scene is one JSON file you can create, save, and reload), a **rich colored-lighting** pipeline, a **real rigid-body physics** layer (a walking first-person character plus believable gravity — angle-of-incidence, rolling, bouncing, friction, mass and 3D spin), and basic TCP networking with chat.
+It ships with a multiplayer sample app that has a full **in-scene editor** (with a reworked, mouse-and-keyboard HUD), a **world system** (each scene is one JSON file you can create, save, and reload), a **rich colored-lighting** pipeline, **PNG textures**, a **real rigid-body physics** layer (a walking first-person character plus believable gravity — angle-of-incidence, rolling, bouncing, friction, mass and 3D spin), a **multi-view camera system**, and basic TCP networking with chat. Its whole UI — including the setup wizard — runs on the engine's own console renderer (no external UI toolkit).
 
 ---
 
@@ -13,6 +13,7 @@ It ships with a multiplayer sample app that has a full **in-scene editor**, a **
 - CPU raytracing rendered to ASCII via a brightness gradient.
 - **Truecolor output**: each cell carries a 24-bit RGB color (`Rgb24`) emitted as ANSI escape codes, so the picture is no longer limited to the 16 console colors. On terminals without truecolor the nearest console color is used.
 - **Two kinds of transparency**: every object has both **object transparency** — the color's **alpha** channel, which makes it see-through (overlapping transparent surfaces composite **front-to-back** via depth peeling, and a transparent object casts a correspondingly lighter shadow) — and **color paleness** (the **Pale** value), a *separate* knob that washes the surface's own color toward white while the object stays fully solid and casts a full shadow.
+- **PNG textures + UV**: any object can wear a **PNG** image (8-bit RGB / RGBA), decoded in-app (no third-party image library). Textures map by per-corner UVs — generated procedurally for the primitives (cube / sphere / cylinder / cone / pyramid / ramp / flatpicture; the sphere uses an **equirectangular** map) and read from the `.obj` for imported meshes. Per object you can set the **tiling** (`TexScale`), **which face** wears it (`TexFace` — e.g. one of a cube's six sides), and the **filtering** — **nearest**, **bilinear**, or **mipmapped** (trilinear minification, so distant / grazing surfaces don't shimmer). Textures render **identically on CPU and GPU** (validated by `gputest`), and in multiplayer the PNG **bytes stream to peers**, so a client without the file still sees the texture.
 - Floating-point lighting pipeline with per-channel **Reinhard tone mapping**, an ambient term, and an adjustable exposure.
 - Smooth (per-vertex-normal) shading, with a Blender-friendly OBJ loader (n-gon fan triangulation, negative/relative indices, geometric-normal fallback).
 - **BVH acceleration** for high-poly meshes, built once in local space and traversed with the ray transformed per frame, so it works even with animated/spinning models.
@@ -61,6 +62,12 @@ Object physics is simulated **by the authority/solo** and each moved body's full
 - **Platform shapes**: square, rectangle, or circle, with configurable size/color.
 - **Live graphics toggles**: flip **shadows** (`F2`), **BVH acceleration** (`F3`), the **camera headlight** (`F4`), and the **floor platform** (`F6`) right in the scene — no need to recreate the world. On a server these changes sync to every client.
 
+### Cameras, views & HUD
+- **You are a body + a camera.** In first person the camera is at your eyes; **F7** cycles to **3rd-person** (behind + above) and **2nd-person** (in front, looking back at you so you see your own face). The external views pull the camera in past any wall in the way; other players always see your avatar.
+- **Placeable cameras.** Spawn a **camera** object (a viewpoint): a **Fixed** camera is a static shot from where you placed it; a **Follow** camera swivels to track a target — your body by default, or any object by id. **F8** cycles the active view through your body and every placed camera — a local, per-peer choice, so clients can look through cameras too.
+- **Split-screen.** **F9** splits the screen 2-way — your active view on the left, the next view in the F8 cycle on the right — two cameras rendered at once.
+- **Three HUD modes.** **PLAY** (a minimal crosshair over full-screen 3D), **overlay-edit** (**Tab** — the editor panels over the 3D), and **docked-edit** (**`** — a Unity/Blender-style layout: the 3D in a centre viewport with a Toolbar on top, a Status bar on the bottom, a navigable **Hierarchy** on the left, and a grouped **Inspector** on the right). Chat is a contained, word-wrapped, scrollable box that never bleeds over the HUD. The whole HUD **reflows when you resize or font-zoom the terminal**.
+
 ### Networking
 - A basic TCP server/client with a shared scene and in-app chat. **Multiple clients** can join one server, and each player sees the others as a small moving **avatar**.
 - The **server is the world authority**: it sends the full world to joining clients — large meshes are split into **chunks** for reliable transfer — then streams live edit deltas, graphics-setting changes, and physics (object positions **and spin**). Clients can fly around and inspect, but only the authority mutates the shared world.
@@ -72,8 +79,8 @@ Object physics is simulated **by the authority/solo** and each moved body's full
 ---
 
 ## Requirements
-- .NET 8 SDK.
-- Windows (keyboard input uses the Win32 API, so the app is currently Windows-only).
+- .NET 10 SDK.
+- Windows (keyboard input uses the Win32 API, and the wizard's mouse support uses the Win32 console API, so the app is currently Windows-only).
 - A terminal that supports 24-bit ANSI color for the best output (Windows Terminal is recommended).
 
 ## Build & Run
@@ -86,7 +93,7 @@ dotnet run --project SampleGame -c Release
 ```
 
 ### Launch setup (the menus before rendering)
-A small Terminal.Gui wizard runs before the render loop:
+A branded setup wizard runs before the render loop. It is drawn by the **engine's own console UI** (no external UI toolkit) and is driven by **keyboard and mouse**; it re-lays-out when you resize the terminal:
 1. **Session mode** — local solo, or online.
 2. **Network role** (online only) — host a **Server** or join as a **Client**.
 3. **World** — **Create** a new world or **Load** a saved one (`worlds/*.json`).
@@ -94,6 +101,8 @@ A small Terminal.Gui wizard runs before the render loop:
 4. **Network** (online only) — listen port (server) or server IP + port (client).
 
 A client that joins a server downloads the host's world automatically.
+
+> **Zoom:** the wizard reflows when you **resize the window** or use **keyboard font-zoom** (Ctrl+= / Ctrl+-). Ctrl+**scroll** font-zoom doesn't resize the wizard (it captures the mouse wheel for clicks) — the in-game 3D still reflows on Ctrl+scroll.
 
 ---
 
@@ -202,9 +211,10 @@ A world object looks like this:
 ```
 - `type` — `mesh`, `cube`, `sphere`, `cylinder`, `cone`, `pyramid`, `ramp`, `flatpicture`, or `light`.
 - `mesh` — the `models/` file name (without `.obj`), for `type: "mesh"`.
-- `texture` — a `textures/` PNG file name (e.g. `"brick.png"`, `""` = none/flat colour): wraps the object with the image. Works on every primitive (cube/sphere/cylinder/cone/pyramid/ramp/flatpicture) **and imported `mesh` objects** (which map by the UVs authored in the `.obj`). > In an online session a peer that lacks the PNG in its own `textures/` folder falls back to flat colour (textures ride sync by file name, not pixels).
+- `texture` — a `textures/` PNG file name (e.g. `"brick.png"`, `""` = none/flat colour): wraps the object with the image. Works on every primitive (cube/sphere/cylinder/cone/pyramid/ramp/flatpicture) **and imported `mesh` objects** (which map by the UVs authored in the `.obj`). In an online session the PNG **bytes are streamed to peers**, so a client without the file still sees the texture (it syncs by file name *and* pixels).
 - `textureScale` — UV tiling factor (default `1`): `2` tiles the texture 2×2 across the surface, `0.5` shows half of it, etc.
 - `textureFace` — which face wears the texture (default `-1` = all faces). For a cube, `0`–`5` select one side (`+X, -X, +Y, -Y, +Z, -Z`); the other faces then show flat colour. Other shapes are a single face (only `-1`/all applies).
+- `textureFilter` — texture sampling: `0` = **nearest** (default), `1` = **bilinear** (smooths magnification), `2` = **mipmapped** (trilinear minification, so distant / grazing surfaces don't shimmer).
 - `position` — world position in units (Y is the vertical axis).
 - `rotation` — initial rotation in radians.
 - `scale` — uniform scale.
@@ -233,7 +243,7 @@ Edit a model or a world JSON and just re-run — no rebuild required.
 ## Project structure
 - `Nova3DVisualiser/` — the engine (library): vector math, shapes, raytracing, the colored-lighting pipeline, truecolor screen output, BVH, OBJ/mesh loading, networking, logging. It is dependency-free.
 - `Nova3DVisualiser.Gpu/` — the optional GPU renderer (depends on the engine + [ILGPU](https://ilgpu.net/)). Keeps the heavy GPU dependency out of the engine; provides `GpuScreen`, the NVIDIA/CUDA raytracing kernel, and the flat scene-snapshot upload.
-- `SampleGame/` — the demo application: the setup wizard, the world system (`worlds/`), the in-scene editor, networking host, and the `models/` mesh library.
+- `SampleGame/` — the demo application: the setup wizard (its own small console-UI toolkit in `SampleGame/WizardUi/` — keyboard + mouse, no external UI library), the world system (`worlds/`), the in-scene editor, networking host, and the `models/` mesh library.
 
 ---
 
@@ -242,7 +252,7 @@ Nova3DVisualiser is a modified and extended version of **Neo3dEngine** by **Ivan
 - Original engine © Ivan Sobolev, licensed under GPL-3.0.
 - Modifications and new features © Jareltis, 2026.
 
-Major changes from the original include: the renamed engine; a rewritten floating-point, **colored** lighting pipeline with per-channel tone mapping and **24-bit truecolor** output; a full multi-light system (point / directional / spot / area, colored emission, light spin, multi-beam spots, and circle/square/triangle cone shapes); smooth shading and a Blender-robust OBJ loader; a JSON **world system** with an **in-scene editor** and live network sync; a **real rigid-body physics** layer (a walking first-person character; gravity where a ball collides with the real mesh surface and rolls down slopes with momentum; per-object collision with AABB/OBB colliders and full 3D Separating-Axis contacts; per-object restitution, mass, friction and 3D tumbling with drift-free quaternion orientation; frame-rate-independent substepping; all under world-level master switches); **diff rendering** of the console; folder-based mesh loading with anchoring; BVH acceleration; bounding-sphere culling for primary and shadow rays; a shadow toggle; timestamped logging; and main-loop improvements (quit key, FPS cap, high-resolution delta time).
+Major changes from the original include: the renamed engine; a rewritten floating-point, **colored** lighting pipeline with per-channel tone mapping and **24-bit truecolor** output; a full multi-light system (point / directional / spot / area, colored emission, light spin, multi-beam spots, and circle/square/triangle cone shapes); smooth shading and a Blender-robust OBJ loader; a JSON **world system** with an **in-scene editor** and live network sync; an **optional GPU renderer** (ILGPU / CUDA) at full CPU-parity; **PNG textures** (UV mapping, bilinear + mipmap filtering, network-synced pixels); a **multi-view camera system** (1st / 2nd / 3rd-person, placeable Fixed / Follow cameras, and split-screen); a reworked three-mode **HUD** (play / overlay-edit / docked Hierarchy + Inspector) with the whole UI — including the setup wizard — on the engine's own console renderer (no external UI toolkit); a **real rigid-body physics** layer (a walking first-person character; gravity where a ball collides with the real mesh surface and rolls down slopes with momentum; per-object collision with AABB/OBB colliders and full 3D Separating-Axis contacts; per-object restitution, mass, friction and 3D tumbling with drift-free quaternion orientation; frame-rate-independent substepping; all under world-level master switches); **diff rendering** of the console; folder-based mesh loading with anchoring; BVH acceleration; bounding-sphere culling for primary and shadow rays; a shadow toggle; timestamped logging; and main-loop improvements (quit key, FPS cap, high-resolution delta time).
 
 ## License
 This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**. Because it is derived from Neo3dEngine (GPL-3.0), Nova3DVisualiser is and must remain GPL-3.0. See the [LICENSE](LICENSE) file for the full text.

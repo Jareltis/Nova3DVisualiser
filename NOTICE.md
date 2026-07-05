@@ -15,7 +15,7 @@ Notable changes from the original:
 - Renamed the engine and all namespaces to Nova3DVisualiser.
 - Rewrote the lighting pipeline to floating point end to end, with multiple summed point lights, an ambient term, and Reinhard tone mapping.
 - Added smooth (per-vertex-normal) shading and a Blender-robust OBJ loader (n-gon fan triangulation, negative/relative indices, geometric-normal fallback).
-- Added folder-based model loading with per-model JSON configuration (position, rotation, scale, color, spin) and a mesh anchoring system.
+- Added folder-based model loading (a pure `.obj` mesh library) with a mesh anchoring system; scene placement (position, rotation, scale, color, spin) lives in the JSON world files.
 - Added a BVH acceleration structure for high-poly meshes, with per-ray local-space traversal so it works with transformed/animated models.
 - Added per-object bounding-sphere culling for both primary and shadow rays.
 - Added an optional shadow toggle and launch-time configuration prompts.
@@ -27,6 +27,6 @@ Because Nova3DVisualiser is derived from Neo3dEngine (GPL-3.0), the entire work 
 
 ## Third-party components
 This project references the following third-party packages via NuGet (their source is not redistributed in this repository):
-- **Terminal.Gui** — © Miguel de Icaza, Tig Kindel, and contributors (the gui-cs project) — MIT License.
+- **ILGPU** and **ILGPU.Algorithms** — © 2016–2025 ILGPU Project (Marcel Koester and contributors) — University of Illinois/NCSA Open Source License. Used only by the optional `Nova3DVisualiser.Gpu` renderer.
 
 The combined work remains licensed under GPL-3.0.
