@@ -247,6 +247,11 @@ dotnet run --project SampleGame -c Release
 
 ---
 
+## Участие
+Nova3DVisualiser пишется исключительно его мейнтейнером и **не принимает вклад в код** — пул-реквесты закрываются без слияния, а форки обратно не вливаются. При этом **отчёты об ошибках, предложения функций и идеи очень приветствуются** через [GitHub Issues](https://github.com/Jareltis/Nova3DVisualiser/issues). Вы вправе форкать и изменять проект в рамках GPL-3.0. Подробности — в [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
 ## Благодарности
 Nova3DVisualiser — это изменённая и расширенная версия **Neo3dEngine** от **Ivan Sobolev** (https://github.com/IvanSobolev/Neo3dEngine), ответвлённая на версии **v0.1.1**.
 - Оригинальный движок © Ivan Sobolev, лицензирован под GPL-3.0.

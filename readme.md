@@ -247,6 +247,11 @@ Edit a model or a world JSON and just re-run — no rebuild required.
 
 ---
 
+## Contributing
+Nova3DVisualiser is written solely by its maintainer and **does not accept code contributions** — pull requests are closed unmerged, and forks are not merged back. **Bug reports, feature requests, and ideas are very welcome** via [GitHub Issues](https://github.com/Jareltis/Nova3DVisualiser/issues). You are free to fork and modify the project under GPL-3.0. See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
+---
+
 ## Credits
 Nova3DVisualiser is a modified and extended version of **Neo3dEngine** by **Ivan Sobolev** (https://github.com/IvanSobolev/Neo3dEngine), forked at version **v0.1.1**.
 - Original engine © Ivan Sobolev, licensed under GPL-3.0.
