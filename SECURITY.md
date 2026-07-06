@@ -12,6 +12,17 @@ Security fixes are made only on the latest release and the `main` branch.
 | 1.0.x (latest release / `main`) | ✅ |
 | older or unreleased commits | ❌ |
 
+## Security model and scope
+
+Nova3DVisualiser's multiplayer is designed for **trusted peers** — a local network
+or a group of friends. The wire protocol is **not authenticated and not
+encrypted**: do not expose a server to the open internet, and do not connect to
+untrusted servers. As defensive measures the server bounds resource use against
+malformed input and floods (allocation, connection, queue, and per-peer rate
+limits), and received meshes and textures are written to a sandboxed folder with
+sanitized filenames. These measures raise the bar against accidental and
+low-effort abuse; they are not a substitute for a trusted network.
+
 ## Reporting a vulnerability
 
 Please report security issues **privately** using GitHub's **"Report a vulnerability"**

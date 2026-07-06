@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — Unreleased
+
+### Added
+- A UDP fast-path for real-time multiplayer: player transforms and physics-sync
+  batches now travel over an unreliable, sequence-filtered UDP channel on the same
+  port, with server-side endpoint learning, automatic fallback to TCP, and
+  MTU-aware chunking of large physics batches. Reliable TCP continues to carry
+  world sync, meshes, textures, live edits, chat, and the join handshake.
+
+### Security
+- Bounded wire-driven allocations (a maximum framed-packet size and per-packet
+  collection counts).
+- Received mesh and texture filenames are sanitized and confined to the assets
+  folder (path-traversal and rooted-path rejection, enforced extensions).
+- PNG decoding caps image dimensions and bounds inflate output (decompression-bomb
+  protection).
+- Chunk reassembly is bounded (maximum parts, concurrent reassemblies, and
+  buffered bytes, with least-recently-used eviction).
+- The incoming packet queue, the concurrent-connection count, and per-peer packet
+  rate are bounded.
+- Added log levels, size-based log rotation, rate-limited anomaly logging,
+  transport counters, and a periodic activity summary.
+
 ## [1.0.0] — 2026-07-05
 
 First tagged release. Nova3DVisualiser is a real-time 3D engine that renders to the terminal
