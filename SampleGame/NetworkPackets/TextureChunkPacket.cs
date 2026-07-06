@@ -19,5 +19,15 @@ public class TextureChunkPacket : INetworkPacket
     public TextureChunkPacket() { }
 
     public void Serialize(BinaryWriter w) { w.Write(TextureName); w.Write(Index); w.Write(Total); w.Write(Data.Length); w.Write(Data); }
-    public void Deserialize(BinaryReader r) { TextureName = r.ReadString(); Index = r.ReadInt32(); Total = r.ReadInt32(); int len = r.ReadInt32(); Data = r.ReadBytes(len); }
+    public void Deserialize(BinaryReader r)
+    {
+        TextureName = r.ReadString();
+        Index = r.ReadInt32();
+        Total = r.ReadInt32();
+        int len = r.ReadInt32();
+        // Reject an out-of-range claimed byte length before ReadBytes(len) allocates.
+        if (!NetLimits.IsFrameLengthValid(len))
+            throw new System.IO.InvalidDataException($"TextureChunk: byte length {len} out of range");
+        Data = r.ReadBytes(len);
+    }
 }

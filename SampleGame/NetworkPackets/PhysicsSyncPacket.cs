@@ -40,7 +40,10 @@ public class PhysicsSyncPacket : INetworkPacket
     public void Deserialize(BinaryReader r)
     {
         int n = r.ReadInt32();
-        if (n < 0) n = 0;
+        // n is an attacker-claimed count read BEFORE the entries — a tiny payload could otherwise force
+        // five multi-GB array allocations. Reject an out-of-range count instead of allocating.
+        if (!NetLimits.IsCollectionCountValid(n))
+            throw new System.IO.InvalidDataException($"PhysicsSync: entry count {n} out of range");
         Ids = new int[n];
         Positions = new Vector3[n];
         LinVel = new Vector3[n];
@@ -54,5 +57,37 @@ public class PhysicsSyncPacket : INetworkPacket
             Rotations[i] = new Vector3(r.ReadSingle(), r.ReadSingle(), r.ReadSingle());
             AngVel[i] = new Vector3(r.ReadSingle(), r.ReadSingle(), r.ReadSingle());
         }
+    }
+
+    // Pure, deterministic chunk factory (no sockets) for the UDP fast-path (plan E, stage E4): split one
+    // physics-sync batch into ≤ maxPerChunk-entry packets so each datagram stays under a safe UDP MTU
+    // (no IP fragmentation). All five arrays are the same length N at the call site; each chunk is itself a
+    // full valid PhysicsSyncPacket, applied per-id on the client. Returns an empty list when N == 0.
+    public static System.Collections.Generic.List<PhysicsSyncPacket> SplitIntoChunks(
+        int[] ids, Vector3[] positions, Vector3[] linVel, Vector3[] rotations, Vector3[] angVel, int maxPerChunk)
+    {
+        if (maxPerChunk < 1) maxPerChunk = 1;
+
+        var chunks = new System.Collections.Generic.List<PhysicsSyncPacket>();
+        int n = ids.Length;
+        for (int start = 0; start < n; start += maxPerChunk)
+        {
+            int count = System.Math.Min(maxPerChunk, n - start);
+            var chunk = new PhysicsSyncPacket
+            {
+                Ids = new int[count],
+                Positions = new Vector3[count],
+                LinVel = new Vector3[count],
+                Rotations = new Vector3[count],
+                AngVel = new Vector3[count],
+            };
+            System.Array.Copy(ids, start, chunk.Ids, 0, count);
+            System.Array.Copy(positions, start, chunk.Positions, 0, count);
+            System.Array.Copy(linVel, start, chunk.LinVel, 0, count);
+            System.Array.Copy(rotations, start, chunk.Rotations, 0, count);
+            System.Array.Copy(angVel, start, chunk.AngVel, 0, count);
+            chunks.Add(chunk);
+        }
+        return chunks;
     }
 }

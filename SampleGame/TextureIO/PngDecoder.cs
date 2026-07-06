@@ -23,6 +23,15 @@ public static class PngDecoder
     /// <summary>Decoded image: dimensions + a row-major RGBA pixel buffer (row 0 first).</summary>
     public readonly record struct Image(int Width, int Height, Rgba32[] Pixels);
 
+    // Bomb / giant-allocation guard: width*height drives every downstream allocation (`expected`, the
+    // pixel array), and a tiny IDAT can inflate to gigabytes. Textures in this engine are small; these
+    // caps are generous. Tunable.
+    public const int MaxDimension = 8192;
+    public const int MaxPixels = 16_000_000;   // ~16 MP → RGBA buffer ≤ ~64 MB; bounds `expected` and the pixel array
+
+    public static bool IsSizeValid(int width, int height) =>
+        width > 0 && height > 0 && width <= MaxDimension && height <= MaxDimension && (long)width * height <= MaxPixels;
+
     private static readonly byte[] Signature = { 137, 80, 78, 71, 13, 10, 26, 10 };
 
     public static Image Decode(byte[] bytes)
@@ -58,8 +67,11 @@ public static class PngDecoder
                     interlace = bytes[dataStart + 12];
                     haveIhdr = true;
 
-                    if (width <= 0 || height <= 0)
-                        throw new InvalidDataException("PNG: non-positive dimensions.");
+                    // Reject a giant image BEFORE any large allocation or inflate (rejects non-positive too).
+                    // With this cap, stride = width*channels and expected = height*(stride+1) stay well within
+                    // int (expected ≤ ~64 M), so no overflow guard is needed downstream.
+                    if (!IsSizeValid(width, height))
+                        throw new InvalidDataException($"PNG: dimensions {width}x{height} exceed limits (max {MaxDimension}px per side, {MaxPixels} pixels total).");
                     if (bitDepth != 8)
                         throw new NotSupportedException($"PNG: unsupported bit depth {bitDepth} (only 8-bit is supported).");
                     if (colorType != 2 && colorType != 6)
@@ -109,9 +121,21 @@ public static class PngDecoder
     {
         using var input = new MemoryStream(zlib);
         using var z = new ZLibStream(input, CompressionMode.Decompress);
-        using var outMs = new MemoryStream(expectedLen > 0 ? expectedLen : 0);
-        z.CopyTo(outMs);
-        return outMs.ToArray();
+        if (expectedLen <= 0) return Array.Empty<byte>();
+        // Bounded: Unfilter needs exactly expectedLen bytes; read AT MOST that many and STOP — never
+        // drain a decompression bomb (a tiny IDAT inflating to gigabytes). expectedLen is IHDR-capped.
+        byte[] outp = new byte[expectedLen];
+        int total = 0;
+        while (total < expectedLen)
+        {
+            int n = z.Read(outp, total, expectedLen - total);
+            if (n == 0) break;   // stream ended early → return short buffer; caller throws "shorter than expected"
+            total += n;
+        }
+        if (total == expectedLen) return outp;
+        byte[] shorter = new byte[total];
+        Array.Copy(outp, shorter, total);
+        return shorter;
     }
 
     // Reverse the PNG per-scanline filters (0 None, 1 Sub, 2 Up, 3 Average, 4 Paeth) into a tightly

@@ -2,7 +2,7 @@
 
 *(На русском — [readmeRU.md](readmeRU.md))*
 
-A multiplayer **ASCII 3D raytracer** that renders straight to the terminal, written in C# / **.NET 10**. It runs on a multithreaded CPU renderer by default, with an optional **GPU** path (ILGPU / CUDA) at pixel-for-pixel parity. It ships with a full in-scene editor, a JSON world system, real rigid-body physics, PNG textures, and TCP multiplayer — and its whole UI, including the setup wizard, runs on the engine's own console renderer, with **no external UI toolkit**.
+A multiplayer **ASCII 3D raytracer** that renders straight to the terminal, written in C# / **.NET 10**. It runs on a multithreaded CPU renderer by default, with an optional **GPU** path (ILGPU / CUDA) at pixel-for-pixel parity. It ships with a full in-scene editor, a JSON world system, real rigid-body physics, PNG textures, and TCP + UDP multiplayer — and its whole UI, including the setup wizard, runs on the engine's own console renderer, with **no external UI toolkit**.
 
 ## Features
 
@@ -14,7 +14,7 @@ A multiplayer **ASCII 3D raytracer** that renders straight to the terminal, writ
 - **Real rigid-body physics** — an impulse-based solver: gravity, per-object collision (AABB/OBB), friction, rolling friction, restitution, mass, 3D tumbling, solid stacks, and a walking first-person character.
 - **World system + in-scene editor** — each scene is one `worlds/*.json`; spawn, move, edit, and save objects live.
 - **Cameras & HUD** — 1st/2nd/3rd-person body views, placeable Fixed/Follow cameras, split-screen, and three HUD modes (play / overlay / docked).
-- **Multiplayer** — TCP server/client with world sync (chunked meshes), physics sync, live edits, and chat.
+- **Multiplayer** — TCP + UDP server/client: reliable TCP for world sync (chunked meshes), edits, spawns and chat; an unreliable UDP fast-path (latest-wins, MTU-chunked, TCP fallback) for player transforms and physics sync.
 
 ## Quick start
 

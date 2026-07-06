@@ -99,8 +99,11 @@ public partial class PriviewNetworkScene
         // a disconnect can map it back.
         if (_isServer && _netManager != null)
         {
-            _netManager.SendPacket(packet, senderId);
-            _connToNet[_netManager.LastSenderConnId] = senderId;
+            _netManager.SendPacketUnreliable(packet, senderId);   // E2: re-broadcast rides UDP too
+            // A UDP-delivered transform carries LastSenderConnId == -1; guard so it can't clobber the real
+            // connId->netId map (which now comes from OnWorldRequested over TCP). No-op on UDP, correct on
+            // the rare TCP-fallback transform.
+            RecordConnMappingIfTcp(_netManager.LastSenderConnId, senderId);
         }
 
         if (senderId == _myNetId) return;

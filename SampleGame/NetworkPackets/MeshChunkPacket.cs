@@ -18,5 +18,8 @@ public class MeshChunkPacket : INetworkPacket
     public MeshChunkPacket() { }
 
     public void Serialize(BinaryWriter w) { w.Write(MeshName); w.Write(Index); w.Write(Total); w.Write(Data); }
+    // NOTE (S1): the fields are ReadString (a BinaryReader 7-bit length prefix) — already bounded by the
+    // ReadLoop frame cap (NetLimits.MaxFrameBytes), since the reader can never read past the framed payload.
+    // So no explicit count/len guard is needed here (unlike the ReadBytes(len)/allocate-by-count packets).
     public void Deserialize(BinaryReader r) { MeshName = r.ReadString(); Index = r.ReadInt32(); Total = r.ReadInt32(); Data = r.ReadString(); }
 }

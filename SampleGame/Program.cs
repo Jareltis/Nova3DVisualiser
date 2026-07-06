@@ -34,6 +34,8 @@ partial class Program
         if (args.Length > 0 && args[0] == "gputest") { GpuSelfTest(); return; }
         if (args.Length > 0 && args[0] == "texturetest") { TextureSelfTest(); return; }
         if (args.Length > 0 && args[0] == "splashtest") { SplashSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "securitytest") { SecuritySelfTest(); return; }          // S1+S2: wire-alloc caps + received-file name sanitization (no sockets/fs)
+        if (args.Length > 0 && args[0] == "udptest") { UdpSelfTest(); return; }                   // plan E stage E1: pure UDP framing + seq-filter (no sockets)
         if (args.Length > 0 && args[0] == "uitest") { WizardUi.UiSelfTest.Run(); return; }        // Variant B (engine-renderer wizard) toolkit tests
         if (args.Length > 0 && args[0] == "uidemo") { WizardUi.UiDemo.Run(); return; }            // Variant B stage-1 interactive demo (font-zoom check)
 

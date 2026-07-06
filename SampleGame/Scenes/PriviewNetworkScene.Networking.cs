@@ -30,6 +30,10 @@ public partial class PriviewNetworkScene
         var live = BuildLiveWorldConfig();
         var sync = WorldSync.Pack(live, AppPaths.ModelsFolder, AppPaths.TexturesFolder);
         int connId = _netManager?.LastSenderConnId ?? -1;
+        // WorldRequestPacket arrives over TCP (~1/s until the client has the world), so this is the reliable
+        // place the server learns connId->netId now that transforms ride UDP. connId is stable for the
+        // connection's lifetime, so recording it here (once per request is harmless) suffices.
+        RecordConnMappingIfTcp(connId, senderId);
 
         // Stream every LARGE referenced texture (too big to inline) as chunks to THIS requester FIRST, so
         // that — TCP being reliable + ordered — the peer materializes them to disk before the world packet
@@ -203,17 +207,13 @@ public partial class PriviewNetworkScene
     // to disk. The trailing spawn WorldEditPacket (Op 1, empty MeshObjText) then builds it from disk.
     private void OnMeshChunkReceived(MeshChunkPacket packet, int senderId)
     {
-        if (!_meshChunks.TryGetValue(packet.MeshName, out var buf) || buf.parts.Length != packet.Total)
-        {
-            buf = (packet.Total, new string[packet.Total]);
-            _meshChunks[packet.MeshName] = buf;
-        }
-        if (packet.Index < 0 || packet.Index >= buf.total) return;   // out-of-range guard
-        buf.parts[packet.Index] = packet.Data;
-
-        if (buf.parts.Any(p => p == null)) return;   // still waiting on parts
-        MaterializeMesh(packet.MeshName, string.Concat(buf.parts));
-        _meshChunks.Remove(packet.MeshName);
+        // Bounded reassembly (S4): caps Total / concurrent names / buffered bytes, LRU-evicts, and drops an
+        // out-of-range index or total. A legit multi-part mesh reassembles + materializes exactly as before.
+        var outcome = _meshReassembler.Accept(packet.MeshName, packet.Index, packet.Total, packet.Data,
+                                              packet.Data?.Length ?? 0, out var parts, out var reason);
+        if (outcome == ChunkOutcome.Rejected) { Logger.Anomaly("chunk-reject", $"mesh chunk '{packet.MeshName}' rejected: {reason}"); return; }
+        if (outcome == ChunkOutcome.Completed) MaterializeMesh(packet.MeshName, string.Concat(parts!));
+        // Pending → nothing to do.
     }
 
     // Client: a slice of a streamed texture arrived — buffer by Index; once all parts are present,
@@ -221,31 +221,32 @@ public partial class PriviewNetworkScene
     // for a BINARY payload. Ordered before the WorldSyncPacket by TCP, so the file is on disk in time.
     private void OnTextureChunkReceived(TextureChunkPacket packet, int senderId)
     {
-        if (!_textureChunks.TryGetValue(packet.TextureName, out var buf) || buf.parts.Length != packet.Total)
-        {
-            buf = (packet.Total, new byte[packet.Total][]);
-            _textureChunks[packet.TextureName] = buf;
-        }
-        if (packet.Index < 0 || packet.Index >= buf.total) return;   // out-of-range guard
-        buf.parts[packet.Index] = packet.Data;
+        // Bounded reassembly (S4), mirroring OnMeshChunkReceived but for a BINARY payload.
+        var outcome = _textureReassembler.Accept(packet.TextureName, packet.Index, packet.Total, packet.Data,
+                                                 packet.Data?.Length ?? 0, out var parts, out var reason);
+        if (outcome == ChunkOutcome.Rejected) { Logger.Anomaly("chunk-reject", $"texture chunk '{packet.TextureName}' rejected: {reason}"); return; }
+        if (outcome != ChunkOutcome.Completed) return;   // Pending
 
-        if (buf.parts.Any(p => p == null)) return;   // still waiting on parts
-        int totalLen = buf.parts.Sum(p => p.Length);
+        int totalLen = 0;
+        foreach (var p in parts!) totalLen += p.Length;
         byte[] full = new byte[totalLen];
         int off = 0;
-        foreach (var part in buf.parts) { Array.Copy(part, 0, full, off, part.Length); off += part.Length; }
+        foreach (var part in parts!) { Array.Copy(part, 0, full, off, part.Length); off += part.Length; }
         MaterializeTexture(packet.TextureName, full);
-        _textureChunks.Remove(packet.TextureName);
     }
 
     // Writes one received mesh to received/<name>.obj (idempotent overwrite). Shared by the 4b
     // bulk world download and the 5b Spawn handler that streams a brand-new mesh in real time.
     private static void MaterializeMesh(string name, string objText)
     {
+        // `name` is attacker-controlled (packet.MeshName) — confine it to received/ before writing, or a
+        // "../../evil.obj" would be an arbitrary file write. SafeCombine enforces the ".obj" extension.
+        string? path = ReceivedFile.SafeCombine(AppPaths.ReceivedFolder, name, ".obj");
+        if (path == null) { Logger.Anomaly("unsafe-file-name", $"rejected received mesh with unsafe name '{name}'"); return; }
         try
         {
             Directory.CreateDirectory(AppPaths.ReceivedFolder);
-            File.WriteAllText(Path.Combine(AppPaths.ReceivedFolder, name + ".obj"), objText);
+            File.WriteAllText(path, objText);
         }
         catch (Exception ex) { Logger.Error($"Failed writing received mesh '{name}'", ex); }
     }
@@ -254,10 +255,14 @@ public partial class PriviewNetworkScene
     // (idempotent overwrite), where the loader decodes it exactly like a local file. Mirrors MaterializeMesh.
     private static void MaterializeTexture(string name, byte[] pngBytes)
     {
+        // `name` is attacker-controlled (packet.TextureName) — confine it to received/textures/ before
+        // writing, or a traversal/absolute name would be an arbitrary file write.
+        string? path = ReceivedFile.SafeCombine(AppPaths.ReceivedTexturesFolder, name, ".png");
+        if (path == null) { Logger.Anomaly("unsafe-file-name", $"rejected received texture with unsafe name '{name}'"); return; }
         try
         {
             Directory.CreateDirectory(AppPaths.ReceivedTexturesFolder);
-            File.WriteAllBytes(Path.Combine(AppPaths.ReceivedTexturesFolder, name), pngBytes);
+            File.WriteAllBytes(path, pngBytes);
         }
         catch (Exception ex) { Logger.Error($"Failed writing received texture '{name}'", ex); }
     }
@@ -269,8 +274,11 @@ public partial class PriviewNetworkScene
     {
         var list = new List<TextureChunkPacket>();
         if (string.IsNullOrWhiteSpace(name)) return list;
+        // `name` may come from a received world config — confine the read to `folder` (no traversal).
+        string? safePath = ReceivedFile.SafeCombine(folder, name, ".png");
+        if (safePath == null) { Logger.Warning($"Texture push: rejected unsafe name '{name}'"); return list; }
         byte[] bytes;
-        try { bytes = File.ReadAllBytes(Path.Combine(folder, name)); }
+        try { bytes = File.ReadAllBytes(safePath); }
         catch (Exception ex) { Logger.Error($"Texture push: failed reading '{name}' from {folder}", ex); return list; }
         int total = Math.Max(1, (bytes.Length + MeshChunkSize - 1) / MeshChunkSize);
         for (int i = 0; i < total; i++)

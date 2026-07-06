@@ -27,6 +27,7 @@ public partial class PriviewNetworkScene
     private readonly Dictionary<int, NetTarget> _physTargets = new();  // client: id -> eased target
     private int _physFrame = 0;                                        // server: sync throttle counter
     private const int PhysicsSyncEvery = 3;                            // send a batch every Nth frame (~20 Hz @60fps)
+    private const int MaxSyncEntries = 20;                             // E4: chunk a flush at ≤20 entries/datagram — 20×52B + 4 count + 12 UDP header ≈ 1056B, safely under ~1200 (no IP fragmentation)
     private const float PhysLerpRate = 12f;                            // client ease speed toward target (1/sec)
 
     // Client-side interpolation target for one synced object: last authoritative position + velocity.
@@ -192,10 +193,16 @@ public partial class PriviewNetworkScene
         }
         _physMoved.Clear();
         if (ids.Count == 0) return;
-        _netManager.SendPacket(new PhysicsSyncPacket
-        {
-            Ids = ids.ToArray(), Positions = pos.ToArray(), LinVel = vel.ToArray(), Rotations = rot.ToArray(), AngVel = ang.ToArray(),
-        }, _myNetId);
+        // E3/E4: server->clients physics batch rides UDP. E4 splits a flush into ≤MaxSyncEntries-entry
+        // datagrams (each < ~1200 B → no IP fragmentation) that SHARE one seq, so the receive-side filter
+        // (monotonic non-decreasing) can't drop a chunk on intra-flush reorder. A strictly-older flush's
+        // stragglers are still dropped (latest full frame wins), and a lost chunk/flush is absorbed by the
+        // per-id apply + dead-reckoning/easing (OnPhysicsSyncReceived overwrites _physTargets[id];
+        // StepInterpolate coasts between batches). A flush of ≤MaxSyncEntries objects is exactly one
+        // datagram — identical to E3. SendPacketUnreliableGroup falls back to TCP until the server has
+        // learned the client's UDP endpoint (~1 frame after join, via E2).
+        var chunks = PhysicsSyncPacket.SplitIntoChunks(ids.ToArray(), pos.ToArray(), vel.ToArray(), rot.ToArray(), ang.ToArray(), MaxSyncEntries);
+        _netManager.SendPacketUnreliableGroup(chunks, _myNetId);
     }
 
     // Client: a position batch arrived (main thread, via ProcessEvents). Store/refresh each object's

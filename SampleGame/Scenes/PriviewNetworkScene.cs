@@ -25,14 +25,27 @@ public partial class PriviewNetworkScene : Scene
     private readonly Dictionary<int, Object3d> _remotePlayers = new();
     private readonly Dictionary<int, int> _connToNet = new();   // server: connId -> peer netId (for disconnect cleanup)
 
+    // Server: record connId -> peer netId, but ONLY for a real TCP connection (connId >= 0). A
+    // UDP-delivered packet has LastSenderConnId == -1 (UdpReadLoop marker) and must NOT clobber this map,
+    // or OnClientDisconnectedServer(connId) could no longer find the departed peer to remove its avatar.
+    private void RecordConnMappingIfTcp(int connId, int senderId)
+    {
+        if (connId >= 0) _connToNet[connId] = senderId;
+    }
+
+    // Headless test hooks (E2 conn-map regression guard) — no sockets.
+    public bool ConnMappingForTest(int connId, int senderId) { RecordConnMappingIfTcp(connId, senderId); return true; }
+    public bool ConnMapTryGetForTest(int connId, out int netId) => _connToNet.TryGetValue(connId, out netId);
+
     // Large-mesh streaming: a big live spawn is split into chunks sent a few per frame so other
     // packets interleave. Small meshes still inline in one WorldEditPacket.
     private const int MeshChunkThreshold = 49152;   // .obj text <= this bytes inlines as today
     private const int MeshChunkSize = 16384;        // chunk payload length (chars)
     private const int ChunksPerFrame = 2;           // outgoing actions drained per Update
     private readonly Queue<Action> _outgoing = new();                            // server: paced mesh-chunk + spawn sends
-    private readonly Dictionary<string, (int total, string[] parts)> _meshChunks = new();   // client: mesh reassembly buffer
-    private readonly Dictionary<string, (int total, byte[][] parts)> _textureChunks = new();   // client: texture (PNG bytes) reassembly buffer
+    // client: bounded mesh/texture reassembly (S4 — caps Total, concurrent names, and total buffered bytes; LRU-evicts)
+    private readonly ChunkReassembler<string> _meshReassembler = new(NetLimits.MaxChunkParts, NetLimits.MaxConcurrentReassemblies, NetLimits.MaxReassemblyBytes);
+    private readonly ChunkReassembler<byte[]> _textureReassembler = new(NetLimits.MaxChunkParts, NetLimits.MaxConcurrentReassemblies, NetLimits.MaxReassemblyBytes);
 
     readonly Camera _myCamera;
     readonly Light _mainLight;
@@ -405,6 +418,14 @@ public partial class PriviewNetworkScene : Scene
                     return null;
                 }
 
+                // A received world config's mesh name is attacker-controlled — confine it to _modelsFolder
+                // (received/ on a client) before loading. Validate only; LoadRawMesh rebuilds the same path.
+                if (ReceivedFile.SafeCombine(_modelsFolder, o.Mesh, ".obj") == null)
+                {
+                    Logger.Warning($"Rejected world mesh with unsafe name '{o.Mesh}'; skipping.");
+                    return null;
+                }
+
                 Object3d? mesh = ModelLoader.LoadRawMesh(_modelsFolder, o.Mesh);
                 if (mesh == null)
                 {
@@ -617,7 +638,7 @@ public partial class PriviewNetworkScene : Scene
             // the player's OWN facing (_bodyLook), not the render camera's LocalRotate — 2nd person / a placed
             // camera override the latter to look back/at a target, which must not rotate the streamed avatar.
             var packet = new TransformPacket(_localBody.Position, _bodyLook);
-            _netManager.SendPacket(packet, _myNetId);
+            _netManager.SendPacketUnreliable(packet, _myNetId);   // E2: hot path rides UDP (latest-wins drops stale; a lost datagram just holds the last pose one frame)
         }
 
         // Drain a few paced mesh-chunk/spawn sends so a big live spawn doesn't block other packets.

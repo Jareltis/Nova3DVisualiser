@@ -1303,6 +1303,23 @@ partial class Program
             ok &= fixOk;
         }
 
+        // E2 — conn-map fix: RecordConnMappingIfTcp records a real TCP connId, but a UDP-delivered packet
+        // (LastSenderConnId == -1) must NOT create a [-1] entry or clobber an existing mapping — otherwise
+        // disconnect avatar cleanup regresses once transforms ride UDP.
+        {
+            var cm = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig { Name = "connmap",
+                Platform = new PlatformConfig { Enabled = false }, Objects = new List<WorldObject>() },
+                isServer: false, "127.0.0.1", 0, online: false);
+            cm.ConnMappingForTest(connId: 5, senderId: 42);
+            bool tcpRecorded = cm.ConnMapTryGetForTest(5, out int n) && n == 42;   // TCP connId is recorded
+            cm.ConnMappingForTest(connId: -1, senderId: 99);
+            bool udpNoEntry = !cm.ConnMapTryGetForTest(-1, out _);                 // UDP (-1) creates no entry
+            bool tcpIntact = cm.ConnMapTryGetForTest(5, out int n2) && n2 == 42;   // earlier mapping not clobbered
+            bool connOk = tcpRecorded && udpNoEntry && tcpIntact;
+            Console.WriteLine($"  connmap-tcp-vs-udp: tcpRecorded={tcpRecorded}, udpNoEntry={udpNoEntry}, tcpIntact={tcpIntact} -> {(connOk ? "ok" : "BAD")}");
+            ok &= connOk;
+        }
+
         Console.WriteLine(ok ? "EDITOR TEST PASSED" : "EDITOR TEST FAILED");
     }
 
@@ -1511,6 +1528,48 @@ partial class Program
                 && Math.Abs(recv.AngVel[0].X - 1.5f) < 1e-5f && Math.Abs(recv.AngVel[1].Y - 3f) < 1e-5f;
             Console.WriteLine($"PhysicsSync round-trip: {pbytes.Length} bytes, n={recv.Ids.Length}, pos1.Y={recv.Positions[1].Y:F2}, linVel0=({recv.LinVel[0].X:F1},{recv.LinVel[0].Y:F1},{recv.LinVel[0].Z:F1}), rot0.Y={recv.Rotations[0].Y:F2}, angvel0.X={recv.AngVel[0].X:F2} -> {(psOk ? "ok" : "BAD")}");
             if (!psOk) { Fail("PhysicsSync packet round-trip lost fields."); return; }
+        }
+
+        // PhysicsSync chunking (E4): SplitIntoChunks slices a batch into ≤maxPerChunk-entry packets that
+        // together reproduce the source order — so a chunked UDP flush loses nothing.
+        {
+            int N = 45;
+            var ids = new int[N]; var posn = new Vector3[N]; var lin = new Vector3[N]; var rota = new Vector3[N]; var angv = new Vector3[N];
+            for (int i = 0; i < N; i++)
+            {
+                ids[i] = 1000 + i;
+                posn[i] = new Vector3(i, i * 2, i * 3);
+                lin[i] = new Vector3(-i, i, -i * 2);
+                rota[i] = new Vector3(i * 0.01f, i * 0.02f, i * 0.03f);
+                angv[i] = new Vector3(i * 0.1f, -i * 0.1f, i * 0.2f);
+            }
+
+            var chunks = PhysicsSyncPacket.SplitIntoChunks(ids, posn, lin, rota, angv, 20);
+
+            // 45 @ 20/chunk → 3 chunks sized 20/20/5; concatenation reproduces the source order + values.
+            bool sizeOk = chunks.Count == 3 && chunks[0].Ids.Length == 20 && chunks[1].Ids.Length == 20 && chunks[2].Ids.Length == 5;
+            bool orderOk = true;
+            int flat = 0;
+            foreach (var c in chunks)
+            {
+                for (int j = 0; j < c.Ids.Length; j++)
+                {
+                    if (c.Ids[j] != ids[flat] || c.Positions[j] != posn[flat] || c.LinVel[j] != lin[flat]
+                        || c.Rotations[j] != rota[flat] || c.AngVel[j] != angv[flat]) orderOk = false;
+                    flat++;
+                }
+            }
+            bool countOk = flat == N;
+
+            // Edge cases: exact multiple, one-over, and empty.
+            bool edgeOk =
+                PhysicsSyncPacket.SplitIntoChunks(new int[20], new Vector3[20], new Vector3[20], new Vector3[20], new Vector3[20], 20).Count == 1
+                && PhysicsSyncPacket.SplitIntoChunks(new int[21], new Vector3[21], new Vector3[21], new Vector3[21], new Vector3[21], 20) is { Count: 2 } c21 && c21[0].Ids.Length == 20 && c21[1].Ids.Length == 1
+                && PhysicsSyncPacket.SplitIntoChunks(new int[0], new Vector3[0], new Vector3[0], new Vector3[0], new Vector3[0], 20).Count == 0;
+
+            bool chunkSplitOk = sizeOk && orderOk && countOk && edgeOk;
+            Console.WriteLine($"PhysicsSync chunking: N={N}/max20 -> {chunks.Count} chunks (20/20/5), order={orderOk}, edges(20->1,21->2,0->0)={edgeOk} -> {(chunkSplitOk ? "ok" : "BAD")}");
+            if (!chunkSplitOk) { Fail("PhysicsSync SplitIntoChunks sizing/order/edge mismatch."); return; }
         }
 
         // Split/reassemble: cut a long string into MeshChunkSize pieces, reassemble by Index, compare.

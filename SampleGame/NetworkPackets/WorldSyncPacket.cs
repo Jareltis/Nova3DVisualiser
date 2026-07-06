@@ -41,6 +41,9 @@ public class WorldSyncPacket : INetworkPacket
         ConfigJson = r.ReadString();
         MeshTexts = new Dictionary<string, string>();
         int count = r.ReadInt32();
+        // Reject an out-of-range claimed count before looping (allocate-by-count guard).
+        if (!NetLimits.IsCollectionCountValid(count))
+            throw new System.IO.InvalidDataException($"WorldSync: mesh count {count} out of range");
         for (int i = 0; i < count; i++)
         {
             string name = r.ReadString();
@@ -49,10 +52,15 @@ public class WorldSyncPacket : INetworkPacket
         }
         TextureData = new Dictionary<string, byte[]>();
         int texCount = r.ReadInt32();
+        if (!NetLimits.IsCollectionCountValid(texCount))
+            throw new System.IO.InvalidDataException($"WorldSync: texture count {texCount} out of range");
         for (int i = 0; i < texCount; i++)
         {
             string name = r.ReadString();
             int len = r.ReadInt32();
+            // Reject an out-of-range per-texture byte length before ReadBytes(len) allocates.
+            if (!NetLimits.IsFrameLengthValid(len))
+                throw new System.IO.InvalidDataException($"WorldSync: texture byte length {len} out of range");
             byte[] bytes = r.ReadBytes(len);
             TextureData[name] = bytes;
         }

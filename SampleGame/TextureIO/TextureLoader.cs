@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using Nova3DVisualiser;
 using Nova3DVisualiser.Logging;
+using SampleGame.Worlds;
 
 namespace SampleGame.Textures;
 
@@ -55,7 +56,10 @@ public static class TextureLoader
         if (string.IsNullOrWhiteSpace(fileName)) return null;
         fileName = fileName.Trim();
 
-        string path = Path.Combine(folder, fileName);
+        // `fileName` can arrive from a received world config (via ApplyToInstance) — confine the read to
+        // `folder`, so a hostile "../../secret" name can't be read off disk. null → flat-colour fallback.
+        string? path = ReceivedFile.SafeCombine(folder, fileName, ".png");
+        if (path == null) { Logger.Warning($"Rejected texture with unsafe name '{fileName}'"); return null; }
         lock (_lock)
         {
             LogFolderOnce(folder);
