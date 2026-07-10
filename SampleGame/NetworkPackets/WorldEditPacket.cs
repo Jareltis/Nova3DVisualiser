@@ -10,9 +10,11 @@ namespace SampleGame.NetworkPackets;
 /// </summary>
 public class WorldEditPacket : INetworkPacket
 {
-    public byte Op;                    // 0 = Modify, 1 = Spawn, 2 = Delete (1/2 reserved for 5b)
-    public int Id;                     // target object's stable WorldObject.Id
-    public string ObjectJson = "";     // the WorldObject (System.Text.Json) for Modify/Spawn; empty for Delete
+    // Object ops: 0 = Modify, 1 = Spawn, 2 = Delete. Joint ops (C1-5, same wire fields, no format change):
+    // 3 = JointModify, 4 = JointSpawn (both carry a JointConfig in ObjectJson), 5 = JointDelete (Id only).
+    public byte Op;
+    public int Id;                     // target object's WorldObject.Id, or a joint's JointConfig.Id (3/4/5)
+    public string ObjectJson = "";     // a WorldObject (0/1) or a JointConfig (3/4), System.Text.Json; empty for Delete (2/5)
     public string MeshName = "";       // 5b: name of a streamed brand-new mesh; empty in this pass
     public string MeshObjText = "";    // 5b: the streamed mesh's .obj text; empty in this pass
 

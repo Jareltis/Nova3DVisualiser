@@ -1,4 +1,6 @@
+using System;
 using Nova3DVisualiser;
+using Nova3DVisualiser.Logging;
 using SampleGame.Scenes;
 using Quat = SampleGame.Physics.Quat;
 
@@ -9,7 +11,7 @@ namespace SampleGame.Physics;
 // IntegrateQuat, ClosestPointOnTriangle, the world inverse-inertia rotation R·I⁻¹·Rᵀ); it only
 // replaces the integration + contact-resolution ARCHITECTURE.
 
-public enum ColliderKind { Sphere, Box, Mesh }
+public enum ColliderKind { Sphere, Box, Mesh, Hull }
 
 // One rigid body. A STATIC body has InvMass == 0 (and InvInertiaLocal == 0) and is never moved;
 // a DYNAMIC body carries inverse mass + principal inverse inertia. The collision SHAPE travels
@@ -30,6 +32,12 @@ public sealed class RigidBody
     public Vector3 HalfExtents;             // Box (centred at Position, oriented by Orientation)
     public Vector3[]? MeshVerts;            // Mesh (world-space vertices)
     public int[]? MeshTris;                 // Mesh (flattened triangle indices, 3 per face)
+    public ConvexHull? Hull;                // Hull (C2-3a): a convex polyhedron in the body's LOCAL frame, centred at the COM
+    // C2-5: the COM DynamicHull used to centre the hull, expressed IN THE FRAME of the localVertices argument (i.e.
+    // BEFORE the Translate(−com) centring) — the hull analogue of an Object3d's LocalCenter·Scale. The scene bridge
+    // places the body at HullLocalCom.Rotate(rot)+objectPos and backs it out on sync-back, so a dynamic mesh doesn't
+    // drift by its COM offset. For the degenerate box fallback it is the AABB centre (identical offset math).
+    public Vector3 HullLocalCom;
     // Stage 2: a static MESH body ALSO carries a box view (its solid world AABB, Position/HalfExtents/
     // Orientation set at build time) so a dynamic BOX can rest on it via the box manifold while a dynamic
     // SPHERE still uses the real triangles (MeshVerts). BoxView is true once those box fields are valid.
@@ -105,6 +113,45 @@ public sealed class RigidBody
             I.X > 0f ? 1f / I.X : 0f,
             I.Y > 0f ? 1f / I.Y : 0f,
             I.Z > 0f ? 1f / I.Z : 0f);
+    }
+
+    // Dynamic convex HULL (C2-3a). `localVertices` is a point cloud in the SPAWN frame; the convex hull is built,
+    // its closed-polyhedron mass properties (COM + diagonal inertia) computed, and the hull vertices RE-CENTRED on
+    // the COM so Position == the COM (mirrors DynamicBox's centre-of-mass handling). Degenerate input (Build fails
+    // on a coincident/collinear/coplanar cloud) falls back to a small dynamic box from the points' AABB (logged),
+    // so the body is never left null-shaped.
+    public static RigidBody DynamicHull(Vector3[] localVertices, float mass)
+    {
+        var hull = ConvexHull.Build(localVertices);
+        if (hull == null)
+        {
+            Vector3 mn = localVertices.Length > 0 ? localVertices[0] : Vector3.Zero, mx = mn;
+            for (int i = 1; i < localVertices.Length; i++)
+            {
+                Vector3 v = localVertices[i];
+                mn = new Vector3(MathF.Min(mn.X, v.X), MathF.Min(mn.Y, v.Y), MathF.Min(mn.Z, v.Z));
+                mx = new Vector3(MathF.Max(mx.X, v.X), MathF.Max(mx.Y, v.Y), MathF.Max(mx.Z, v.Z));
+            }
+            Vector3 center = (mn + mx) * 0.5f;
+            Vector3 half = (mx - mn) * 0.5f;
+            half = new Vector3(MathF.Max(half.X, 1e-3f), MathF.Max(half.Y, 1e-3f), MathF.Max(half.Z, 1e-3f));
+            Logger.Warning("RigidBody.DynamicHull: degenerate point cloud; falling back to a dynamic box AABB.");
+            var fb = DynamicBox(center, half, Quat.Identity, mass);
+            fb.HullLocalCom = center;                      // AABB centre — same offset math as a hull COM (keeps the bridge's place/sync consistent)
+            return fb;
+        }
+
+        hull.ComputeMassProperties(mass, out Vector3 com, out Vector3 inertia);
+        hull.Translate(-com);                              // re-centre so the hull is about its COM (Position == COM)
+        return new RigidBody
+        {
+            Position = com, Kind = ColliderKind.Hull, Hull = hull, HullLocalCom = com,
+            InvMass = mass > 0f ? 1f / mass : 0f,
+            InvInertiaLocal = new Vector3(
+                inertia.X > 0f ? 1f / inertia.X : 0f,
+                inertia.Y > 0f ? 1f / inertia.Y : 0f,
+                inertia.Z > 0f ? 1f / inertia.Z : 0f),
+        };
     }
 
     public static RigidBody StaticSphere(Vector3 pos, float radius)

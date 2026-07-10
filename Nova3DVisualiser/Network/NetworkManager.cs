@@ -32,6 +32,17 @@ public class NetworkManager
     private int _udpSeq;                                                        // atomic per-sender send counter
     private readonly UdpSeqFilter _udpSeqFilter = new();                        // receive-side latest-wins filter
 
+    // ---- UDP session authentication (client→server). The server issues a per-connection token over TCP
+    // and registers it here; the client stamps its token on every UDP frame. The server drops any incoming
+    // datagram whose token isn't registered, so an off-path spoofer can't inject fake transforms/physics or
+    // poison endpoint learning. Clients don't validate server→client UDP (they trust the server they dialed).
+    private bool _isUdpServer;                                                  // true = server bound UDP (validate incoming tokens)
+    private long _localUdpToken;                                               // CLIENT: token stamped on outgoing frames (0 until issued)
+    private readonly ConcurrentDictionary<long, byte> _validUdpTokens = new();  // SERVER: set of accepted tokens
+    // SERVER: per-sender fairness limit on AUTHENTICATED UDP (senderId trusted post-token-check), so a
+    // trusted-peer-gone-rogue can't flood the shared queue. Separate bucket set from the TCP _peerLimiter.
+    private readonly PeerRateLimiter _udpPeerLimiter = new(NetLimits.PeerRatePerSec, NetLimits.PeerRateBurst);
+
     // ---- Observability counters (S5). Incremented from background read/send tasks → Interlocked. Live
     // gauges (_conns.Count, _packetQueue.Count) are read directly in the summary, not counted.
     private long _packetsReceived, _bytesReceived, _packetsSent, _bytesSent, _framesRejected, _connectionsAccepted;
@@ -57,6 +68,7 @@ public class NetworkManager
         try
         {
             _udp = new UdpClient(new IPEndPoint(IPAddress.Any, port));
+            _isUdpServer = true;   // validate incoming UDP tokens on this side
             Task.Run(UdpReadLoop);
             Logger.Info($"UDP bound on :{port}");
         }
@@ -138,6 +150,16 @@ public class NetworkManager
         catch (Exception ex) { Logger.Error($"SendPacketTo conn {connId} failed", ex); _disconnected.Enqueue(connId); }
     }
 
+    // ---- UDP session-token API. CLIENT: SetLocalUdpToken stamps the server-issued token on outgoing
+    // frames. SERVER: Register/Unregister the tokens it has handed out over TCP (validated in UdpReadLoop).
+    public void SetLocalUdpToken(long token) => _localUdpToken = token;
+    public void RegisterValidUdpToken(long token) => _validUdpTokens[token] = 0;
+    public void UnregisterValidUdpToken(long token) => _validUdpTokens.TryRemove(token, out _);
+
+    // SERVER: drop a departing peer's UDP rate-limit bucket (hygiene — PeerRateLimiter already bounds its
+    // tracked keys; wired for symmetry with the TCP _peerLimiter.Forget on disconnect).
+    public void ForgetUdpPeer(int senderId) => _udpPeerLimiter.Forget(senderId);
+
     // Best-effort UDP send with automatic TCP fallback (so the caller never loses the ability to send).
     // Later stages opt specific hot packets (transforms / physics-sync) onto this; nothing uses it yet.
     // A UDP-delivered packet arrives with LastSenderConnId == -1 (see UdpReadLoop) so game code can tell
@@ -147,7 +169,7 @@ public class NetworkManager
         if (_udp == null) { SendPacket(packet, senderId); return; }   // UDP unavailable → TCP
 
         int seq = Interlocked.Increment(ref _udpSeq);
-        byte[] frame = UdpFraming.BuildUdpFrame(packet, senderId, seq);
+        byte[] frame = UdpFraming.BuildUdpFrame(packet, senderId, seq, _localUdpToken);
 
         if (_serverUdpEndpoint != null)   // CLIENT: one datagram to the server
         {
@@ -195,7 +217,7 @@ public class NetworkManager
 
         foreach (var packet in packets)
         {
-            byte[] frame = UdpFraming.BuildUdpFrame(packet, senderId, seq);   // SAME seq for every chunk
+            byte[] frame = UdpFraming.BuildUdpFrame(packet, senderId, seq, _localUdpToken);   // SAME seq for every chunk
 
             if (_serverUdpEndpoint != null)   // CLIENT: one datagram to the server
             {
@@ -228,18 +250,41 @@ public class NetworkManager
             catch (SocketException ex) { Logger.Error("UdpReadLoop socket error", ex); continue; }   // transient — keep going
             catch (Exception ex) { Logger.Error("UdpReadLoop error", ex); break; }
 
-            if (!UdpFraming.TryParseUdpFrame(result.Buffer, result.Buffer.Length, out int typeId, out int senderId, out int seq, out var packet))
+            if (!UdpFraming.TryParseUdpFrame(result.Buffer, result.Buffer.Length, out int typeId, out int senderId, out int seq, out long token, out var packet))
             {
                 Interlocked.Increment(ref _framesRejected);
                 Logger.Anomaly("udp-parse-fail", $"bad UDP datagram from {result.RemoteEndPoint}");
                 continue;   // malformed / short / unknown typeId — drop (rate-limiter coalesces a flood)
             }
-            CountRecv(result.Buffer.Length);   // a successfully parsed datagram
+
+            // SERVER: authenticate the per-session token BEFORE touching the datagram (endpoint learning,
+            // seq-filter, enqueue). An off-path spoofer can forge senderId but not the token the server
+            // issued this peer over TCP. token==0 is a legit client that hasn't received its token yet
+            // (its early frames) — drop silently, no anomaly. Clients don't validate server→client UDP.
+            if (_isUdpServer && !_validUdpTokens.ContainsKey(token))
+            {
+                Interlocked.Increment(ref _framesRejected);
+                if (token != 0)
+                    Logger.Anomaly("udp-bad-token", $"UDP datagram with invalid token from {result.RemoteEndPoint}");
+                continue;
+            }
+
+            CountRecv(result.Buffer.Length);   // a successfully parsed, authenticated datagram
 
             // SERVER (client leaves _serverUdpEndpoint set): learn/refresh where this sender's datagrams
             // come from, so SendPacketUnreliable can fan back out to it.
             if (_serverUdpEndpoint == null)
                 _udpEndpoints[senderId] = result.RemoteEndPoint;
+
+            // SERVER: per-sender fairness limit. The senderId is now trusted (it passed the token check),
+            // so an AUTHENTICATED peer flooding valid-token UDP can't monopolize the shared queue and starve
+            // the others. Client-side UDP is a single trusted source → not limited. (Token FIRST, rate SECOND.)
+            if (_isUdpServer && !_udpPeerLimiter.Allow(senderId, Environment.TickCount64))
+            {
+                Interlocked.Increment(ref _packetsDropped);
+                Logger.Anomaly("udp-peer-flood", $"UDP sender {senderId} at {result.RemoteEndPoint} exceeded {NetLimits.PeerRatePerSec}/s; dropping datagram");
+                continue;
+            }
 
             // Latest-wins: drop stale/duplicate BEFORE enqueue.
             if (!_udpSeqFilter.Accept(senderId, typeId, seq)) continue;

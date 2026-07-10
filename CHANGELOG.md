@@ -12,6 +12,18 @@ All notable changes to this project are documented in this file. The format is b
   port, with server-side endpoint learning, automatic fallback to TCP, and
   MTU-aware chunking of large physics batches. Reliable TCP continues to carry
   world sync, meshes, textures, live edits, chat, and the join handshake.
+- **Joints** connecting objects, solved in the same constraint solver as contacts:
+  ball-socket, hinge (with optional angle limits and a torque-limited motor), and
+  distance (a rigid rod or a soft spring). Authored in the editor as a "joint"
+  object with a colour-coded line/axis marker, saved in the world, and synced in
+  multiplayer.
+- **Dynamic convex-hull physics for mesh objects**: a custom mesh with gravity +
+  collision now falls, tumbles, and stacks as its true convex shape — resting on its
+  faces and sliding on the real triangles of sloped meshes — instead of a bounding
+  box. (Box-like primitives keep their cheaper box collider.)
+- A **capsule player**: the walking player now has real body height instead of a
+  point bubble, so it can't slip under low overhangs or poke its head through a
+  head-height bar, and it slides along walls without catching.
 
 ### Security
 - Bounded wire-driven allocations (a maximum framed-packet size and per-packet

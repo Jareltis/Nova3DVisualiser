@@ -4,6 +4,8 @@
 
 A multiplayer **ASCII 3D raytracer** that renders straight to the terminal, written in C# / **.NET 10**. It runs on a multithreaded CPU renderer by default, with an optional **GPU** path (ILGPU / CUDA) at pixel-for-pixel parity. It ships with a full in-scene editor, a JSON world system, real rigid-body physics, PNG textures, and TCP + UDP multiplayer — and its whole UI, including the setup wizard, runs on the engine's own console renderer, with **no external UI toolkit**.
 
+It is developing toward an engine whose **built-in editor is itself the game** — an editor-first sandbox where the worlds, models and textures you create are **shared local content**.
+
 ## Features
 
 - **CPU or GPU renderer, per world** — multithreaded CPU raytracer by default, or an ILGPU/CUDA GPU path at full feature parity (transparent fallback if no GPU).
@@ -11,7 +13,7 @@ A multiplayer **ASCII 3D raytracer** that renders straight to the terminal, writ
 - **Multi-light system** — point / directional / spot / area lights, colored emission, spin, multi-beam spots, circle/square/triangle cones, alpha-correct shadows.
 - **Two transparencies** — object alpha (see-through, front-to-back) and color paleness (washes toward white).
 - **PNG textures + UV** — every primitive and imported mesh; tiling, per-face, and nearest/bilinear/mipmapped filtering; pixels stream to peers.
-- **Real rigid-body physics** — an impulse-based solver: gravity, per-object collision (AABB/OBB), friction, rolling friction, restitution, mass, 3D tumbling, solid stacks, and a walking first-person character.
+- **Real rigid-body physics** — an impulse-based solver: gravity, per-object collision (AABB/OBB), friction, rolling friction, restitution, mass, 3D tumbling, and solid stacks; **dynamic convex-hull bodies** so a custom mesh falls, tumbles and stacks as its true shape (and rests on the real triangles of sloped meshes); **joints** — ball-socket, hinge (with angle limits and a motor), and distance (rigid or spring) — authored in the editor and synced in multiplayer; and a **capsule** first-person character with real body height.
 - **World system + in-scene editor** — each scene is one `worlds/*.json`; spawn, move, edit, and save objects live.
 - **Cameras & HUD** — 1st/2nd/3rd-person body views, placeable Fixed/Follow cameras, split-screen, and three HUD modes (play / overlay / docked).
 - **Multiplayer** — TCP + UDP server/client: reliable TCP for world sync (chunked meshes), edits, spawns and chat; an unreliable UDP fast-path (latest-wins, MTU-chunked, TCP fallback) for player transforms and physics sync.

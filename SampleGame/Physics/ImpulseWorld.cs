@@ -14,6 +14,7 @@ namespace SampleGame.Physics;
 public sealed class ImpulseWorld
 {
     public readonly List<RigidBody> Bodies = new();
+    public readonly List<Joint> Joints = new();    // Plan C1: bilateral joint constraints, solved alongside contacts
     public Vector3 Gravity = new Vector3(0f, -9.8f, 0f);
     public float Restitution = 0f;                 // world default restitution (a body's <0 restitution inherits this)
 
@@ -24,13 +25,13 @@ public sealed class ImpulseWorld
     private const int PosIters = 8;                // split-impulse position iterations (a stack must not sag/sink)
     private const float Slop = 0.005f;             // allowed resting penetration
     private const float Margin = 0.02f;            // speculative contact margin (a resting box is caught before it sinks)
-    private const float Beta = 0.2f;               // fraction of excess penetration removed per substep (position bias)
+    internal const float Beta = 0.2f;              // fraction of excess penetration removed per substep (position bias); internal so Joint.cs shares it
     private const float RestThreshold = 1.0f;      // |approach speed| below this = a resting contact -> NO restitution (kills micro-bounce)
     private const float SleepLin = 0.05f;          // |LinVel| below this (units/s) counts as calm
     private const float SleepAng = 0.05f;          // |AngVel| below this (rad/s) counts as calm
     private const int SleepSteps = 30;             // consecutive calm substeps before a body sleeps
     // ---- anti-fling rails (mirror the legacy engine's: nothing may explode even at coarse dt / deep contact) ----
-    private const float MaxBiasSpeed = 4f;         // cap the split-impulse position-correction speed (a deep coarse-dt penetration can't fling)
+    internal const float MaxBiasSpeed = 4f;        // cap the split-impulse position-correction speed (a deep coarse-dt penetration can't fling); internal so Joint.cs shares it
     private const float MaxLinSpeed = 60f;         // clamp |LinVel| (units/s) — anti-explosion
     private const float MaxAngSpeed = 30f;         // clamp |AngVel| (rad/s)  — anti-explosion
     private const float RunawayBound = 300f;       // a body past this has escaped -> zero its velocity (backstop, mirrors the legacy engine)
@@ -75,6 +76,11 @@ public sealed class ImpulseWorld
             c.RestitutionBias = vn0 < -RestThreshold ? -c.Restitution * vn0 : 0f;
         }
 
+        // 3a-joints) prepare each ACTIVE joint (world lever arms + per-axis effective masses). A joint is a
+        //     BILATERAL constraint (Plan C1) solved in the SAME warm-started PGS loop as contacts; JointActive
+        //     also wakes a lone sleeping endpoint under a live one. No-op (empty loop) when there are no joints.
+        foreach (var j in Joints) if (JointActive(j)) j.Prepare(h);
+
         // 3b) warm-start: re-apply the cached normal + friction impulses from the previous substep.
         foreach (var c in _contacts)
         {
@@ -82,11 +88,14 @@ public sealed class ImpulseWorld
             c.NormalImpulse = w.n; c.TanImpulse1 = w.t1; c.TanImpulse2 = w.t2;
             ApplyImpulse(c, c.Normal * c.NormalImpulse + c.Tan1 * c.TanImpulse1 + c.Tan2 * c.TanImpulse2);
         }
+        // joints warm-start with the impulse accumulated last substep (bilateral — re-applied unclamped).
+        foreach (var j in Joints) if (JointActive(j)) j.WarmStart();
 
         // 4) solve velocity constraints: per iteration, NORMAL first (accumulated impulse clamped >= 0 so
         //    contacts push, never pull), then the two FRICTION tangents (accumulated 2D magnitude clamped to
         //    μ · normal impulse — Coulomb, so friction never exceeds μN and never adds energy).
         for (int it = 0; it < VelIters; it++)
+        {
             foreach (var c in _contacts)
             {
                 float vn = RelVelN(c);
@@ -103,6 +112,10 @@ public sealed class ImpulseWorld
                 ApplyImpulse(c, c.Tan1 * (new1 - c.TanImpulse1) + c.Tan2 * (new2 - c.TanImpulse2));
                 c.TanImpulse1 = new1; c.TanImpulse2 = new2;
             }
+            // BILATERAL joints (Plan C1): solve each active joint's velocity constraint AFTER the contacts, in
+            // the SAME iteration. Unclamped (a joint may push AND pull). No-op when Joints is empty.
+            foreach (var j in Joints) if (JointActive(j)) j.SolveVelocity();
+        }
 
         // cache accumulated impulses for the next substep's warm-start.
         _warm.Clear();
@@ -137,6 +150,7 @@ public sealed class ImpulseWorld
         foreach (var b in Bodies) { b.PseudoLin = Vector3.Zero; b.PseudoAng = Vector3.Zero; }
         foreach (var c in _contacts) c.PosImpulse = 0f;
         for (int it = 0; it < PosIters; it++)
+        {
             foreach (var c in _contacts)
             {
                 float bias = MathF.Min(Beta * MathF.Max(c.Penetration - Slop, 0f) / h, MaxBiasSpeed);   // desired separation speed (clamped: a deep coarse-dt penetration can't fling)
@@ -146,6 +160,9 @@ public sealed class ImpulseWorld
                 c.PosImpulse = MathF.Max(old + dl, 0f);
                 ApplyPseudo(c, c.Normal * (c.PosImpulse - old));
             }
+            // BILATERAL joints (Plan C1): split-impulse positional pass AFTER the contacts, same loop. No-op when empty.
+            foreach (var j in Joints) if (JointActive(j)) j.SolvePosition(h);
+        }
 
         // 6) integrate position (real + pseudo) and orientation (reuse the engine's drift-free quaternion step),
         //    with anti-fling rails: clamp the real velocities before integrating, and a runaway backstop that
@@ -215,6 +232,21 @@ public sealed class ImpulseWorld
     // Wake a sleeping body (a later stage calls this on a disturbance; Stage 1 rarely needs it).
     public static void Wake(RigidBody b) { b.Sleeping = false; b.CalmSteps = 0; }
 
+    // A joint is INACTIVE (skipped this substep) only when BOTH ends are immovable (static or sleeping) — then
+    // it can do nothing. Otherwise it's active; and if exactly one end is asleep while the OTHER is an awake,
+    // actively-moving (not calm) dynamic body, wake the sleeper so the joint never goes dead under a live end.
+    // Called at the joint-prepare phase (before Prepare), so the wake is consistent for the whole substep.
+    // (Full joint-in-island sleep propagation is a later refinement — this stays minimal.)
+    private static bool JointActive(Joint j)
+    {
+        bool aFixed = j.A.IsStatic || j.A.Sleeping;
+        bool bFixed = j.B.IsStatic || j.B.Sleeping;
+        if (aFixed && bFixed) return false;
+        if (j.A.Sleeping && !j.B.IsStatic && !j.B.Sleeping && !j.B.Calm) Wake(j.A);
+        else if (j.B.Sleeping && !j.A.IsStatic && !j.A.Sleeping && !j.A.Calm) Wake(j.B);
+        return true;
+    }
+
     private void GenerateContacts()
     {
         _contacts.Clear();
@@ -246,6 +278,16 @@ public sealed class ImpulseWorld
                     else if (stat.Kind == ColliderKind.Box) ContactGen.BoxVsBox(stat, dyn, Margin, _contacts);      // a genuine static OBB
                 }
             }
+            else if (dyn.Kind == ColliderKind.Hull)                                            // dynamic convex HULL vs static (C2-3a/C2-4)
+            {
+                foreach (var stat in Bodies)
+                {
+                    if (!stat.IsStatic) continue;
+                    if (stat.Kind == ColliderKind.Sphere) { if (ContactGen.HullVsSphere(stat, dyn, Margin, out var cs)) _contacts.Add(cs); }
+                    else if (stat.Kind == ColliderKind.Box) ContactGen.HullVsBox(stat, dyn, Margin, _contacts);    // clipped multi-point manifold (flat rest)
+                    else if (stat.Kind == ColliderKind.Mesh) ContactGen.HullVsMesh(stat, dyn, Margin, _contacts);  // C2-4: REAL triangles (rests/slides on the true slope); high-poly falls back to the OBB box view
+                }
+            }
             // dynamic Mesh: inert (later stages). The runtime represents dynamic meshes as OBBs (ColliderKind.Box).
         }
 
@@ -254,17 +296,36 @@ public sealed class ImpulseWorld
         // IS generated with the sleeper as an immovable anchor. The A/B assignment is DETERMINISTIC per pair
         // (box-box + sphere-sphere ordered by Id; sphere-box always box=A) so the reference/incident choice,
         // feature ids and the contact NORMAL are stable frame-to-frame -> warm-start catches -> no jitter.
-        // Boxes get the clipped multi-point manifold; sphere pairs get a single analytic point. Real-triangle
-        // mesh contact stays inert (Stage 5): a dynamic Mesh never reaches here (the runtime boxes it as an OBB).
+        // Boxes get the clipped multi-point manifold; sphere pairs get a single analytic point. HULL pairs (C2-3b)
+        // get the same clipped manifold vs a box/hull (A/B ordered so each generator's roles match) or an analytic
+        // point vs a sphere. Real-triangle mesh contact stays inert (Stage 5): a dynamic Mesh never reaches here.
         for (int i = 0; i < Bodies.Count; i++)
         {
             var a = Bodies[i];
-            if (a.IsStatic || a.Kind == ColliderKind.Mesh) continue;                       // dynamic sphere or box
+            if (a.IsStatic || a.Kind == ColliderKind.Mesh) continue;                        // dynamic sphere/box/hull
             for (int j = i + 1; j < Bodies.Count; j++)
             {
                 var b = Bodies[j];
                 if (b.IsStatic || b.Kind == ColliderKind.Mesh) continue;
                 if (a.Sleeping && b.Sleeping) continue;
+
+                bool aHull = a.Kind == ColliderKind.Hull, bHull = b.Kind == ColliderKind.Hull;
+                if (aHull || bHull)                                                         // C2-3b: dynamic HULL pairs
+                {
+                    if (aHull && bHull)                                                     // hull-hull: A=lower Id
+                    {
+                        var (lo, hi) = a.Id < b.Id ? (a, b) : (b, a);
+                        ContactGen.HullVsHull(lo, hi, Margin, _contacts);
+                    }
+                    else                                                                   // hull-box / hull-sphere
+                    {
+                        var hull = aHull ? a : b;
+                        var other = aHull ? b : a;
+                        if (other.Kind == ColliderKind.Box) ContactGen.HullVsBox(other, hull, Margin, _contacts);          // box=A, hull=B
+                        else if (other.Kind == ColliderKind.Sphere) { if (ContactGen.HullVsSphere(other, hull, Margin, out var cs)) _contacts.Add(cs); }   // sphere=A, hull=B
+                    }
+                    continue;
+                }
 
                 bool aBox = a.Kind == ColliderKind.Box, bBox = b.Kind == ColliderKind.Box;
                 if (aBox && bBox)                                                           // box-box: clipped manifold

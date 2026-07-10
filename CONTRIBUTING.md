@@ -67,8 +67,9 @@ The app ships non-interactive self-tests (they run before the interactive wizard
 should **all pass**, and `gputest` should be an exact CPU↔GPU match (Δ = 0):
 
 ```bash
-for t in splashtest impulsetest cutovertest bvhtest worldtest editortest picktest \
-         worldsynctest collisiontest physicstest texturetest gputest uitest; do
+for t in splashtest impulsetest jointtest hulltest gjktest hullphystest cutovertest \
+         bvhtest worldtest editortest picktest worldsynctest collisiontest \
+         physicstest texturetest gputest uitest; do
   dotnet run --project SampleGame -c Release --no-build -- $t
 done
 ```
@@ -76,8 +77,9 @@ done
 On Windows PowerShell:
 
 ```powershell
-'splashtest','impulsetest','cutovertest','bvhtest','worldtest','editortest','picktest',
-'worldsynctest','collisiontest','physicstest','texturetest','gputest','uitest' |
+'splashtest','impulsetest','jointtest','hulltest','gjktest','hullphystest','cutovertest',
+'bvhtest','worldtest','editortest','picktest','worldsynctest','collisiontest',
+'physicstest','texturetest','gputest','uitest' |
   ForEach-Object { dotnet run --project SampleGame -c Release --no-build -- $_ }
 ```
 

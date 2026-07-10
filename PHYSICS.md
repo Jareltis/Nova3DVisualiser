@@ -13,8 +13,10 @@ correction + sleeping) giving **Box2D / simple-3D-engine class SOLIDITY**:
 - believable **tumbling / rolling / sliding** as *emergent* behaviour of the solver,
 - **no energy injection, no fling, no sink-through.**
 
-The target is **not** full PhysX — no continuous collision detection (CCD), no articulations,
-no TGS soft-step. Deliberately a small, correct, stable core.
+The target is **not** full PhysX — no continuous collision detection (CCD), no reduced-coordinate
+articulations, no TGS soft-step. Deliberately a small, correct, stable core. (Bilateral **joint
+constraints** — Plan C1 — DO now run, but as maximal-coordinate constraints in the same PGS loop as
+contacts, not as a reduced-coordinate articulation solver.)
 
 **Governing rule:** *correctness + stability over features.* A shortcut that conflicts with
 stable, energy-conserving contact is a **BUG, not a simplification** — fix it, don't keep it.
@@ -87,8 +89,10 @@ the existing, tested geometry/math:
 
 ## Future directions (beyond the completed rewrite)
 
-The staged rewrite (Stages 1–7b) is **done**. The items below are **AGREED but NOT SCHEDULED** — recorded so
-the direction is captured; this is a wish-list, not a committed roadmap.
+The staged rewrite (Stages 1–7b) is **done**, and the three highest-leverage follow-ons have since shipped as
+**Plan C** (see **Current status — Plan C** below): **joints** (C1), **dynamic convex-hull mesh bodies** (C2),
+and the **capsule player** (C4). The items still open below are **AGREED but NOT SCHEDULED** — a wish-list,
+not a committed roadmap.
 
 **Governing rule (non-negotiable):** every one of these MUST build **ON** the unified impulse solver — the
 same warm-started **sequential-impulse / PGS substep loop**, reusing `RigidBody` / `ImpulseWorld` / the
@@ -96,24 +100,116 @@ integrator. **Never a parallel or second physics path** — that decoupling is e
 rewrite removed, and re-introducing it would bring back the class of bugs (glue between separate passes) the
 whole effort eliminated.
 
-- **Constraints / joints** (hinge, ball-socket, spring/distance, motor) — bilateral constraints solved in the
-  **SAME PGS loop** as the contact constraints (warm-started; split-impulse for the positional part), just
-  with a two-sided impulse clamp instead of the contact's `≥ 0` clamp. Unlocks **ragdolls, doors, chains,
-  vehicles, articulated contraptions.** The highest-leverage next capability.
-- **Dynamic real-mesh rigid body** — a dynamic mesh that is not a box/sphere is currently boxed to its OBB by
-  the solver (a known limit, not a legacy regression — legacy's mesh dynamics was the source of the original
-  ramp-teleport). A true dynamic triangle-mesh body (convex decomposition into convex hulls + a GJK-EPA
-  narrow-phase feeding the same manifold/solver) is a possible later stage.
-- **CCD / speculative contacts** — a **NON-GOAL for now** (consistent with the North Star: no CCD). Fast or
+- **Convex DECOMPOSITION for concave dynamic meshes** — a dynamic mesh currently simulates as a **single
+  convex hull** of its vertices (Plan C2), so a concave shape collides as its convex envelope. Splitting a
+  concave mesh into multiple convex hulls (e.g. V-HACD) — each a `RigidBody` shape feeding the same GJK-EPA
+  narrow-phase + `PolyManifold` — would give true concave dynamics. The remaining mesh-physics item.
+- **Principal-axis inertia diagonalisation** — `ConvexHull.ComputeMassProperties` returns a **diagonal**
+  inertia in the input axes (products of inertia dropped — exact for an axis-symmetric hull, small for the
+  near-symmetric game meshes we target). Diagonalising the full covariance to the true principal axes is a
+  possible refinement.
+- **CCD / speculative contacts** — still a **NON-GOAL** (consistent with the North Star: no CCD). Fast or
   thin bodies at coarse dt can tunnel; the anti-fling rails (`MaxLinSpeed` / `MaxAngSpeed` / `RunawayBound`)
   keep them **bounded**, and the realistic dt range is jitter-free. Revisit only if fast projectiles or thin
   walls actually appear in real use.
-- **Player-collision upgrade** — the walk-mode camera bubble is still **sphere-vs-AABB/OBB**
-  (`ResolveSphereVsAabb`/`Obb`), cruder than the object solver. A capsule / convex-hull / per-triangle player
-  collision is a polish item. (This is the *player's own* collision, separate from object dynamics — an
-  upgrade here doesn't touch the falling-object engine.)
 
-## Current status — Stage 7b (COMPLETE — single engine; future directions recorded above)
+## Current status — Plan C (joints + dynamic convex hulls + capsule player)
+
+Three capabilities were added **ON** the completed solver — each a bilateral / narrow-phase extension of the
+SAME warm-started PGS substep loop, never a parallel path, each gated by a headless test.
+
+### C1 — Joint constraints (`SampleGame/Physics/Joint.cs`, `JointBuilder.cs`)
+
+Bilateral constraints solved in the **same substep** as contacts. A `Joint` mirrors the contact pipeline's
+phases — `Prepare(h)` / `WarmStart()` / `SolveVelocity()` / `SolvePosition(h)` — and `ImpulseWorld` runs every
+active joint's hook interleaved with the contact solve (warm-start, then each velocity iteration, then the
+split-impulse positional pass). **THE invariant:** a joint impulse is **BILATERAL — never clamped** (it may
+push AND pull to hold the constraint), unlike a contact's normal impulse clamped `≥ 0`. When `Joints` is empty
+every hook is a no-op, so a joint-free scene steps **bit-identically**.
+
+- **Shared point constraint** (`PointConstraint`) — pins A's `LocalAnchorA` to B's `LocalAnchorB` coincident
+  (removes the 3 translational DOF) as **three scalar rows** along the world X/Y/Z axes (PGS recovers the
+  coupling); a **split-impulse** positional pass closes the anchor gap, its bias capped at `MaxBiasSpeed`
+  (shared with contacts). Reused verbatim by ball-socket AND hinge.
+- **Ball-socket** (`BallSocketJoint`) — a thin wrapper over `PointConstraint` (rotation free).
+- **Hinge** (`HingeJoint`) — the point pin PLUS **two angular axis-lock rows** (a deterministic tangent basis
+  `⟂` the hinge axis, via the contact solver's `TangentBasis`) that remove the 2 relative-rotation DOF off the
+  axis, leaving free spin about it. Angular drift is corrected in the positional pass from `err = aA × aB` (the
+  two world axes' cross, `≈ sin` of the tilt). Two OPTIONAL axis constraints (both default OFF → a plain hinge
+  is bit-identical to a base hinge): a **LIMIT** — a *unilateral* angle stop clamped like a contact normal
+  (only pushes θ back inside `[Lower, Upper]`, θ measured from the assembly pose); and a **MOTOR** — a velocity
+  drive whose accumulated impulse is clamped to `±(MaxMotorTorque·h)` (a torque cap). Solve order is point →
+  axis-lock → **motor → limit last**, so a limit can arrest the motor (a servo).
+- **Distance** (`DistanceJoint`) — RIGID (default): a single 1-D velocity row holding the anchor-separation
+  rate at 0 + a split-impulse pass toward `RestLength`. SPRING (`SpringEnabled && Frequency > 0`): the
+  **Box2D/Catto soft-constraint** formulation — CFM `γ` + a soft mass from the frequency/damping, the position
+  error fed back as a bias velocity `C·h·k·γ` in the velocity solve, **NO** positional pass. `jointtest` checks
+  the static deflection matches `g/ω²`.
+- **World entities + bridge** — a joint is a `JointConfig` (a stable `Id` in the object-id space; `Kind` =
+  `ballsocket` / `hinge` / `distance`; `BodyA` / `BodyB` object ids, `-1` = the fixed WORLD anchor at the
+  origin; local-frame `AnchorA` / `AnchorB`; hinge `Axis` + limit/motor fields; distance `RestLength` + spring
+  fields). The pure `JointBuilder.BuildJoint` translates a config into a live `Joint`. The scene bridge
+  (`BuildFrameJoints`) keeps **persistent** live joints (their accumulated-impulse warm-start survives frames),
+  rebuilding one only when a referenced body changes; a joint whose endpoint isn't a solver body this frame is
+  skipped (warned once).
+- **Editor + sync** — a **`joint`** spawn type places a joint entry: a pickable, non-colliding **line marker**
+  spanning the two anchors, coloured by kind (**ball-socket cyan, hinge orange, distance green**), a hinge
+  adding an **axis stub**; `Field.JointKind` cycles `ballsocket → hinge → distance` and the inspector shows
+  kind-dependent fields. Joints ride the world config (`WorldConfig.Joints` — saved / loaded and carried in a
+  join's world sync) and live edits stream as `WorldEditPacket` ops **3 (JointModify) / 4 (JointSpawn) /
+  5 (JointDelete)** with in-place mutation. Guarded by `jointtest` (solver behaviour) + `editortest`
+  (authoring + the net ops).
+
+### C2 — Dynamic convex-hull mesh bodies (`ConvexHull.cs`, `Gjk.cs`, `Contact.cs`)
+
+A gravity+collides **custom mesh** object now simulates as its **true convex hull** instead of a loose OBB.
+
+- **Convex hull** (`ConvexHull.Build`) — **quickhull** over the mesh vertices: duplicates welded onto a grid, a
+  single extent-scaled epsilon, an initial simplex + horizon iteration, **outward winding** enforced, the loop
+  defensively iteration-capped; **null** on degenerate input (< 4 non-coplanar / coincident / collinear /
+  coplanar), whereupon the bridge falls back to a box AABB. **Mass properties** (`ComputeMassProperties`) —
+  closed-polyhedron signed-tetrahedron decomposition → volume, COM, and a **DIAGONAL** inertia (products of
+  inertia **dropped** — a standard first approximation, EXACT for an axis-symmetric hull: a unit cube hull
+  reproduces `PhysicsMath.BoxInertia`, verified in `hulltest`). **Polygonal `Faces`** — coplanar adjacent
+  triangles merged (union-find) into convex CCW loops, for manifold clipping.
+- **GJK + EPA** (`Gjk.cs`) — over a generic **support-function delegate** (works for hull / box / sphere).
+  `Distance` returns witness points via the terminating simplex's **barycentric weights**; `Intersect` is the
+  boolean; `Penetration` is **EPA** (grows the terminating simplex to a tetra, then a quickhull-style horizon
+  expansion) with a documented normal sign (points B→A: translating B by `−depth·normal` separates). Guarded
+  by `gjktest`.
+- **Contact manifolds** (`Contact.cs`) — a shared **`PolyManifold`** core: the GJK/EPA contact normal picks a
+  **reference** face (the candidate most parallel to the normal) and the OTHER shape's **incident** face, then
+  **Sutherland–Hodgman** clips the incident polygon against the reference's side planes → **≤ 4** contact
+  points, each carrying a **STABLE `Feature` id** so warm-start catches (jitter-free rest / stack). Pairs:
+  `HullVsSphere` (a single analytic point), `HullVsBox`, `HullVsHull` — each transform-based, so the non-hull
+  partner may be **static or dynamic** (the solver mass-weights both). **`HullVsMesh`** (C2-4) mirrors
+  `BoxVsMesh` but queries the **hull's own vertices** against the static mesh's triangle faces (per-vertex
+  deepest-penetrating face, the hull-vertex index as the stable Feature id); a high-poly mesh falls back to the
+  mesh's box view via `HullVsBox`. Guarded by `hullphystest`.
+- **Scene bridge** (`PriviewNetworkScene.Physics.cs`) — an `Object3d` whose descriptor `Type == "mesh"` that is
+  gravity+collides builds a `DynamicHull` from its **`LocalVertices · Scale`**; `RigidBody.HullLocalCom` (the
+  hull's COM in that scaled-local frame) both **places** the body (`Position = HullLocalCom·rot + objectPos`)
+  and is **backed out** on sync-back, so the mesh doesn't drift by its COM offset. The hull is built **ONCE**
+  (quickhull is expensive) and rebuilt **only on a scale edit**; velocity / sleep are preserved. Box-like
+  **primitives** (cube / ramp / pyramid / …) still simulate as their **OBB** (a cube's OBB equals its hull, and
+  box-box is cheaper). It rides the existing per-object physics-sync unchanged. Guarded by `editortest`'s C2-5
+  bridge check.
+- **Remaining limit** — a mesh collides as a **single convex hull**, so a concave shape uses its convex
+  envelope; convex decomposition is a future item (above).
+
+### C4 — Capsule player (`PriviewNetworkScene.Player.cs`)
+
+The walk-mode player collider is now a **vertical capsule** instead of a single sphere: a central segment of
+half-length `CapsuleHalf` (0.55) plus radius `CameraRadius` (0.35) — total height ≈ 1.8 (human scale),
+`Position` staying the capsule CENTRE so the camera rig is unchanged. Resolution **reuses the existing sphere
+resolvers**: for each collider, clamp its height into the capsule segment (a Sphere's centre / an OBB or AABB's
+mid-height) → run the SAME `ResolveSphereVsSphere` / `Aabb` / `Obb` at that segment point → translate the body
+by the delta. With `CapsuleHalf == 0` it reduces EXACTLY to the old sphere bubble. Ground detection is
+unchanged, now read from the **foot cap** (rest at `floorTop + CapsuleHalf + CameraRadius`). So the player has
+real body height — blocked by head- and foot-height obstacles a centre-sphere would miss, can't slip under low
+overhangs. Guarded by `editortest`'s C4 capsule checks.
+
+## Prior status — Stage 7b (COMPLETE — single engine; Plan C built on top, above)
 
 The rewrite is **done**: the impulse solver is the **only** object-dynamics engine, the legacy decoupled
 passes are **deleted**, and there is **no engine switch**:
@@ -140,8 +236,9 @@ passes are **deleted**, and there is **no engine switch**:
   within ~0.4 during a tumble and converge to ~0 at rest, at 20 Hz and 10 Hz batch rates).
 - **Preserved (untouched):** the camera/player walk-mode collision bubble (`ResolveSphereVsAabb`/`Obb`),
   non-colliding / gravity-off objects, the editor, graphics toggles, world save/load.
-- **Known limit (not a regression):** a DYNAMIC mesh that is not a box/sphere is simulated as its OBB (see
-  the "dynamic real-mesh rigid body" item under **Future directions** above).
+- **Superseded by Plan C:** at Stage 7b a DYNAMIC mesh that is not a box/sphere was simulated as its OBB;
+  Plan C2 (above) now simulates a gravity+collides mesh as its true convex **HULL** (a concave mesh still
+  uses its convex envelope — see **Convex DECOMPOSITION** under Future directions).
 
 ## Prior status — Stage 6
 

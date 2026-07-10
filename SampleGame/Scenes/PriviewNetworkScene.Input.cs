@@ -138,8 +138,16 @@ public partial class PriviewNetworkScene
     // other clients to drop it too.
     private void OnClientDisconnectedServer(int connId)
     {
+        // Revoke this connection's UDP token so the valid-token set doesn't grow with connection churn.
+        if (_connToken.TryGetValue(connId, out long token))
+        {
+            _netManager?.UnregisterValidUdpToken(token);
+            _connToken.Remove(connId);
+        }
+
         if (!_connToNet.TryGetValue(connId, out int netId)) return;
         _connToNet.Remove(connId);
+        _netManager?.ForgetUdpPeer(netId);   // drop this peer's UDP rate-limit bucket (senderId == netId)
         RemoveRemotePlayer(netId);
         _netManager?.SendPacket(new PlayerLeftPacket { NetId = netId }, _myNetId);
     }
@@ -227,8 +235,15 @@ public partial class PriviewNetworkScene
         Field.ConeAngle or Field.AreaSize or Field.Spin or Field.Beams or
         Field.PlatSize or Field.PlatWidth or Field.PlatDepth or
         Field.Mass or Field.Restitution or Field.Friction or Field.RollingFriction or
-        Field.ColorFade or Field.TextureScale or Field.FollowTargetId => true,
-        _ => false,   // Name (text), Kind/AreaShape/Shape/PlatShape/Texture/TexFace/TexFilter/Collides/Gravity/Collider/CamKind (cycle/toggle)
+        Field.ColorFade or Field.TextureScale or Field.FollowTargetId or
+        // joint (C1-4b) numerics (JointKind + the three *Enabled toggles are cycled, NOT typed)
+        Field.JBodyA or Field.JBodyB or
+        Field.JAnchorAX or Field.JAnchorAY or Field.JAnchorAZ or
+        Field.JAnchorBX or Field.JAnchorBY or Field.JAnchorBZ or
+        Field.JAxisX or Field.JAxisY or Field.JAxisZ or
+        Field.JLower or Field.JUpper or Field.JMotorSpeed or Field.JMaxTorque or
+        Field.JRestLength or Field.JFrequency or Field.JDamping => true,
+        _ => false,   // Name (text), Kind/AreaShape/Shape/PlatShape/Texture/TexFace/TexFilter/Collides/Gravity/Collider/CamKind/JointKind/J*Enabled (cycle/toggle)
     };
 
     // Enters inline typed-entry for field `f` on entry `e`: seed the buffer (the Name field with its
@@ -393,6 +408,26 @@ public partial class PriviewNetworkScene
                 // Lives on the descriptor (a camera has no engine companion), riding save/sync/FromInstance.
                 entry.Descriptor.FollowTargetId = Math.Max(-1, (int)MathF.Round(v));
                 break;
+
+            // ---- joint (C1-4b): typed entry sets the LIVE JointConfig field exactly (mirror AdjustField's clamps) ----
+            case Field.JBodyA: if (entry.Joint != null) entry.Joint.BodyA = Math.Max(-1, (int)MathF.Round(v)); break;
+            case Field.JBodyB: if (entry.Joint != null) entry.Joint.BodyB = Math.Max(-1, (int)MathF.Round(v)); break;
+            case Field.JAnchorAX: if (entry.Joint != null) entry.Joint.AnchorA.X = v; break;
+            case Field.JAnchorAY: if (entry.Joint != null) entry.Joint.AnchorA.Y = v; break;
+            case Field.JAnchorAZ: if (entry.Joint != null) entry.Joint.AnchorA.Z = v; break;
+            case Field.JAnchorBX: if (entry.Joint != null) entry.Joint.AnchorB.X = v; break;
+            case Field.JAnchorBY: if (entry.Joint != null) entry.Joint.AnchorB.Y = v; break;
+            case Field.JAnchorBZ: if (entry.Joint != null) entry.Joint.AnchorB.Z = v; break;
+            case Field.JAxisX: if (entry.Joint != null) entry.Joint.Axis.X = v; break;
+            case Field.JAxisY: if (entry.Joint != null) entry.Joint.Axis.Y = v; break;
+            case Field.JAxisZ: if (entry.Joint != null) entry.Joint.Axis.Z = v; break;
+            case Field.JLower: if (entry.Joint != null) entry.Joint.LowerLimit = v; break;
+            case Field.JUpper: if (entry.Joint != null) entry.Joint.UpperLimit = v; break;
+            case Field.JMotorSpeed: if (entry.Joint != null) entry.Joint.MotorTargetSpeed = v; break;
+            case Field.JMaxTorque: if (entry.Joint != null) entry.Joint.MaxMotorTorque = MathF.Max(0f, v); break;
+            case Field.JRestLength: if (entry.Joint != null) entry.Joint.RestLength = MathF.Max(0f, v); break;
+            case Field.JFrequency: if (entry.Joint != null) entry.Joint.Frequency = MathF.Max(0f, v); break;
+            case Field.JDamping: if (entry.Joint != null) entry.Joint.DampingRatio = MathF.Max(0f, v); break;
         }
     }
 

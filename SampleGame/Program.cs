@@ -22,6 +22,10 @@ partial class Program
     static void Main(string[] args)
     {
         if (args.Length > 0 && args[0] == "impulsetest") { ImpulseSelfTest(); return; }
+        if (args.Length > 0 && args[0] == "jointtest") { JointSelfTest(); return; }              // Plan C1-1: ball-socket joint (bilateral constraint in the PGS loop)
+        if (args.Length > 0 && args[0] == "hulltest") { HullSelfTest(); return; }                 // Plan C2-1: convex hull + mass properties + support (pure geometry)
+        if (args.Length > 0 && args[0] == "gjktest") { GjkSelfTest(); return; }                   // Plan C2-2: GJK distance/boolean + EPA penetration (pure support-function queries)
+        if (args.Length > 0 && args[0] == "hullphystest") { HullPhysSelfTest(); return; }          // Plan C2-3a: dynamic convex hull collider (rests on static box/sphere)
         if (args.Length > 0 && args[0] == "cutovertest") { CutoverSelfTest(); return; }
         if (args.Length > 0 && args[0] == "bvhtest") { BvhSelfTest(); return; }
         if (args.Length > 0 && args[0] == "worldtest") { WorldSelfTest(); return; }

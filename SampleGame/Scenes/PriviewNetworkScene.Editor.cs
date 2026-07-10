@@ -162,7 +162,7 @@ public partial class PriviewNetworkScene
             case Field.Gravity:
                 if (!_world.Physics.GravityEnabled) break;                            // world gravity off -> locked off
                 inst.Gravity = !inst.Gravity;                                         // N or M toggles it
-                if (!inst.Gravity) _impBodies.Remove(inst);                            // stop simulating it once it can't fall
+                if (!inst.Gravity) { _impBodies.Remove(inst); _hullScale.Remove(inst); }   // stop simulating it once it can't fall
                 if (entry.Platform != null) entry.Platform.Gravity = inst.Gravity;    // platform: persist on the live config
                 break;
             case Field.Collider:
@@ -317,7 +317,86 @@ public partial class PriviewNetworkScene
                 // entry sets it exactly. Lives on the descriptor like CamKind (rides save/sync/FromInstance).
                 entry.Descriptor.FollowTargetId = Math.Max(-1, entry.Descriptor.FollowTargetId + dir);
                 break;
+
+            // ---- joint fields (C1-4b): all mutate the LIVE JointConfig in _world.Joints ----
+            case Field.JointKind:
+                if (entry.Joint != null)
+                {
+                    entry.Joint.Kind = NextJointKind(entry.Joint.Kind, dir);   // ballsocket -> hinge -> distance -> …
+                    _fieldIndex = 0;   // the field set changed (like changing a light's Kind)
+                }
+                break;
+            // Body ids reference LIVE runtime object ids; floored at -1 (= the static world), like FollowTargetId.
+            case Field.JBodyA: if (entry.Joint != null) entry.Joint.BodyA = Math.Max(-1, entry.Joint.BodyA + dir); break;
+            case Field.JBodyB: if (entry.Joint != null) entry.Joint.BodyB = Math.Max(-1, entry.Joint.BodyB + dir); break;
+            case Field.JAnchorAX: if (entry.Joint != null) entry.Joint.AnchorA.X += dir * MoveStep; break;
+            case Field.JAnchorAY: if (entry.Joint != null) entry.Joint.AnchorA.Y += dir * MoveStep; break;
+            case Field.JAnchorAZ: if (entry.Joint != null) entry.Joint.AnchorA.Z += dir * MoveStep; break;
+            case Field.JAnchorBX: if (entry.Joint != null) entry.Joint.AnchorB.X += dir * MoveStep; break;
+            case Field.JAnchorBY: if (entry.Joint != null) entry.Joint.AnchorB.Y += dir * MoveStep; break;
+            case Field.JAnchorBZ: if (entry.Joint != null) entry.Joint.AnchorB.Z += dir * MoveStep; break;
+            case Field.JAxisX: if (entry.Joint != null) entry.Joint.Axis.X += dir * MoveStep; break;
+            case Field.JAxisY: if (entry.Joint != null) entry.Joint.Axis.Y += dir * MoveStep; break;
+            case Field.JAxisZ: if (entry.Joint != null) entry.Joint.Axis.Z += dir * MoveStep; break;
+            case Field.JLimitEnabled: if (entry.Joint != null) entry.Joint.LimitEnabled = !entry.Joint.LimitEnabled; break;   // N or M toggles
+            case Field.JLower: if (entry.Joint != null) entry.Joint.LowerLimit += dir * RotStep; break;
+            case Field.JUpper: if (entry.Joint != null) entry.Joint.UpperLimit += dir * RotStep; break;
+            case Field.JMotorEnabled: if (entry.Joint != null) entry.Joint.MotorEnabled = !entry.Joint.MotorEnabled; break;
+            case Field.JMotorSpeed: if (entry.Joint != null) entry.Joint.MotorTargetSpeed += dir * JointSpeedStep; break;
+            case Field.JMaxTorque: if (entry.Joint != null) entry.Joint.MaxMotorTorque = MathF.Max(0f, entry.Joint.MaxMotorTorque + dir * JointTorqueStep); break;
+            case Field.JRestLength: if (entry.Joint != null) entry.Joint.RestLength = MathF.Max(0f, entry.Joint.RestLength + dir * JointLengthStep); break;
+            case Field.JSpringEnabled: if (entry.Joint != null) entry.Joint.SpringEnabled = !entry.Joint.SpringEnabled; break;
+            case Field.JFrequency: if (entry.Joint != null) entry.Joint.Frequency = MathF.Max(0f, entry.Joint.Frequency + dir * JointFreqStep); break;
+            case Field.JDamping: if (entry.Joint != null) entry.Joint.DampingRatio = MathF.Max(0f, entry.Joint.DampingRatio + dir * JointDampStep); break;
         }
+    }
+
+    // Cycles a joint Kind ballsocket -> hinge -> distance -> ballsocket (N = forward, M = back).
+    private static readonly string[] JointKinds = { "ballsocket", "hinge", "distance" };
+    private static string NextJointKind(string? kind, int dir)
+    {
+        int idx = Array.IndexOf(JointKinds, kind?.Trim().ToLowerInvariant());
+        if (idx < 0) idx = 0;
+        int n = JointKinds.Length;
+        return JointKinds[(((idx + dir) % n) + n) % n];
+    }
+
+    // C1-4c: the joint marker's colour by kind (bright, so it reads like the camera/light markers). A hinge
+    // marker is one Object3d (single Colour), so its axis stub shares the hinge orange — it reads as a
+    // separate element by its perpendicular geometry (per-face colour isn't supported by a single-Colour mesh).
+    private static Rgba32 JointColor(string? kind) => kind?.Trim().ToLowerInvariant() switch
+    {
+        "hinge"      => new Rgba32(255, 150, 40),    // orange
+        "distance"   => new Rgba32(60, 220, 90),     // green
+        "ballsocket" => new Rgba32(0, 220, 255),     // cyan
+        _            => new Rgba32(255, 120, 255),   // magenta (unknown kind)
+    };
+
+    // C1-4c: builds the editor entry for a joint — a thin LINE marker (a non-colliding, PICKABLE Object3d)
+    // spanning the two anchors (coloured by kind; a hinge adds an axis stub), a "joint" descriptor (a fresh
+    // id), and an EditEntry carrying the LIVE JointConfig (mutated in place → save + the C1-4a bridge follow).
+    // Used by spawn AND load; the marker is rebuilt as the bodies move (UpdateJointMarkers). Replaced the
+    // C1-4b placeholder sphere.
+    private EditEntry BuildJointEntry(JointConfig cfg)
+    {
+        Vector3 wa = JointAnchorWorld(cfg.BodyA, cfg.AnchorA);
+        Vector3 wb = JointAnchorWorld(cfg.BodyB, cfg.AnchorB);
+        Vector3? axis = HingeAxisWorld(cfg);
+        var marker = BuildJointMarkerMesh(wa, wb, cfg.Kind, axis);   // verts are in WORLD space; the transform stays at the origin
+        marker.Color = JointColor(cfg.Kind);
+        marker.Collides = false;   // visual-only — never a collider or a physics body
+        marker.Gravity = false;
+        marker.UpdateGeometry();
+        // C1-5: the joint's stable id (shared with its cfg). An unset id (-1: a live spawn OR an old save with
+        // no id) draws a fresh one; a synced/saved id is kept verbatim so the joint is the same everywhere.
+        if (cfg.Id < 0) cfg.Id = _nextObjectId++;
+        var descriptor = new WorldObject { Id = cfg.Id, Type = "joint", Position = FromVec(JointMidpoint(cfg)) };
+        _models.Add(marker);
+        AddDisplaysObject(marker, castsShadow: false);   // visual-only; it must not cast shadows
+        var entry = new EditEntry { Descriptor = descriptor, Instance = marker, Joint = cfg };
+        _editables.Add(entry);
+        _jointMarkerCache[cfg] = (wa, wb, axis ?? Vector3.Zero);   // seed the rebuild cache (a resting joint won't rebuild)
+        return entry;
     }
 
     // Rebuilds the live floor mesh from the (just-mutated) PlatformConfig: a shape/size change
@@ -386,12 +465,15 @@ public partial class PriviewNetworkScene
             return;
         }
 
-        int id = _editables[_selected].Descriptor.Id;   // capture before removal (for the broadcast)
+        // C1-5: a joint deletes with a JointDelete (Op 5, keyed by cfg.Id); everything else uses the object
+        // Delete (Op 2). Capture the id/kind BEFORE removal (RemoveEntryAt also drops the cfg from _world.Joints).
+        bool isJoint = sel.Joint != null;
+        int id = isJoint ? sel.Joint!.Id : sel.Descriptor.Id;
         RemoveEntryAt(_selected);
 
-        // Server is the world authority: tell viewing clients to drop this object by id.
+        // Server is the world authority: tell viewing clients to drop this object/joint by id.
         if (_online && _isServer)
-            _netManager?.SendPacket(new WorldEditPacket { Op = 2, Id = id }, _myNetId);
+            _netManager?.SendPacket(new WorldEditPacket { Op = isJoint ? (byte)5 : (byte)2, Id = id }, _myNetId);
     }
 
     // Removes one editable entry from the display + tracking lists and keeps _selected/_fieldIndex
@@ -404,10 +486,14 @@ public partial class PriviewNetworkScene
         var entry = _editables[index];
         // Deleting the camera we're viewing THROUGH -> fall back to the body view (restore avatar visibility).
         if (IsCamera(entry) && entry.Descriptor.Id == _activeCameraId) { _activeCameraId = -1; ApplyCameraMode(); }
+        // C1-4b: deleting a joint entry drops its config from _world.Joints (so it's gone everywhere — the
+        // save list + the physics bridge). Deleting an OBJECT never touches _world.Joints; a joint left
+        // dangling by a deleted body is harmless (the bridge skips a joint whose id doesn't resolve — C1-4a).
+        if (entry.Joint != null) { _world.Joints.Remove(entry.Joint); _jointMarkerCache.Remove(entry.Joint); }   // C1-4c: drop its marker-rebuild cache too
         if (entry.Instance is IDisplays disp) RemoveDisplaysObject(disp);
         if (entry.Instance is Object3d o) _models.Remove(o);
         if (entry.Light != null) RemoveLight(entry.Light);   // a light: actually turn it off, not just hide the marker
-        _impBodies.Remove(entry.Instance);                   // drop the solver RigidBody state
+        _impBodies.Remove(entry.Instance); _hullScale.Remove(entry.Instance);   // drop the solver RigidBody state
         _physMoved.Remove(entry.Descriptor.Id);              // and any pending/interp sync state
         _physTargets.Remove(entry.Descriptor.Id);
         _editables.RemoveAt(index);
@@ -445,6 +531,40 @@ public partial class PriviewNetworkScene
             BuildPlatform();                          // appends the platform entry + sets _floor
             if (_editables.Count > 0) { _selected = _editables.Count - 1; _fieldIndex = 0; }
             if (_online && _isServer) BroadcastWorldSettings();   // push the re-enable to connected clients
+            return;
+        }
+
+        // A JOINT is authored like the platform special-case (C1-4b): it isn't an Object — it's a
+        // constraint. Create a JointConfig (defaults pinning the selected body to the world point in front),
+        // add it to _world.Joints (which the C1-4a bridge reads), and build its placeholder midpoint marker.
+        // No spawn broadcast — joint sync defers to C1-5.
+        if (string.Equals(label, "joint", StringComparison.OrdinalIgnoreCase))
+        {
+            // BodyA = the selected real body (an object, or the platform id 0) if one is selected; else 0
+            // (the platform). BodyB = -1 (the static WORLD). AnchorA = BodyA's local origin; AnchorB = the
+            // spawn world point (so it reads as "pinned there"). RestLength = the BodyA↔anchor distance.
+            int bodyA = 0;
+            if (_selected >= 0 && _selected < _editables.Count)
+            {
+                var selEntry = _editables[_selected];
+                if (selEntry.Joint == null && selEntry.Descriptor.Id >= 0) bodyA = selEntry.Descriptor.Id;
+            }
+            Vector3 anchorAWorld = JointAnchorWorld(bodyA, new Vec3Config());
+            var cfg = new JointConfig
+            {
+                Kind = "ballsocket",
+                BodyA = bodyA,
+                BodyB = -1,                              // the static world
+                AnchorA = new Vec3Config(),              // BodyA's local origin
+                AnchorB = FromVec(spawnPos),             // the world point in front of the body
+                RestLength = MathF.Max(0.5f, (anchorAWorld - spawnPos).Length()),
+            };
+            _world.Joints.Add(cfg);
+            BuildJointEntry(cfg);   // assigns cfg.Id
+            _selected = _editables.Count - 1; _fieldIndex = 0;
+            // C1-5: the authority streams the new joint to viewing clients (reliable TCP; no mesh/texture).
+            if (_online && _isServer)
+                _netManager?.SendPacket(new WorldEditPacket { Op = 4, Id = cfg.Id, ObjectJson = JsonSerializer.Serialize(cfg) }, _myNetId);
             return;
         }
 
@@ -524,7 +644,7 @@ public partial class PriviewNetworkScene
 
     private void SaveWorld()
     {
-        _world = BuildLiveWorldConfig();
+        _world = BuildLiveWorldConfig();   // now carries Joints (C1-5) — one builder for save AND world-sync
         WorldManager.Save(_world);
         _saveMsg = $"Saved to {_world.Name} ({_world.Objects.Count} objects)";
         _saveFlash = 120;
@@ -548,11 +668,16 @@ public partial class PriviewNetworkScene
             Graphics = _world.Graphics,
             Physics = _world.Physics,     // gravity + collision world switches persist on save/sync
             Platform = _world.Platform,   // the live platform (mutated in place) rides along for save/sync
-            // EXCLUDE the platform entry: it is an extra selectable, not an Object — it must never leak
-            // into the saved/synced object list (it carries through Platform above instead).
+            // EXCLUDE the platform AND joint entries: they are extra selectables, not Objects — they must
+            // never leak into the saved/synced object list (the platform carries through Platform above; a
+            // joint is a constraint that rides WorldConfig.Joints below).
             Objects = _editables
-                .Where(e => !string.Equals(e.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase))
+                .Where(e => !string.Equals(e.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase)
+                         && !string.Equals(e.Descriptor.Type, "joint", StringComparison.OrdinalIgnoreCase))
                 .Select(e => FromInstance(e.Descriptor, e.Instance, e.Light)).ToList(),
+            // C1-5: the LIVE joint list (same references) rides save AND the world-sync pack (OnWorldRequested
+            // packs this builder), so a joining client receives the world's joints.
+            Joints = _world.Joints,
         };
     }
 

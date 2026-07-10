@@ -86,6 +86,7 @@ public partial class PriviewNetworkScene : Scene
 
     // ---- Client world download (4b) ----
     private bool _awaitingWorld = false;   // client only: true until the server's world arrives
+    private bool _hasSessionToken = false; // client only: true once the server's UDP token arrives (gates the UDP transform stream)
     private bool _worldReceived = false;   // client only: a world has been applied
     private float _requestTimer = 0f;      // client only: countdown to the next WorldRequestPacket
 
@@ -119,6 +120,11 @@ public partial class PriviewNetworkScene : Scene
         // For the special "platform" entry: the LIVE PlatformConfig (mutated in place), so editing
         // its Shape/size/Color persists on save/sync. Non-null ONLY for the platform entry.
         public PlatformConfig? Platform;
+        // For a "joint" object (C1-4b): the LIVE JointConfig in _world.Joints (mutated in place), so editing
+        // its params rides save + the C1-4a physics bridge. Its Instance is a placeholder midpoint marker;
+        // there is no engine companion. Non-null ONLY for a joint entry. Excluded from the saved Objects list
+        // (like the platform) — joints ride WorldConfig.Joints.
+        public JointConfig? Joint;
     }
 
     // The HUD has three modes: PLAY (minimal HUD over full-screen 3D), OVERLAY-EDIT (the existing overlay
@@ -180,6 +186,12 @@ public partial class PriviewNetworkScene : Scene
     private const float RollFrictionStep = 0.02f;        // per-object rolling-friction adjust per N/M press
     private const float ColorFadeStep = 0.1f;            // per-object colour paleness adjust per N/M press
     private const float TextureScaleStep = 0.1f;         // per-object UV tiling adjust per N/M press
+    // Joint (C1-4b) editor steps: anchors/axis reuse MoveStep, limits reuse RotStep; the rest have their own.
+    private const float JointSpeedStep = 0.5f;           // hinge motor target speed (rad/s) per N/M
+    private const float JointTorqueStep = 5f;            // hinge max motor torque per N/M
+    private const float JointLengthStep = 0.25f;         // distance rest length per N/M
+    private const float JointFreqStep = 0.5f;            // distance spring frequency (Hz) per N/M
+    private const float JointDampStep = 0.1f;            // distance spring damping ratio per N/M
     private static readonly string[] PlatformShapes = { "square", "rectangle", "circle" };   // ordered for PlatShape cycle
     private const float LightMarkerScale = 0.3f;         // size of the small cube that marks a light
     private static readonly Vector3 LightMarkerOffset = Vector3.Zero;  // Light sits exactly at its marker; the marker is a non-shadow-caster so there's no self-shadow to avoid
@@ -191,7 +203,11 @@ public partial class PriviewNetworkScene : Scene
     private enum Field { Name, PosX, PosY, PosZ, RotX, RotY, RotZ, Scale, RotateSpeed, ColorR, ColorG, ColorB, ColorA, Radius,
                          Power, ClrInf, Kind, DirX, DirY, DirZ, ConeAngle, AreaSize, AreaShape, Spin, Beams, Shape,
                          PlatShape, PlatSize, PlatWidth, PlatDepth, Collides, Gravity, Collider, Mass, Restitution, Friction, RollingFriction, ColorFade,
-                         Texture, TextureScale, TextureFace, TextureFilter, CamKind, FollowTargetId }
+                         Texture, TextureScale, TextureFace, TextureFilter, CamKind, FollowTargetId,
+                         // ---- joint-only fields (C1-4b; ignored for non-joint entries) ----
+                         JointKind, JBodyA, JBodyB, JAnchorAX, JAnchorAY, JAnchorAZ, JAnchorBX, JAnchorBY, JAnchorBZ,
+                         JAxisX, JAxisY, JAxisZ, JLimitEnabled, JLower, JUpper, JMotorEnabled, JMotorSpeed, JMaxTorque,
+                         JRestLength, JSpringEnabled, JFrequency, JDamping }
     private int _fieldIndex = 0;
 
     // Editable fields for the selected entry. A light's set depends on its Kind: every light shows
@@ -234,6 +250,30 @@ public partial class PriviewNetworkScene : Scene
         // visual-only indicator).
         if (type == "camera")
             return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.CamKind, Field.FollowTargetId, Field.Name };
+        // A joint pins two bodies together; its field set depends on Kind (mirroring the "light" branch's
+        // dynamic set by LightKind). Common: kind + both body ids + both local anchors. Hinge adds the axis
+        // + limit + motor; distance adds rest length + spring; ball-socket is common-only. Changing JointKind
+        // swaps the set (the per-frame FieldsFor + _fieldIndex clamp handles it, exactly like LightKind).
+        if (type == "joint")
+        {
+            var jf = new List<Field> { Field.JointKind, Field.JBodyA, Field.JBodyB,
+                Field.JAnchorAX, Field.JAnchorAY, Field.JAnchorAZ,
+                Field.JAnchorBX, Field.JAnchorBY, Field.JAnchorBZ };
+            switch (e.Joint?.Kind?.Trim().ToLowerInvariant())
+            {
+                case "hinge":
+                    jf.AddRange(new[] { Field.JAxisX, Field.JAxisY, Field.JAxisZ,
+                        Field.JLimitEnabled, Field.JLower, Field.JUpper,
+                        Field.JMotorEnabled, Field.JMotorSpeed, Field.JMaxTorque });
+                    break;
+                case "distance":
+                    jf.AddRange(new[] { Field.JRestLength, Field.JSpringEnabled, Field.JFrequency, Field.JDamping });
+                    break;
+                // "ballsocket" (and default): common only
+            }
+            jf.Add(Field.Name);
+            return jf.ToArray();
+        }
         return new[] { Field.PosX, Field.PosY, Field.PosZ, Field.RotX, Field.RotY, Field.RotZ, Field.Scale, Field.RotateSpeed, Field.ColorR, Field.ColorG, Field.ColorB, Field.ColorA, Field.ColorFade, Field.Texture, Field.TextureScale, Field.TextureFace, Field.TextureFilter, Field.Collides, Field.Gravity, Field.Collider, Field.Mass, Field.Restitution, Field.Friction, Field.RollingFriction, Field.Name };
     }
 
@@ -275,6 +315,7 @@ public partial class PriviewNetworkScene : Scene
         PacketManager.RegisterPacket<MeshChunkPacket>();
         PacketManager.RegisterPacket<TextureChunkPacket>();
         PacketManager.RegisterPacket<PhysicsSyncPacket>();
+        PacketManager.RegisterPacket<SessionPacket>();
 
         PacketManager.Subscribe<TransformPacket>(OnTransformReceived);
         PacketManager.Subscribe<ChatPacket>(OnChatReceived);
@@ -300,6 +341,7 @@ public partial class PriviewNetworkScene : Scene
             PacketManager.Subscribe<MeshChunkPacket>(OnMeshChunkReceived);
             PacketManager.Subscribe<TextureChunkPacket>(OnTextureChunkReceived);
             PacketManager.Subscribe<PhysicsSyncPacket>(OnPhysicsSyncReceived);
+            PacketManager.Subscribe<SessionPacket>(OnSessionReceived);   // the server's per-session UDP token
             _awaitingWorld = true;
             _netManager.Connect(targetIp, port);
             Logger.Info($"Connecting to {targetIp}:{port}");
@@ -338,6 +380,7 @@ public partial class PriviewNetworkScene : Scene
         _spawnTypes.Add("flatpicture");
         _spawnTypes.Add("light");
         _spawnTypes.Add("camera");
+        _spawnTypes.Add("joint");
         _spawnTypes.Add("platform");
         _spawnTypes.AddRange(WorldManager.ListAvailableMeshes());
 
@@ -350,10 +393,20 @@ public partial class PriviewNetworkScene : Scene
             for (int i = 0; i < _world.Objects.Count; i++)
                 _world.Objects[i].Id = i + 1;   // ids 1..N — id 0 is reserved for the platform
             _nextObjectId = _world.Objects.Count + 1;
+            // C1-5: joint ids share the object id space — seed past any SAVED joint ids (kept verbatim by
+            // BuildJointEntry) so a later spawn/-1 joint can't collide with them.
+            foreach (var j in _world.Joints)
+                if (j.Id >= _nextObjectId) _nextObjectId = j.Id + 1;
         }
 
         foreach (var obj in _world.Objects)
             BuildWorldObject(obj);
+
+        // C1-4b: build a placeholder editor entry for each saved joint, AFTER the objects (so BodyA/BodyB ids
+        // resolve to live instances for the midpoint marker). A joint-free world adds nothing here — no
+        // behaviour change. The C1-4a physics bridge reads _world.Joints directly each frame.
+        foreach (var cfg in _world.Joints)
+            BuildJointEntry(cfg);
     }
 
     // The settings "extra light" toggle, realized as a full editable "light" WorldObject (so it gets
@@ -619,19 +672,25 @@ public partial class PriviewNetworkScene : Scene
         FlushPhysicsSync();                            // server: send the changed-object batch
         StepNetworkPhysics(GameTime.GetDeltaTime());   // client: dead-reckon + lerp toward targets
 
+        UpdateJointMarkers();                          // C1-4b: keep each joint's placeholder marker at its live midpoint (no-op when joint-free)
+
         // Server is the world authority: if an edit-action changed the selected object this frame,
         // stream ONE coalesced delta for it. A dirty PLATFORM pushes the whole settings packet (it has
         // no per-object delta); any other object streams a coalesced Modify.
         if (_online && _isServer && _editDirty && _selected >= 0 && _selected < _editables.Count)
         {
             var sel = _editables[_selected];
-            if (string.Equals(sel.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase))
+            if (sel.Joint != null)                        // C1-5: a joint streams the whole JointConfig (JointModify)
+                _netManager?.SendPacket(new WorldEditPacket { Op = 3, Id = sel.Joint.Id, ObjectJson = JsonSerializer.Serialize(sel.Joint) }, _myNetId);
+            else if (string.Equals(sel.Descriptor.Type, "platform", StringComparison.OrdinalIgnoreCase))
                 BroadcastWorldSettings();                 // platform: push whole settings (no per-object delta)
             else { var o = FromInstance(sel.Descriptor, sel.Instance, sel.Light); _netManager?.SendPacket(new WorldEditPacket { Op = 0, Id = o.Id, ObjectJson = JsonSerializer.Serialize(o) }, _myNetId); }
         }
         _editDirty = false;
 
-        if (!_isChatting && _netManager != null)
+        // A client streams only once it has its UDP session token (server drops earlier, token-0 frames
+        // anyway); the server host isn't a UDP client, so it always streams. ~1 RTT gate at join only.
+        if (!_isChatting && _netManager != null && (_isServer || _hasSessionToken))
         {
             // Stream the BODY transform (in 1st person the body IS at the old camera position, so remote
             // avatars look exactly as before; in 3rd person peers still see your body, not your camera). Use
@@ -770,6 +829,20 @@ public partial class PriviewNetworkScene : Scene
         return _editables.Count;
     }
 
+    // ---- C1-4b joint-authoring test hooks (headless) ----
+    // Select an editable (so a "joint" spawn picks it as BodyA), read the world's live joint configs, and
+    // delete the entry at `index` through the real DeleteSelected path (which prunes _world.Joints for joints).
+    public void SelectForTest(int index) { if (index >= 0 && index < _editables.Count) { _selected = index; _fieldIndex = 0; } }
+    public IReadOnlyList<JointConfig> WorldJointsForTest => _world.Joints;
+    public void DeleteSelectedForTest(int index) { _selected = index; DeleteSelected(); }
+
+    // ---- C1-5 joint-sync test hooks (headless) ----
+    // Feed a crafted WorldEditPacket through the SAME client-apply handler (joint ops 3/4/5), and apply a
+    // received WorldConfig through the SAME join path (ApplyReceivedWorld, empty mesh/texture maps).
+    public void ApplyWorldEditForTest(NetworkPackets.WorldEditPacket p) => OnWorldEditReceived(p, 0);
+    public void ApplyReceivedWorldForTest(WorldConfig w) =>
+        ApplyReceivedWorld(w, new Dictionary<string, string>(), new Dictionary<string, byte[]>());
+
     // Inspection/test accessors for the local player body (B-camera): its stable id + system name, whether
     // it leaked into the editables list (it must NOT — it's the player, not world content), and its current
     // world position + the derived camera position.
@@ -826,6 +899,34 @@ public partial class PriviewNetworkScene : Scene
     // Test hook: advance the authority physics one step (so a headless test can verify stability
     // without the interactive render loop). Same call the Update loop makes.
     public void StepPhysicsForTest(float dt) => StepPhysics(dt);
+
+    // C2-5 bridge test hook: the solver ColliderKind of a dynamic object's persistent RigidBody (null if the
+    // object has no solver body this frame — e.g. static, deleted, or gravity-off). Lets a headless test assert a
+    // gravity+collides MESH became a Hull while a cube PRIMITIVE stayed a Box.
+    public ColliderKind? BodyKindForTest(int id)
+    {
+        int idx = _editables.FindIndex(e => e.Descriptor.Id == id);
+        if (idx < 0) return null;
+        return _impBodies.TryGetValue(_editables[idx].Instance, out var rb) ? rb.Kind : null;
+    }
+
+    // C2-5 bridge test hook: the o.Scale a dynamic-mesh hull body was last (re)built with (NaN if none cached) —
+    // lets a headless test assert a scale edit REBUILT the hull (the cached scale followed o.Scale).
+    public float HullBuiltScaleForTest(int id)
+    {
+        int idx = _editables.FindIndex(e => e.Descriptor.Id == id);
+        if (idx < 0) return float.NaN;
+        return _hullScale.TryGetValue(_editables[idx].Instance, out float s) ? s : float.NaN;
+    }
+
+    // ---- C4 player-capsule test hooks (headless): set/read the body position, drive the player step or a raw
+    //      collision resolve, read onGround, and read the capsule dimensions so a test computes the rest height. ----
+    public Vector3 PlayerBodyForTest { get => _localBody.Position; set => _localBody.Position = value; }
+    public bool PlayerOnGroundForTest => _onGround;
+    public void ResolveBodyCollisionForTest() => ResolveBodyCollision();
+    public void StepPlayerForTest(float dt) => StepPlayerPhysics(dt);
+    public static float CapsuleHalfForTest => CapsuleHalf;
+    public static float CapsuleRadiusForTest => CameraRadius;
 
     // ---- Stage-7a multiplayer-sync test hooks (headless) ----
     // Snapshot the CURRENT dynamic-body state (pos + Euler orientation + full linVel + angVel) into a

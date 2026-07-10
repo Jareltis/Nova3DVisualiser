@@ -6,15 +6,16 @@ namespace Nova3DVisualiser.Network;
 // NetworkManager so the framing + sequence logic can be unit-tested (udptest) with no real sockets.
 //
 // A UDP datagram is message-oriented — one datagram == one packet — so there is NO length prefix
-// (unlike the TCP BuildFrame). Header: TypeId(int32) + SenderId(int32) + Seq(int32) = 12 bytes, then
-// the packet payload.
+// (unlike the TCP BuildFrame). Header: TypeId(int32) + SenderId(int32) + Seq(int32) + Token(int64) = 20
+// bytes, then the packet payload. The Token is a per-session secret the server issues over TCP and the
+// client stamps on every UDP frame, so an off-path spoofer can't inject fake datagrams (client→server).
 public static class UdpFraming
 {
-    public const int HeaderSize = 12;   // TypeId(4) + SenderId(4) + Seq(4)
+    public const int HeaderSize = 20;   // TypeId(4) + SenderId(4) + Seq(4) + Token(8)
 
     // Serialize the packet, then prepend the UDP header. Mirrors NetworkManager.BuildFrame's payload
-    // pattern; the only difference is the header (Seq instead of a length prefix).
-    public static byte[] BuildUdpFrame<T>(T packet, int senderId, int seq) where T : INetworkPacket
+    // pattern; the differences are Seq (instead of a length prefix) and the per-session Token.
+    public static byte[] BuildUdpFrame<T>(T packet, int senderId, int seq, long token) where T : INetworkPacket
     {
         int typeId = PacketManager.GetId(packet.GetType());
 
@@ -28,17 +29,19 @@ public static class UdpFraming
         writer.Write(typeId);
         writer.Write(senderId);
         writer.Write(seq);
+        writer.Write(token);
         writer.Write(payload);
         return ms.ToArray();
     }
 
     // Parse a received datagram. Returns false (packet == null) on ANY malformed/short buffer or unknown
     // typeId — it never throws out of this method, so a garbage datagram can't crash the receive loop.
-    public static bool TryParseUdpFrame(byte[] buffer, int length, out int typeId, out int senderId, out int seq, out INetworkPacket? packet)
+    public static bool TryParseUdpFrame(byte[] buffer, int length, out int typeId, out int senderId, out int seq, out long token, out INetworkPacket? packet)
     {
         typeId = 0;
         senderId = 0;
         seq = 0;
+        token = 0;
         packet = null;
 
         if (buffer == null || length < HeaderSize || length > buffer.Length) return false;
@@ -51,6 +54,7 @@ public static class UdpFraming
             typeId = reader.ReadInt32();
             senderId = reader.ReadInt32();
             seq = reader.ReadInt32();
+            token = reader.ReadInt64();
 
             INetworkPacket instance = PacketManager.CreateInstance(typeId);   // throws on an unknown id
             instance.Deserialize(reader);                                     // throws if the payload is short/garbled

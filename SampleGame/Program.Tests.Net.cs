@@ -34,14 +34,16 @@ partial class Program
             var sent = new TransformPacket(pos, rot);
             const int senderId = 7;
             const int seq = 42;
+            const long token = 0x1122334455667788L;
 
-            byte[] frame = UdpFraming.BuildUdpFrame(sent, senderId, seq);
-            bool parsed = UdpFraming.TryParseUdpFrame(frame, frame.Length, out int typeId, out int gotSender, out int gotSeq, out var packet);
+            byte[] frame = UdpFraming.BuildUdpFrame(sent, senderId, seq, token);
+            bool parsed = UdpFraming.TryParseUdpFrame(frame, frame.Length, out int typeId, out int gotSender, out int gotSeq, out long gotToken, out var packet);
 
             Check(parsed, "transform frame parses");
             Check(typeId == PacketManager.GetId<TransformPacket>(), "transform typeId matches GetId<TransformPacket>");
             Check(gotSender == senderId, "transform senderId round-trips");
             Check(gotSeq == seq, "transform seq round-trips");
+            Check(gotToken == token, "transform token round-trips");
             if (packet is TransformPacket tp)
             {
                 Check(tp.Pos == pos, "transform Pos round-trips");
@@ -62,13 +64,15 @@ partial class Program
             };
             const int senderId = 2;
             const int seq = 5;
+            const long token = -0x0123456789ABCDEFL;
 
-            byte[] frame = UdpFraming.BuildUdpFrame(sent, senderId, seq);
-            bool parsed = UdpFraming.TryParseUdpFrame(frame, frame.Length, out int typeId, out int gotSender, out int gotSeq, out var packet);
+            byte[] frame = UdpFraming.BuildUdpFrame(sent, senderId, seq, token);
+            bool parsed = UdpFraming.TryParseUdpFrame(frame, frame.Length, out int typeId, out int gotSender, out int gotSeq, out long gotToken, out var packet);
 
             Check(parsed, "physics frame parses");
             Check(typeId == PacketManager.GetId<PhysicsSyncPacket>(), "physics typeId matches GetId<PhysicsSyncPacket>");
             Check(gotSender == senderId && gotSeq == seq, "physics senderId+seq round-trip");
+            Check(gotToken == token, "physics token round-trips");
             if (packet is PhysicsSyncPacket pp)
             {
                 bool same = pp.Ids.Length == 2 && pp.Ids[0] == 3 && pp.Ids[1] == 9
@@ -86,8 +90,8 @@ partial class Program
             bool threw = false, parsed = true;
             try
             {
-                var shortBuf = new byte[5];   // < 12-byte header
-                parsed = UdpFraming.TryParseUdpFrame(shortBuf, shortBuf.Length, out _, out _, out _, out var packet);
+                var shortBuf = new byte[5];   // < 20-byte header
+                parsed = UdpFraming.TryParseUdpFrame(shortBuf, shortBuf.Length, out _, out _, out _, out _, out var packet);
                 Check(packet == null, "malformed → null packet");
             }
             catch { threw = true; }

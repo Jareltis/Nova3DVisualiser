@@ -14,6 +14,9 @@ public class WorldConfig
     public PlatformConfig Platform { get; set; } = new();
     public List<WorldObject> Objects { get; set; } = new();
     public PhysicsConfig Physics { get; set; } = new();
+    // Constraint joints between objects (C1-4a). Old worlds have no "joints" key -> this stays the empty
+    // default (backward compatible). Built into the impulse solver by the scene's physics bridge.
+    public List<JointConfig> Joints { get; set; } = new();
 }
 
 public class GraphicsConfig
@@ -113,4 +116,35 @@ public class WorldObject
     // ---- camera-only fields (ignored for other types) ----
     public string CameraKind { get; set; } = "fixed";  // camera: "fixed" (placed position + orientation) | "follow" (placed position, orientation looks at a target)
     public int FollowTargetId { get; set; } = -1;      // follow camera: object id to aim at; -1 = the player body (default). Ignored by fixed cameras.
+}
+
+/// <summary>
+/// A constraint joint between two objects (C1-4a). Built into the impulse solver by the physics bridge; only
+/// effective when world gravity/physics is on and both bodies are dynamic solver bodies (or a fixed WORLD
+/// anchor, BodyId -1). Serialized with the rest of the world; unmapped params for a Kind are ignored.
+/// </summary>
+public class JointConfig
+{
+    // Stable network/save id in the SAME id space as object ids (the authority's _nextObjectId counter). A
+    // joint ENTRY's Descriptor.Id equals this — one id for the joint everywhere (C1-5 sync + save). Old JSON
+    // without this key deserializes to -1; the authority then assigns a fresh id at entry-build.
+    public int Id { get; set; } = -1;
+    public string Kind { get; set; } = "ballsocket";   // "ballsocket" | "hinge" | "distance"
+    public int BodyA { get; set; } = -1;                // object Id; -1 = the static WORLD (a fixed anchor point)
+    public int BodyB { get; set; } = -1;
+    public Vec3Config AnchorA { get; set; } = new();    // anchor in BodyA's LOCAL frame (or WORLD position when BodyA == -1)
+    public Vec3Config AnchorB { get; set; } = new();    // anchor in BodyB's LOCAL frame (or WORLD position when BodyB == -1)
+    // ---- hinge (revolute) ----
+    public Vec3Config Axis { get; set; } = new();       // hinge axis in local frame (shared -> both bodies' LocalAxis)
+    public bool LimitEnabled { get; set; }
+    public float LowerLimit { get; set; }               // radians (relative to the assembly angle)
+    public float UpperLimit { get; set; }
+    public bool MotorEnabled { get; set; }
+    public float MotorTargetSpeed { get; set; }         // rad/s about the axis
+    public float MaxMotorTorque { get; set; }           // torque cap (>= 0)
+    // ---- distance (rod / spring) ----
+    public float RestLength { get; set; }
+    public bool SpringEnabled { get; set; }             // true + Frequency>0 -> soft spring; otherwise a rigid rod
+    public float Frequency { get; set; }                // spring frequency (Hz)
+    public float DampingRatio { get; set; }             // spring damping ratio (1 = critical)
 }

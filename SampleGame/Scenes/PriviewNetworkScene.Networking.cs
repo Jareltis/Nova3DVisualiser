@@ -35,6 +35,10 @@ public partial class PriviewNetworkScene
         // connection's lifetime, so recording it here (once per request is harmless) suffices.
         RecordConnMappingIfTcp(connId, senderId);
 
+        // Issue this client its per-session UDP token FIRST (over TCP, before the world/texture streaming),
+        // so it can authenticate its UDP frames as early as possible.
+        IssueUdpTokenIfNeeded(connId, senderId);
+
         // Stream every LARGE referenced texture (too big to inline) as chunks to THIS requester FIRST, so
         // that — TCP being reliable + ordered — the peer materializes them to disk before the world packet
         // below triggers its build. Small textures already ride inline in `sync`.
@@ -69,6 +73,40 @@ public partial class PriviewNetworkScene
         ApplyReceivedWorld(world, meshTexts, textureData);
     }
 
+    // ---- UDP session token (client→server authentication) ----
+
+    // SERVER: connId -> the UDP token issued to that connection (so it can be revoked on disconnect).
+    private readonly Dictionary<int, long> _connToken = new();
+
+    // SERVER: issue a per-session UDP token to a connecting client ONCE, register it as valid, and send it
+    // over reliable TCP. The client stamps it on every UDP frame; the server drops datagrams whose token it
+    // hasn't issued (see NetworkManager.UdpReadLoop), so an off-path spoofer can't inject fake UDP traffic.
+    private void IssueUdpTokenIfNeeded(int connId, int senderId)
+    {
+        if (connId < 0 || _netManager == null) return;
+        if (_connToken.ContainsKey(connId)) return;   // already issued for this connection
+
+        long token;
+        Span<byte> buf = stackalloc byte[8];
+        do
+        {
+            System.Security.Cryptography.RandomNumberGenerator.Fill(buf);
+            token = BitConverter.ToInt64(buf);
+        } while (token == 0);   // 0 is the "no token yet" sentinel — never issue it
+
+        _connToken[connId] = token;
+        _netManager.RegisterValidUdpToken(token);
+        _netManager.SendPacketTo(connId, new SessionPacket { Token = token }, _myNetId);
+    }
+
+    // CLIENT: the server issued our per-session UDP token — stamp it on outgoing UDP frames and unblock the
+    // transform stream (gated on _hasSessionToken until now). Runs on the main thread via ProcessEvents.
+    private void OnSessionReceived(SessionPacket packet, int senderId)
+    {
+        _netManager?.SetLocalUdpToken(packet.Token);
+        _hasSessionToken = true;
+    }
+
     // Client side: a server edit delta arrived. Runs on the main thread (via ProcessEvents in
     // Update), so applying directly to the live scene is safe. Handles Modify/Spawn/Delete.
     private void OnWorldEditReceived(WorldEditPacket packet, int senderId)
@@ -78,6 +116,39 @@ public partial class PriviewNetworkScene
             int del = _editables.FindIndex(e => e.Descriptor.Id == packet.Id);
             if (del < 0) { Logger.Warning($"WorldEdit Delete for unknown id {packet.Id}; ignoring."); return; }
             RemoveEntryAt(del);
+            return;
+        }
+
+        // ---- C1-5: joint deltas (handled BEFORE the WorldObject parse; ops 3/4 carry a JointConfig) ----
+        if (packet.Op == 5)   // JointDelete: drop the joint entry with this cfg.Id
+        {
+            int del = _editables.FindIndex(e => e.Joint != null && e.Joint.Id == packet.Id);
+            if (del < 0) { Logger.Warning($"WorldEdit JointDelete for unknown joint id {packet.Id}; ignoring."); return; }
+            RemoveEntryAt(del);   // also drops the cfg from _world.Joints + the marker cache
+            return;
+        }
+        if (packet.Op == 3 || packet.Op == 4)
+        {
+            JointConfig? jc;
+            try { jc = JsonSerializer.Deserialize<JointConfig>(packet.ObjectJson); }
+            catch (Exception ex) { Logger.Error("WorldEdit: bad joint ObjectJson", ex); return; }
+            if (jc == null) return;
+
+            if (packet.Op == 4)   // JointSpawn: idempotent by id, then add + build the entry
+            {
+                int existing = _editables.FindIndex(e => e.Joint != null && e.Joint.Id == jc.Id);
+                if (existing >= 0) RemoveEntryAt(existing);   // drops the stale cfg from _world.Joints first (no duplicate)
+                _world.Joints.Add(jc);
+                BuildJointEntry(jc);   // keeps the server's cfg.Id (already set)
+                return;                // do NOT touch _selected — the client's selection is its own
+            }
+
+            // JointModify (3): mutate the LIVE cfg IN PLACE. entry.Joint and the C1-4a bridge are keyed by
+            // REFERENCE, so an in-place copy makes the received edit behave exactly like a local one — the
+            // bridge, the C1-4c marker and FieldsFor all follow. Replacing the reference would orphan them.
+            int jidx = _editables.FindIndex(e => e.Joint != null && e.Joint.Id == packet.Id);
+            if (jidx < 0) { Logger.Warning($"WorldEdit JointModify for unknown joint id {packet.Id}; ignoring."); return; }
+            CopyJointFields(_editables[jidx].Joint!, jc);
             return;
         }
 
@@ -117,6 +188,20 @@ public partial class PriviewNetworkScene
             ApplyLightFields(light, o, _editables[idx].Instance.Position);
             ReplaceMarker(_editables[idx], BuildLightMarker(light.Kind, light.Direction, light.AreaSize, light.ConeShape, light.ConeAngleDeg, light.AreaShape, light.BeamCount));
         }
+    }
+
+    // C1-5: copy every JointConfig field EXCEPT Id from src into dst IN PLACE, so the reference the entry +
+    // the C1-4a bridge + the C1-4c marker cache hold stays the live one (a received JointModify then behaves
+    // exactly like a local field edit). The id already matches (looked up by it), so it's left untouched.
+    private static void CopyJointFields(JointConfig dst, JointConfig src)
+    {
+        dst.Kind = src.Kind;
+        dst.BodyA = src.BodyA; dst.BodyB = src.BodyB;
+        dst.AnchorA = src.AnchorA; dst.AnchorB = src.AnchorB; dst.Axis = src.Axis;
+        dst.LimitEnabled = src.LimitEnabled; dst.LowerLimit = src.LowerLimit; dst.UpperLimit = src.UpperLimit;
+        dst.MotorEnabled = src.MotorEnabled; dst.MotorTargetSpeed = src.MotorTargetSpeed; dst.MaxMotorTorque = src.MaxMotorTorque;
+        dst.RestLength = src.RestLength;
+        dst.SpringEnabled = src.SpringEnabled; dst.Frequency = src.Frequency; dst.DampingRatio = src.DampingRatio;
     }
 
     // Server: push the live PlatformConfig (+ GraphicsConfig) to connected clients. Called on every
@@ -325,17 +410,28 @@ public partial class PriviewNetworkScene
         }
         _editables.Clear();
         _models.Clear();
-        _impBodies.Clear(); _physMoved.Clear(); _physTargets.Clear();   // drop stale physics/sync state
+        _impBodies.Clear(); _hullScale.Clear(); _physMoved.Clear(); _physTargets.Clear();   // drop stale physics/sync state
+        // C1-5: drop stale joint bridge + marker state too, so a world swap never carries an old world's joints.
+        _impJoints.Clear(); _impJointBuiltWith.Clear(); _impJointsWarned.Clear(); _jointMarkerCache.Clear();
         _selected = -1;
         _floor = null;   // the floor is an editable entry now; the loop above already removed its display
 
         // 3) Build the received world (BuildWorldObject loads meshes from _modelsFolder == received/).
         _world = world;
-        // Adopt the server's ids verbatim (do NOT reassign); future local spawns (5b) start past them.
-        _nextObjectId = _world.Objects.Count == 0 ? PlatformId + 1 : _world.Objects.Max(o => o.Id) + 1;   // never hand out id 0 (platform)
+        // Adopt the server's ids verbatim (do NOT reassign); future local spawns (5b) start past them. Joint
+        // ids share the object id space (C1-5), so seed past the max of BOTH.
+        int maxId = PlatformId;
+        foreach (var o in _world.Objects) if (o.Id > maxId) maxId = o.Id;
+        foreach (var j in _world.Joints) if (j.Id > maxId) maxId = j.Id;
+        _nextObjectId = maxId + 1;   // never hand out id 0 (platform)
         BuildPlatform();
         foreach (var o in _world.Objects)
             BuildWorldObject(o);
+
+        // C1-5: build a joint entry per received cfg (AFTER the objects, so BodyA/BodyB ids resolve). Client
+        // joints are effectively read-only, but their markers track the bodies (which move via physics-sync).
+        foreach (var j in _world.Joints)
+            BuildJointEntry(j);
 
         // 4) Apply its graphics and reconcile the lights against the placeholder's.
         ApplyGraphicsSettings();   // shadows + BVH + camera light, idempotent

@@ -101,6 +101,56 @@ partial class Program
         Console.WriteLine($"Ramp geometry: faces={ramp.FaceCount} (want 8)");
         if (ramp.FaceCount != 8) { Console.WriteLine($"WORLD TEST FAILED: ramp should have 8 faces, got {ramp.FaceCount}."); return; }
 
+        // C1-4a — the world's Joints list round-trips through the same JSON options WorldManager uses (in-memory,
+        // no disk artifact): one of each kind (ballsocket dyn↔dyn, hinge dyn↔world with limit+motor, distance
+        // dyn↔world spring). Assert every field of each joint survives; and an OLD world with NO "joints" key
+        // loads as an EMPTY list (backward compatible — old worlds unchanged).
+        {
+            var jw = new WorldConfig
+            {
+                Name = "jointrt",
+                Joints = new List<JointConfig>
+                {
+                    new JointConfig { Kind = "ballsocket", BodyA = 0, BodyB = 1,
+                        AnchorA = new Vec3Config { X = 0.1f, Y = 0.2f, Z = 0.3f },
+                        AnchorB = new Vec3Config { X = -0.4f, Y = 0.5f, Z = -0.6f } },
+                    new JointConfig { Kind = "hinge", BodyA = 2, BodyB = -1,
+                        AnchorA = new Vec3Config { X = 1f, Y = 0f, Z = 0f }, AnchorB = new Vec3Config { X = 0f, Y = 3f, Z = 0f },
+                        Axis = new Vec3Config { X = 0f, Y = 0f, Z = 1f },
+                        LimitEnabled = true, LowerLimit = -1.2f, UpperLimit = 0.8f,
+                        MotorEnabled = true, MotorTargetSpeed = 2.5f, MaxMotorTorque = 15f },
+                    new JointConfig { Kind = "distance", BodyA = 3, BodyB = -1,
+                        AnchorB = new Vec3Config { X = 0f, Y = 5f, Z = 0f },
+                        RestLength = 2.5f, SpringEnabled = true, Frequency = 3f, DampingRatio = 0.4f },
+                },
+            };
+            string jjson = System.Text.Json.JsonSerializer.Serialize(jw, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            var jrt = System.Text.Json.JsonSerializer.Deserialize<WorldConfig>(jjson,
+                new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            if (jrt == null || jrt.Joints.Count != 3)
+            { Console.WriteLine($"WORLD TEST FAILED: joints round-trip count={jrt?.Joints.Count} (want 3)."); return; }
+
+            var ja = jrt.Joints[0]; var jb = jrt.Joints[1]; var jc = jrt.Joints[2];
+            bool jaOk = ja.Kind == "ballsocket" && ja.BodyA == 0 && ja.BodyB == 1
+                && Math.Abs(ja.AnchorA.X - 0.1f) < 1e-4f && Math.Abs(ja.AnchorA.Y - 0.2f) < 1e-4f && Math.Abs(ja.AnchorA.Z - 0.3f) < 1e-4f
+                && Math.Abs(ja.AnchorB.X + 0.4f) < 1e-4f && Math.Abs(ja.AnchorB.Y - 0.5f) < 1e-4f && Math.Abs(ja.AnchorB.Z + 0.6f) < 1e-4f;
+            bool jbOk = jb.Kind == "hinge" && jb.BodyA == 2 && jb.BodyB == -1
+                && Math.Abs(jb.AnchorA.X - 1f) < 1e-4f && Math.Abs(jb.AnchorB.Y - 3f) < 1e-4f && Math.Abs(jb.Axis.Z - 1f) < 1e-4f
+                && jb.LimitEnabled && Math.Abs(jb.LowerLimit + 1.2f) < 1e-4f && Math.Abs(jb.UpperLimit - 0.8f) < 1e-4f
+                && jb.MotorEnabled && Math.Abs(jb.MotorTargetSpeed - 2.5f) < 1e-4f && Math.Abs(jb.MaxMotorTorque - 15f) < 1e-4f;
+            bool jcOk = jc.Kind == "distance" && jc.BodyA == 3 && jc.BodyB == -1
+                && Math.Abs(jc.AnchorB.Y - 5f) < 1e-4f && Math.Abs(jc.RestLength - 2.5f) < 1e-4f
+                && jc.SpringEnabled && Math.Abs(jc.Frequency - 3f) < 1e-4f && Math.Abs(jc.DampingRatio - 0.4f) < 1e-4f;
+            Console.WriteLine($"  joints round-trip: ballsocket={jaOk}, hinge={jbOk}, distance={jcOk}");
+            if (!(jaOk && jbOk && jcOk)) { Console.WriteLine("WORLD TEST FAILED: a joint field did not round-trip."); return; }
+
+            var oldw = System.Text.Json.JsonSerializer.Deserialize<WorldConfig>("{\"Name\":\"old\"}",
+                new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            bool emptyOk = oldw != null && oldw.Joints != null && oldw.Joints.Count == 0;
+            Console.WriteLine($"  joints backward-compat: no-joints-key -> empty list = {emptyOk}");
+            if (!emptyOk) { Console.WriteLine("WORLD TEST FAILED: old world without a joints key did not load empty."); return; }
+        }
+
         Console.WriteLine("WORLD TEST PASSED");
     }
 
@@ -1320,6 +1370,408 @@ partial class Program
             ok &= connOk;
         }
 
+        // C1-4b — in-editor JOINT authoring: spawn a joint with a body selected, edit ALL its params through
+        // the field inspector (kind swaps the field set; body ids, anchors, limit/motor, spring), and delete
+        // it — keeping _world.Joints (the C1-4a bridge source) in sync. Plus a load round-trip.
+        {
+            var jointWorld = new WorldConfig
+            {
+                Name = "jointedit",
+                Physics = new PhysicsConfig { GravityEnabled = true },
+                Platform = new PlatformConfig { Enabled = false },   // objects are editables 0,1
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 1, Type = "cube", Color = "White", Gravity = true,
+                        Position = new Vec3Config { X = 0f, Y = 3f, Z = 0f } },
+                    new WorldObject { Id = 2, Type = "cube", Color = "Red",
+                        Position = new Vec3Config { X = 4f, Y = 3f, Z = 0f } },
+                },
+            };
+            var js = new PriviewNetworkScene(new DisplayManagerAsync(), jointWorld, isServer: false, "127.0.0.1", 0, online: false);
+            js.Start();
+            bool jok = true;
+
+            // SPAWN: select editable 0 (the first cube) as BodyA, then spawn a "joint".
+            int cubeAId = js.EditableEntries[0].Descriptor.Id;
+            js.SelectForTest(0);
+            int beforeJoints = js.WorldJointsForTest.Count;
+            js.SpawnTypeForTest("joint");
+            var jEntry = js.EditableEntries.LastOrDefault(e => e.Descriptor.Type == "joint");
+            bool spawned = js.WorldJointsForTest.Count == beforeJoints + 1
+                && jEntry != null && jEntry.Joint != null
+                && jEntry.Joint.Kind == "ballsocket" && jEntry.Joint.BodyA == cubeAId && jEntry.Joint.BodyB == -1
+                && !jEntry.Instance.Collides;
+            Console.WriteLine($"  joint-spawn: joints {beforeJoints}->{js.WorldJointsForTest.Count}, kind={jEntry?.Joint?.Kind}, A={jEntry?.Joint?.BodyA}(want {cubeAId}), B={jEntry?.Joint?.BodyB}(want -1), marker non-colliding={jEntry != null && !jEntry.Instance.Collides} -> {(spawned ? "ok" : "BAD")}");
+            jok &= spawned;
+
+            int jIndex = js.EditableEntries.ToList().FindIndex(e => ReferenceEquals(e, jEntry));
+
+            // A hinge-only field is NOT in the set while the joint is a ball-socket (TypeFieldForTest returns
+            // false for a field absent from the entry's FieldsFor set — the kind-dependent set proof).
+            bool hingeFieldAbsent = !js.TypeFieldForTest(jIndex, "JLower", "0", confirm: false);
+
+            // EDIT (kind swap → hinge): the hinge fields now appear in the set (typing into them succeeds).
+            js.StepFieldForTest(jIndex, "JointKind", +1);   // ballsocket -> hinge
+            string kAfter = js.FieldValueForTest(jIndex, "JointKind");
+            bool lowerNowInSet = js.TypeFieldForTest(jIndex, "JLower", "-1", confirm: true);
+            js.TypeFieldForTest(jIndex, "JUpper", "0.75", confirm: true);
+            js.StepFieldForTest(jIndex, "JLimitEnabled", +1);   // toggle the limit on
+            bool limit = jEntry!.Joint!.LimitEnabled
+                && Math.Abs(jEntry.Joint.LowerLimit + 1f) < 1e-4f && Math.Abs(jEntry.Joint.UpperLimit - 0.75f) < 1e-4f;
+            // retarget Body B to the second cube's id (typed exact via the numeric path).
+            int cubeBId = js.EditableEntries[1].Descriptor.Id;
+            js.TypeFieldForTest(jIndex, "JBodyB", cubeBId.ToString(), confirm: true);
+            bool bodyB = jEntry.Joint.BodyB == cubeBId;
+            // enable a motor + set its params.
+            js.StepFieldForTest(jIndex, "JMotorEnabled", +1);
+            js.TypeFieldForTest(jIndex, "JMotorSpeed", "2", confirm: true);
+            js.TypeFieldForTest(jIndex, "JMaxTorque", "12", confirm: true);
+            bool motor = jEntry.Joint.MotorEnabled
+                && Math.Abs(jEntry.Joint.MotorTargetSpeed - 2f) < 1e-4f && Math.Abs(jEntry.Joint.MaxMotorTorque - 12f) < 1e-4f;
+            bool hingeOk = kAfter == "hinge" && hingeFieldAbsent && lowerNowInSet && limit && bodyB && motor;
+            Console.WriteLine($"  joint-hinge: kind={kAfter}, ballsocket-had-no-hinge-field={hingeFieldAbsent}, hinge-field-now-in-set={lowerNowInSet}, BodyB={jEntry.Joint.BodyB}(want {cubeBId}), limit={limit}, motor={motor} -> {(hingeOk ? "ok" : "BAD")}");
+            jok &= hingeOk;
+
+            // EDIT (kind swap → distance): its fields appear; set rest/freq/damping + toggle the spring.
+            js.StepFieldForTest(jIndex, "JointKind", +1);   // hinge -> distance
+            string kDist = js.FieldValueForTest(jIndex, "JointKind");
+            js.TypeFieldForTest(jIndex, "JRestLength", "2.5", confirm: true);
+            js.StepFieldForTest(jIndex, "JSpringEnabled", +1);
+            js.TypeFieldForTest(jIndex, "JFrequency", "3", confirm: true);
+            js.TypeFieldForTest(jIndex, "JDamping", "0.4", confirm: true);
+            bool dist = kDist == "distance" && jEntry.Joint.SpringEnabled
+                && Math.Abs(jEntry.Joint.RestLength - 2.5f) < 1e-4f
+                && Math.Abs(jEntry.Joint.Frequency - 3f) < 1e-4f
+                && Math.Abs(jEntry.Joint.DampingRatio - 0.4f) < 1e-4f;
+            Console.WriteLine($"  joint-distance: kind={kDist}, rest={jEntry.Joint.RestLength:F2}, spring={jEntry.Joint.SpringEnabled}, freq={jEntry.Joint.Frequency:F2}, damp={jEntry.Joint.DampingRatio:F2} -> {(dist ? "ok" : "BAD")}");
+            jok &= dist;
+
+            // The edits mutated the LIVE cfg that lives in _world.Joints (same reference — rides save + bridge).
+            bool liveRef = js.WorldJointsForTest.Count == 1 && ReferenceEquals(js.WorldJointsForTest[0], jEntry.Joint);
+            Console.WriteLine($"  joint-live: cfg is the live _world.Joints[0] = {liveRef} -> {(liveRef ? "ok" : "BAD")}");
+            jok &= liveRef;
+
+            // DELETE: removing the joint entry drops the config from _world.Joints AND the entry from editables.
+            int jIndexNow = js.EditableEntries.ToList().FindIndex(e => e.Descriptor.Type == "joint");
+            js.DeleteSelectedForTest(jIndexNow);
+            bool deleted = js.WorldJointsForTest.Count == 0 && !js.EditableEntries.Any(e => e.Descriptor.Type == "joint");
+            Console.WriteLine($"  joint-delete: joints={js.WorldJointsForTest.Count} (want 0), entry gone={!js.EditableEntries.Any(e => e.Descriptor.Type == "joint")} -> {(deleted ? "ok" : "BAD")}");
+            jok &= deleted;
+
+            // LOAD ROUND-TRIP: a world that already carries a JointConfig builds a joint entry on Start,
+            // backed by the live _world.Joints[0].
+            var loadWorld = new WorldConfig
+            {
+                Name = "jointload",
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Color = "White" } },
+                Joints = new List<JointConfig> { new JointConfig { Kind = "hinge", BodyA = 1, BodyB = -1,
+                    Axis = new Vec3Config { X = 0f, Y = 0f, Z = 1f } } },
+            };
+            var ls = new PriviewNetworkScene(new DisplayManagerAsync(), loadWorld, isServer: false, "127.0.0.1", 0, online: false);
+            ls.Start();
+            var loadedJoint = ls.EditableEntries.FirstOrDefault(e => e.Descriptor.Type == "joint");
+            bool loaded = loadedJoint != null && loadedJoint.Joint != null && loadedJoint.Joint.Kind == "hinge"
+                && ls.WorldJointsForTest.Count == 1 && ReferenceEquals(loadedJoint.Joint, ls.WorldJointsForTest[0]);
+            Console.WriteLine($"  joint-load: entry built={loadedJoint != null}, kind={loadedJoint?.Joint?.Kind}, live-ref={(loadedJoint != null && ls.WorldJointsForTest.Count == 1 && ReferenceEquals(loadedJoint.Joint, ls.WorldJointsForTest[0]))} -> {(loaded ? "ok" : "BAD")}");
+            jok &= loaded;
+
+            ok &= jok;
+        }
+
+        // C1-4c — the joint marker is now a thin LINE mesh (not a placeholder sphere): its world bbox spans
+        // both anchors and is thin perpendicular to the A→B axis; a hinge adds an axis stub (more geometry +
+        // the bbox extends along the axis direction). Visual correctness (it reads as a coloured line) is
+        // verified live — here we only assert the marker GEOMETRY.
+        {
+            var A = new Vector3(-1f, 0.5f, 2f);
+            var B = new Vector3(3f, 0.5f, 2f);   // A→B along +X (extent 4)
+            var ball = PriviewNetworkScene.BuildJointMarkerMesh(A, B, "ballsocket", null);
+            ball.UpdateGeometry();
+            Vector3 mn = ball.WorldMin, mx = ball.WorldMax;
+            bool Contains(Vector3 p) =>
+                mn.X - 1e-3f <= p.X && p.X <= mx.X + 1e-3f &&
+                mn.Y - 1e-3f <= p.Y && p.Y <= mx.Y + 1e-3f &&
+                mn.Z - 1e-3f <= p.Z && p.Z <= mx.Z + 1e-3f;
+            float exX = mx.X - mn.X, exY = mx.Y - mn.Y, exZ = mx.Z - mn.Z;
+            bool spans = Contains(A) && Contains(B);
+            bool thin = exY < 0.2f && exZ < 0.2f && Math.Abs(exX - 4f) < 0.2f;   // ~2r perpendicular, ~|B−A| along the axis
+            int ballTris = ball.FaceCount;
+            bool ballOk = spans && thin && ballTris == 12;
+            Console.WriteLine($"  joint-marker-ball: spans={spans}, thin(exX={exX:F2},exY={exY:F2},exZ={exZ:F2})={thin}, tris={ballTris}(want 12) -> {(ballOk ? "ok" : "BAD")}");
+            bool mok = ballOk;
+
+            // Hinge with a +Y axis: more geometry than the plain line, and the bbox extends along +Y (the stub).
+            var hinge = PriviewNetworkScene.BuildJointMarkerMesh(A, B, "hinge", new Vector3(0f, 1f, 0f));
+            hinge.UpdateGeometry();
+            int hingeTris = hinge.FaceCount;
+            float hingeExY = hinge.WorldMax.Y - hinge.WorldMin.Y;
+            bool moreGeom = hingeTris > ballTris;
+            bool axisExtends = hingeExY > 0.5f;   // the stub (halfLen 0.4 → ~0.8 span) grows Y beyond the thin tube
+            bool hingeOk = moreGeom && axisExtends;
+            Console.WriteLine($"  joint-marker-hinge: tris={hingeTris}(>ball {ballTris}={moreGeom}), Y-extent={hingeExY:F2}(axis-extends={axisExtends}) -> {(hingeOk ? "ok" : "BAD")}");
+            mok &= hingeOk;
+
+            ok &= mok;
+        }
+
+        // C1-5 — joint NETWORK SYNC: the JointConfig.Id + the pack path carrying joints (A2), the three
+        // live-edit ops (JointSpawn/Modify/Delete) applied through the CLIENT handler, and a joining client
+        // building joints from the received world (clearing any prior joint state).
+        {
+            bool cok = true;
+
+            // A2: BuildLiveWorldConfig (the OnWorldRequested pack path) carries the LIVE joints by reference,
+            // and a joint entry's Descriptor.Id equals its cfg.Id (one id everywhere).
+            var authWorld = new WorldConfig
+            {
+                Name = "jointpack",
+                Physics = new PhysicsConfig { GravityEnabled = true },
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Color = "White", Gravity = true } },
+            };
+            var auth = new PriviewNetworkScene(new DisplayManagerAsync(), authWorld, isServer: false, "127.0.0.1", 0, online: false);
+            auth.Start();
+            auth.SelectForTest(0);
+            auth.SpawnTypeForTest("joint");                       // authority spawn assigns cfg.Id
+            var liveCfg = auth.WorldJointsForTest[0];
+            var snap = auth.LiveWorldSnapshot();
+            bool packRef = snap.Joints.Count == 1 && ReferenceEquals(snap.Joints[0], liveCfg);
+            var authEntry = auth.EditableEntries.First(e => e.Descriptor.Type == "joint");
+            bool packOk = packRef && liveCfg.Id >= 0 && authEntry.Descriptor.Id == liveCfg.Id;
+            Console.WriteLine($"  joint-sync-pack: LiveConfig.Joints carries live cfg (ref={packRef}), cfg.Id={liveCfg.Id}, entryId==cfgId={authEntry.Descriptor.Id == liveCfg.Id} -> {(packOk ? "ok" : "BAD")}");
+            cok &= packOk;
+
+            // Client-apply of the three ops on a headless scene (crafted WorldEditPackets → the real handler).
+            var client = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig { Name = "jointclient",
+                Physics = new PhysicsConfig { GravityEnabled = true }, Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Color = "White", Gravity = true } } },
+                isServer: false, "127.0.0.1", 0, online: false);
+            client.Start();
+
+            // Op 4 (JointSpawn): a crafted cfg with a server id → entry built with Descriptor.Id == cfg.Id.
+            var spawnCfg = new JointConfig { Id = 500, Kind = "ballsocket", BodyA = 1, BodyB = -1 };
+            client.ApplyWorldEditForTest(new WorldEditPacket { Op = 4, Id = spawnCfg.Id, ObjectJson = JsonSerializer.Serialize(spawnCfg) });
+            var je = client.EditableEntries.FirstOrDefault(e => e.Descriptor.Type == "joint");
+            bool spawnOk = client.WorldJointsForTest.Count == 1 && je != null && je.Joint != null && je.Joint.Id == 500 && je.Descriptor.Id == 500;
+            client.ApplyWorldEditForTest(new WorldEditPacket { Op = 4, Id = spawnCfg.Id, ObjectJson = JsonSerializer.Serialize(spawnCfg) });   // repeat → idempotent
+            bool idemOk = client.WorldJointsForTest.Count == 1 && client.EditableEntries.Count(e => e.Descriptor.Type == "joint") == 1;
+            Console.WriteLine($"  joint-sync-op4: entry id=500 built ({spawnOk}); repeat Op4 idempotent ({idemOk}) -> {((spawnOk && idemOk) ? "ok" : "BAD")}");
+            cok &= spawnOk && idemOk;
+
+            // Op 3 (JointModify): the LIVE cfg is mutated IN PLACE (SAME reference the bridge/marker hold).
+            var liveJoint = client.EditableEntries.First(e => e.Descriptor.Type == "joint").Joint!;
+            var modCfg = new JointConfig { Id = 500, Kind = "hinge", BodyA = 1, BodyB = -1,
+                Axis = new Vec3Config { X = 0f, Y = 0f, Z = 1f }, LimitEnabled = true, LowerLimit = -0.7f, UpperLimit = 0.9f };
+            client.ApplyWorldEditForTest(new WorldEditPacket { Op = 3, Id = 500, ObjectJson = JsonSerializer.Serialize(modCfg) });
+            var liveJoint2 = client.EditableEntries.First(e => e.Descriptor.Type == "joint").Joint!;
+            bool modOk = ReferenceEquals(liveJoint, liveJoint2) && liveJoint.Kind == "hinge" && liveJoint.LimitEnabled
+                && Math.Abs(liveJoint.LowerLimit + 0.7f) < 1e-4f && Math.Abs(liveJoint.UpperLimit - 0.9f) < 1e-4f && liveJoint.Id == 500;
+            Console.WriteLine($"  joint-sync-op3: in-place (same-ref={ReferenceEquals(liveJoint, liveJoint2)}), kind={liveJoint.Kind}, limit={liveJoint.LimitEnabled}, id={liveJoint.Id} -> {(modOk ? "ok" : "BAD")}");
+            cok &= modOk;
+
+            // Op 5 (JointDelete): the entry + the cfg are gone.
+            client.ApplyWorldEditForTest(new WorldEditPacket { Op = 5, Id = 500 });
+            bool delOk = client.WorldJointsForTest.Count == 0 && !client.EditableEntries.Any(e => e.Descriptor.Type == "joint");
+            Console.WriteLine($"  joint-sync-op5: joints={client.WorldJointsForTest.Count}, entry gone={!client.EditableEntries.Any(e => e.Descriptor.Type == "joint")} -> {(delOk ? "ok" : "BAD")}");
+            cok &= delOk;
+
+            // Join path: a scene that already had a joint receives a fresh world with two joints → the prior
+            // joint state is cleared and two joint entries are built (Descriptor.Id == cfg.Id for each).
+            var join = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig { Name = "pre",
+                Physics = new PhysicsConfig { GravityEnabled = true }, Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Gravity = true } },
+                Joints = new List<JointConfig> { new JointConfig { Id = 3, Kind = "ballsocket", BodyA = 1, BodyB = -1 } } },
+                isServer: false, "127.0.0.1", 0, online: false);
+            join.Start();
+            bool hadPre = join.EditableEntries.Count(e => e.Descriptor.Type == "joint") == 1;
+            var received = new WorldConfig { Name = "arrived", Physics = new PhysicsConfig { GravityEnabled = true },
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject> { new WorldObject { Id = 7, Type = "cube", Gravity = true }, new WorldObject { Id = 8, Type = "sphere", Radius = 1f } },
+                Joints = new List<JointConfig>
+                {
+                    new JointConfig { Id = 40, Kind = "hinge", BodyA = 7, BodyB = -1, Axis = new Vec3Config { X = 0f, Y = 1f, Z = 0f } },
+                    new JointConfig { Id = 41, Kind = "distance", BodyA = 8, BodyB = 7, RestLength = 2f },
+                } };
+            join.ApplyReceivedWorldForTest(received);
+            var joinJoints = join.EditableEntries.Where(e => e.Descriptor.Type == "joint").ToList();
+            bool joinOk = hadPre && joinJoints.Count == 2 && join.WorldJointsForTest.Count == 2
+                && joinJoints.Any(e => e.Joint!.Id == 40 && e.Joint.Kind == "hinge")
+                && joinJoints.Any(e => e.Joint!.Id == 41 && e.Joint.Kind == "distance")
+                && joinJoints.All(e => e.Descriptor.Id == e.Joint!.Id);
+            Console.WriteLine($"  joint-sync-join: pre-had-joint={hadPre}, after-arrival joints={joinJoints.Count} (ids {string.Join(",", joinJoints.Select(e => e.Joint!.Id))}) -> {(joinOk ? "ok" : "BAD")}");
+            cok &= joinOk;
+
+            ok &= cok;
+        }
+
+        // ---- C2-5: dynamic MESH object -> real DynamicHull bridge (a gravity+collides mesh simulates as its true
+        //      convex hull, not a loose OBB; a box-like PRIMITIVE stays an OBB; a scale edit rebuilds the hull). ----
+        {
+            bool bok = true;
+            // Headless world: a floor platform + a gravity+collides MESH (monkey) dropped from height + a
+            // gravity+collides cube PRIMITIVE dropped alongside (offset in X so they don't touch).
+            WorldConfig BridgeWorld() => new WorldConfig
+            {
+                Name = "c25bridge", Graphics = new GraphicsConfig { Shadows = false },
+                Platform = new PlatformConfig { Enabled = true, Shape = "square", Size = 60f, Color = "Gray", Position = new Vec3Config { X = 0f, Y = 0f, Z = 0f } },
+                Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 9.8f, CollisionEnabled = true, Restitution = 0f },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 10, Type = "mesh", Mesh = "monkey", Color = "White",
+                        Position = new Vec3Config { X = 0f, Y = 4f, Z = 0f }, Scale = 1f, Collides = true, Gravity = true },
+                    new WorldObject { Id = 11, Type = "cube", Color = "Red",
+                        Position = new Vec3Config { X = 8f, Y = 4f, Z = 0f }, Scale = 1f, Collides = true, Gravity = true },
+                },
+            };
+            var sc = new PriviewNetworkScene(new DisplayManagerAsync(), BridgeWorld(), isServer: false, "127.0.0.1", 0, online: false);
+            sc.Start();
+            // the scene assigns fresh ids on load, so resolve by descriptor Type, not the config's Id.
+            var meshE = sc.EditableEntries.First(e => e.Descriptor.Type == "mesh");
+            var cubeE = sc.EditableEntries.First(e => e.Descriptor.Type == "cube");
+            int meshId = meshE.Descriptor.Id, cubeId = cubeE.Descriptor.Id;
+
+            var meshObj = (Object3d)meshE.Instance;
+            float startY = meshObj.Position.Y;
+            float dt = 1f / 60f;
+            for (int i = 0; i < 300; i++) sc.StepPhysicsForTest(dt);          // ~5 s: fall + settle (+ sleep)
+
+            // (1) the MESH object simulates as a HULL (not a loose OBB); the CUBE primitive stays a Box.
+            var meshKind = sc.BodyKindForTest(meshId);
+            var cubeKind = sc.BodyKindForTest(cubeId);
+            bool meshIsHull = meshKind == ColliderKind.Hull;
+            bool cubeIsBox = cubeKind == ColliderKind.Box;
+
+            // (2) the mesh FELL and now RESTS: dropped well below its start, and over the next frames it's still.
+            Vector3 before = meshObj.Position;
+            for (int i = 0; i < 30; i++) sc.StepPhysicsForTest(dt);
+            float restJitter = (meshObj.Position - before).Length();
+            bool fell = meshObj.Position.Y < startY - 1f;
+            bool rests = restJitter < 0.01f;
+            // (3) NO COM DRIFT: the mesh's lowest world vertex sits ON the floor (y≈0). WorldMin is geometry-based,
+            //     so an inconsistent COM offset (place vs sync-back) would leave the mesh off the floor by that
+            //     offset. This proves the hull place/sync round-trips for ANY mesh shape.
+            bool onFloor = MathF.Abs(meshObj.WorldMin.Y) < 0.1f;
+            bool bounded = MathF.Abs(meshObj.Position.X) < 5f && MathF.Abs(meshObj.Position.Z) < 5f;
+            bool fallOk = meshIsHull && cubeIsBox && fell && rests && onFloor && bounded;
+            Console.WriteLine($"  c25-mesh-falls-as-hull: meshKind={meshKind}(Hull), cubeKind={cubeKind}(Box), y {startY:F2}->{meshObj.Position.Y:F2} (fell={fell}), jitter={restJitter:F5} (rests={rests}), worldMinY={meshObj.WorldMin.Y:F4} (onFloor={onFloor}) -> {(fallOk ? "ok" : "BAD")}");
+            bok &= fallOk;
+
+            // (4) SCALE REBUILD: editing the mesh's Scale rebuilds the hull from the new scaled locals (the cached
+            //     build-scale follows o.Scale) WITHOUT losing that it's a Hull. Verified via the build-scale hook +
+            //     Kind (the rebuild fires regardless of sleep state; velocity/sleep are preserved per the bridge).
+            meshObj.Scale = 1.5f; meshObj.UpdateGeometry();
+            sc.StepPhysicsForTest(dt);                                        // next step rebuilds the hull at the new scale
+            bool stillHull = sc.BodyKindForTest(meshId) == ColliderKind.Hull;
+            bool rebuilt = MathF.Abs(sc.HullBuiltScaleForTest(meshId) - 1.5f) < 1e-4f;
+            bool scaleOk = stillHull && rebuilt;
+            Console.WriteLine($"  c25-scale-rebuild: builtScale={sc.HullBuiltScaleForTest(meshId):F3}(1.5), stillHull={stillHull} -> {(scaleOk ? "ok" : "BAD")}");
+            bok &= scaleOk;
+
+            ok &= bok;
+        }
+
+        // ---- C4: the player CAPSULE collision (vertical segment + radius, resolved via the REUSED sphere
+        //      resolvers). Real body height: stands on the floor, blocked by walls, blocked by head- and
+        //      foot-height obstacles a lone centre-sphere would miss. Driven headless via the C4 ForTest hooks. ----
+        {
+            bool pok = true;
+            float half = PriviewNetworkScene.CapsuleHalfForTest;    // 0.55
+            float rad = PriviewNetworkScene.CapsuleRadiusForTest;   // 0.35
+            // A floor platform (top at y≈0) + one movable collidable box obstacle repositioned per sub-test.
+            WorldConfig CapWorld() => new WorldConfig
+            {
+                Name = "c4cap", Graphics = new GraphicsConfig { Shadows = false },
+                Platform = new PlatformConfig { Enabled = true, Shape = "square", Size = 60f, Color = "Gray", Position = new Vec3Config { X = 0f, Y = 0f, Z = 0f } },
+                Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 9.8f, CollisionEnabled = true },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 20, Type = "cube", Color = "White",
+                        Position = new Vec3Config { X = 100f, Y = 100f, Z = 100f }, Scale = 2f, Collides = true, Gravity = false },   // parked far away
+                },
+            };
+            var pc = new PriviewNetworkScene(new DisplayManagerAsync(), CapWorld(), isServer: false, "127.0.0.1", 0, online: false);
+            pc.Start();
+            var box = (Object3d)pc.EditableEntries.First(e => e.Descriptor.Type == "cube").Instance;
+            var platform = (Object3d)pc.EditableEntries.First(e => e.Descriptor.Type == "platform").Instance;
+            float floorTop = platform.WorldMax.Y;
+            void PlaceBox(Vector3 pos, float scale) { box.Position = pos; box.Scale = scale; box.UpdateGeometry(); }   // move/resize + refresh AABB
+
+            // (1) STANDS ON FLOOR: dropped from above, the FOOT settles on the floor (Y = floorTop + half + rad), onGround.
+            {
+                PlaceBox(new Vector3(100f, 100f, 100f), 2f);        // keep the box far away
+                pc.PlayerBodyForTest = new Vector3(0f, floorTop + 3f, 0f);
+                for (int i = 0; i < 240; i++) pc.StepPlayerForTest(1f / 60f);
+                float restY = pc.PlayerBodyForTest.Y, wantY = floorTop + half + rad;
+                bool onGround = pc.PlayerOnGroundForTest;
+                bool good = MathF.Abs(restY - wantY) < 0.02f && onGround;
+                Console.WriteLine($"  c4-stands-on-floor: restY={restY:F4} (want {wantY:F4}=floorTop+half+rad), onGround={onGround} -> {(good ? "ok" : "BAD")}");
+                pok &= good;
+            }
+
+            // (2) BLOCKED BY A WALL: a tall box spanning the player's height; push the body into it -> ejected to the
+            //     near face, body centre ≈ rad from the face (no penetration).
+            {
+                PlaceBox(new Vector3(5f, 5f, 0f), 2f);
+                float wallMinX = box.WorldMin.X;                    // near (−X) face
+                pc.PlayerBodyForTest = new Vector3(wallMinX - rad + 0.2f, 5f, 0f);   // pushed 0.2 INTO the wall's reach
+                pc.ResolveBodyCollisionForTest();
+                float px = pc.PlayerBodyForTest.X;
+                bool good = px <= wallMinX - rad + 1e-3f && MathF.Abs(px - (wallMinX - rad)) < 0.05f;   // at the face − rad, not through it
+                Console.WriteLine($"  c4-blocked-by-wall: px={px:F4} (want {wallMinX - rad:F4}=faceMinX−rad) -> {(good ? "ok" : "BAD")}");
+                pok &= good;
+            }
+
+            // (3) HEAD-HEIGHT BAR (the capsule win): a bar overhead whose BOTTOM is above a lone centre-sphere's
+            //     reach (py+rad) but within the capsule's top cap (py+half+rad). The capsule's head hits it -> pushed
+            //     DOWN; a centre-sphere would miss. Contrast: the same bar well ABOVE the cap does nothing.
+            {
+                float py = 5f;
+                float boxScale = 2f;
+                PlaceBox(new Vector3(0f, py, 0f), boxScale);
+                float boxHalfY = (box.WorldMax.Y - box.WorldMin.Y) * 0.5f;
+                float wantBottom = py + 0.6f;                       // rad(0.35) < 0.6 < half+rad(0.9)
+                PlaceBox(new Vector3(0f, wantBottom + boxHalfY, 0f), boxScale);   // centre so the bottom lands at wantBottom, footprint over the player
+                bool sphereWouldMiss = box.WorldMin.Y > py + rad;   // a lone centre-sphere (reach py+rad) never reaches the bar
+                pc.PlayerBodyForTest = new Vector3(0f, py, 0f);
+                float before = pc.PlayerBodyForTest.Y;
+                pc.ResolveBodyCollisionForTest();
+                float after = pc.PlayerBodyForTest.Y;
+                bool pushedDown = after < before - 0.05f;
+                // contrast: raise the bar well above the capsule top -> no collision.
+                PlaceBox(new Vector3(0f, py + half + rad + 0.5f + boxHalfY, 0f), boxScale);
+                pc.PlayerBodyForTest = new Vector3(0f, py, 0f);
+                float b2 = pc.PlayerBodyForTest.Y;
+                pc.ResolveBodyCollisionForTest();
+                bool noPushHigh = MathF.Abs(pc.PlayerBodyForTest.Y - b2) < 1e-4f;
+                bool good = sphereWouldMiss && pushedDown && noPushHigh;
+                Console.WriteLine($"  c4-head-bar: barBottom={wantBottom:F2}>sphereReach={py + rad:F2}(sphere-misses={sphereWouldMiss}), capsulePushedDown={pushedDown} ({before:F3}->{after:F3}); raised-bar noPush={noPushHigh} -> {(good ? "ok" : "BAD")}");
+                pok &= good;
+            }
+
+            // (4) FOOT-HEIGHT OBSTACLE (symmetric): a low obstacle whose TOP is below a centre-sphere's downward
+            //     reach (py−rad) but within the capsule's foot cap (py−half−rad). It pushes the capsule UP.
+            {
+                float py = 5f;
+                float boxScale = 2f;
+                PlaceBox(new Vector3(0f, py, 0f), boxScale);
+                float boxHalfY = (box.WorldMax.Y - box.WorldMin.Y) * 0.5f;
+                float wantTop = py - 0.6f;                          // py−0.9 < py−0.6 < py−0.35
+                PlaceBox(new Vector3(0f, wantTop - boxHalfY, 0f), boxScale);
+                bool sphereWouldMiss = box.WorldMax.Y < py - rad;
+                pc.PlayerBodyForTest = new Vector3(0f, py, 0f);
+                float before = pc.PlayerBodyForTest.Y;
+                pc.ResolveBodyCollisionForTest();
+                float after = pc.PlayerBodyForTest.Y;
+                bool pushedUp = after > before + 0.05f;
+                bool good = sphereWouldMiss && pushedUp;
+                Console.WriteLine($"  c4-foot-obstacle: barTop={wantTop:F2}<sphereReach={py - rad:F2}(sphere-misses={sphereWouldMiss}), capsulePushedUp={pushedUp} ({before:F3}->{after:F3}) -> {(good ? "ok" : "BAD")}");
+                pok &= good;
+            }
+
+            ok &= pok;
+        }
+
         Console.WriteLine(ok ? "EDITOR TEST PASSED" : "EDITOR TEST FAILED");
     }
 
@@ -1402,7 +1854,25 @@ partial class Program
                     Position = new Vec3Config { X = -6f, Y = 3f, Z = 4f },
                     Rotation = new Vec3Config { X = 0f, Y = 0.5f, Z = -0.2f },
                     Collides = false, CameraKind = "follow", FollowTargetId = 11 },
-            }
+            },
+            // C1-5: joints ride the world-sync ConfigJson — two kinds with ids set + EVERY field populated
+            // (regardless of the kind's relevance) so the whole JointConfig round-trips through the packet.
+            Joints = new List<JointConfig>
+            {
+                new JointConfig { Id = 20, Kind = "ballsocket", BodyA = 11, BodyB = -1,
+                    AnchorA = new Vec3Config { X = 0.1f, Y = 0.2f, Z = 0.3f },
+                    AnchorB = new Vec3Config { X = 1f, Y = 5f, Z = 0f },
+                    Axis = new Vec3Config { X = 0.1f, Y = 0.9f, Z = 0f },
+                    LimitEnabled = true, LowerLimit = -0.5f, UpperLimit = 1.5f,
+                    MotorEnabled = true, MotorTargetSpeed = 1.1f, MaxMotorTorque = 7f,
+                    RestLength = 3.3f, SpringEnabled = true, Frequency = 2.2f, DampingRatio = 0.6f },
+                new JointConfig { Id = 21, Kind = "distance", BodyA = 12, BodyB = 11,
+                    AnchorA = new Vec3Config { X = 0f, Y = 1f, Z = 0f }, AnchorB = new Vec3Config { X = 2f, Y = 0f, Z = -1f },
+                    Axis = new Vec3Config { X = 0f, Y = 0f, Z = 1f },
+                    LimitEnabled = false, LowerLimit = -1.2f, UpperLimit = 0.8f,
+                    MotorEnabled = true, MotorTargetSpeed = 2.5f, MaxMotorTorque = 15f,
+                    RestLength = 2.5f, SpringEnabled = true, Frequency = 3f, DampingRatio = 0.4f },
+            },
         };
 
         // Pack, then round-trip the packet through its own byte (de)serialization. (This world references
@@ -1808,6 +2278,28 @@ partial class Program
             // ---- camera-only fields ----
             if (x.CameraKind != y.CameraKind) return $"object[{i}].CameraKind '{x.CameraKind}' != '{y.CameraKind}'";
             if (x.FollowTargetId != y.FollowTargetId) return $"object[{i}].FollowTargetId {x.FollowTargetId} != {y.FollowTargetId}";
+        }
+
+        // ---- C1-5: joints (empty on both sides for a joint-free world → no change to existing callers) ----
+        if (a.Joints.Count != b.Joints.Count) return $"joint count {a.Joints.Count} != {b.Joints.Count}";
+        for (int i = 0; i < a.Joints.Count; i++)
+        {
+            var x = a.Joints[i];
+            var y = b.Joints[i];
+            if (x.Id != y.Id) return $"joint[{i}].Id {x.Id} != {y.Id}";
+            if (x.Kind != y.Kind) return $"joint[{i}].Kind '{x.Kind}' != '{y.Kind}'";
+            if (x.BodyA != y.BodyA) return $"joint[{i}].BodyA {x.BodyA} != {y.BodyA}";
+            if (x.BodyB != y.BodyB) return $"joint[{i}].BodyB {x.BodyB} != {y.BodyB}";
+            if (!Eq(x.AnchorA.X, y.AnchorA.X) || !Eq(x.AnchorA.Y, y.AnchorA.Y) || !Eq(x.AnchorA.Z, y.AnchorA.Z)) return $"joint[{i}].AnchorA differs";
+            if (!Eq(x.AnchorB.X, y.AnchorB.X) || !Eq(x.AnchorB.Y, y.AnchorB.Y) || !Eq(x.AnchorB.Z, y.AnchorB.Z)) return $"joint[{i}].AnchorB differs";
+            if (!Eq(x.Axis.X, y.Axis.X) || !Eq(x.Axis.Y, y.Axis.Y) || !Eq(x.Axis.Z, y.Axis.Z)) return $"joint[{i}].Axis differs";
+            if (x.LimitEnabled != y.LimitEnabled) return $"joint[{i}].LimitEnabled differs";
+            if (!Eq(x.LowerLimit, y.LowerLimit) || !Eq(x.UpperLimit, y.UpperLimit)) return $"joint[{i}].Limit differs";
+            if (x.MotorEnabled != y.MotorEnabled) return $"joint[{i}].MotorEnabled differs";
+            if (!Eq(x.MotorTargetSpeed, y.MotorTargetSpeed) || !Eq(x.MaxMotorTorque, y.MaxMotorTorque)) return $"joint[{i}].Motor differs";
+            if (!Eq(x.RestLength, y.RestLength)) return $"joint[{i}].RestLength differs";
+            if (x.SpringEnabled != y.SpringEnabled) return $"joint[{i}].SpringEnabled differs";
+            if (!Eq(x.Frequency, y.Frequency) || !Eq(x.DampingRatio, y.DampingRatio)) return $"joint[{i}].Spring differs";
         }
         return null;
     }

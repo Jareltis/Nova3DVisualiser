@@ -245,6 +245,15 @@ public partial class PriviewNetworkScene
         Field.TextureFilter => "TexFilter",
         Field.CamKind => "Kind",
         Field.FollowTargetId => "Target",
+        // ---- joint (C1-4b) ----
+        Field.JointKind => "Kind",
+        Field.JBodyA => "Body A", Field.JBodyB => "Body B",
+        Field.JAnchorAX => "Anchor A X", Field.JAnchorAY => "Anchor A Y", Field.JAnchorAZ => "Anchor A Z",
+        Field.JAnchorBX => "Anchor B X", Field.JAnchorBY => "Anchor B Y", Field.JAnchorBZ => "Anchor B Z",
+        Field.JAxisX => "Axis X", Field.JAxisY => "Axis Y", Field.JAxisZ => "Axis Z",
+        Field.JLimitEnabled => "Limit", Field.JLower => "Lower", Field.JUpper => "Upper",
+        Field.JMotorEnabled => "Motor", Field.JMotorSpeed => "Speed", Field.JMaxTorque => "Max Torque",
+        Field.JRestLength => "Rest Len", Field.JSpringEnabled => "Spring", Field.JFrequency => "Freq", Field.JDamping => "Damping",
         Field.Name => "Name",
         _ => f.ToString()
     };
@@ -310,10 +319,36 @@ public partial class PriviewNetworkScene
             },
             Field.CamKind => ParseCameraKind(entry.Descriptor.CameraKind) == CameraMode.Follow ? "Follow" : "Fixed",
             Field.FollowTargetId => entry.Descriptor.FollowTargetId < 0 ? "player" : $"#{entry.Descriptor.FollowTargetId}",
+            // ---- joint (C1-4b): kind name; body ids show "world" for -1; bools on/off; numerics like the rest ----
+            Field.JointKind => entry.Joint?.Kind ?? "-",
+            Field.JBodyA => JointBodyLabel(entry.Joint?.BodyA ?? -1),
+            Field.JBodyB => JointBodyLabel(entry.Joint?.BodyB ?? -1),
+            Field.JAnchorAX => (entry.Joint?.AnchorA.X ?? 0f).ToString("F2"),
+            Field.JAnchorAY => (entry.Joint?.AnchorA.Y ?? 0f).ToString("F2"),
+            Field.JAnchorAZ => (entry.Joint?.AnchorA.Z ?? 0f).ToString("F2"),
+            Field.JAnchorBX => (entry.Joint?.AnchorB.X ?? 0f).ToString("F2"),
+            Field.JAnchorBY => (entry.Joint?.AnchorB.Y ?? 0f).ToString("F2"),
+            Field.JAnchorBZ => (entry.Joint?.AnchorB.Z ?? 0f).ToString("F2"),
+            Field.JAxisX => (entry.Joint?.Axis.X ?? 0f).ToString("F2"),
+            Field.JAxisY => (entry.Joint?.Axis.Y ?? 0f).ToString("F2"),
+            Field.JAxisZ => (entry.Joint?.Axis.Z ?? 0f).ToString("F2"),
+            Field.JLimitEnabled => (entry.Joint?.LimitEnabled ?? false) ? "On" : "Off",
+            Field.JLower => (entry.Joint?.LowerLimit ?? 0f).ToString("F2"),
+            Field.JUpper => (entry.Joint?.UpperLimit ?? 0f).ToString("F2"),
+            Field.JMotorEnabled => (entry.Joint?.MotorEnabled ?? false) ? "On" : "Off",
+            Field.JMotorSpeed => (entry.Joint?.MotorTargetSpeed ?? 0f).ToString("F2"),
+            Field.JMaxTorque => (entry.Joint?.MaxMotorTorque ?? 0f).ToString("F2"),
+            Field.JRestLength => (entry.Joint?.RestLength ?? 0f).ToString("F2"),
+            Field.JSpringEnabled => (entry.Joint?.SpringEnabled ?? false) ? "On" : "Off",
+            Field.JFrequency => (entry.Joint?.Frequency ?? 0f).ToString("F2"),
+            Field.JDamping => (entry.Joint?.DampingRatio ?? 0f).ToString("F2"),
             Field.Name => DisplayName(entry),   // live typing handled by the buffer check above
             _ => ""
         };
     }
+
+    // Editor display for a joint body id: "world" for -1 (the static world anchor), else "#id".
+    private static string JointBodyLabel(int id) => id < 0 ? "world" : $"#{id}";
 
     // Editor display for a TextureFace value: "All" for -1, else the type's face option name (a cube:
     // +X..-Z), or the raw index as a fallback for an out-of-range value from hand-edited JSON.
@@ -619,6 +654,14 @@ public partial class PriviewNetworkScene
         Field.Collides or Field.Gravity or Field.Collider or Field.Mass or Field.Restitution
             or Field.Friction or Field.RollingFriction => "Physics",
         Field.Texture or Field.TextureScale or Field.TextureFace or Field.TextureFilter => "Texture",
+        // Joint (C1-4b): its own docked-Inspector section.
+        Field.JointKind or Field.JBodyA or Field.JBodyB
+            or Field.JAnchorAX or Field.JAnchorAY or Field.JAnchorAZ
+            or Field.JAnchorBX or Field.JAnchorBY or Field.JAnchorBZ
+            or Field.JAxisX or Field.JAxisY or Field.JAxisZ
+            or Field.JLimitEnabled or Field.JLower or Field.JUpper
+            or Field.JMotorEnabled or Field.JMotorSpeed or Field.JMaxTorque
+            or Field.JRestLength or Field.JSpringEnabled or Field.JFrequency or Field.JDamping => "Joint",
         _ => "Object",
     };
 

@@ -41,8 +41,14 @@ public partial class PriviewNetworkScene
         return best;
     }
 
-    // ---- Collision (camera bubble vs scene colliders) ----
-    private const float CameraRadius = 0.35f;
+    // ---- Collision (player CAPSULE vs scene colliders) ----
+    // The player is a VERTICAL capsule centred at _localBody.Position: a central segment of half-length
+    // CapsuleHalf plus radius CameraRadius, so the total height ≈ 2·CapsuleHalf + 2·CameraRadius ≈ 1.8 (human
+    // scale). Position stays the capsule CENTRE — the camera rig derives the eye from it (first-person eye sits
+    // AT the centre, i.e. floorTop + CapsuleHalf + CameraRadius ≈ 0.9 when standing, a natural height), so the
+    // rig is untouched. Collision reuses the sphere resolvers at the segment point nearest each collider.
+    private const float CameraRadius = 0.35f;   // capsule (and legacy bubble) radius
+    private const float CapsuleHalf = 0.55f;    // half-length of the capsule's central segment (0 => the old single sphere)
 
     // Pure sphere-vs-AABB/OBB/sphere resolvers + ClosestPointOnTriangle moved to CollisionMath
     // (SampleGame.Physics). The Object3d-overload below builds this mesh's OBB params then delegates.
@@ -60,20 +66,44 @@ public partial class PriviewNetworkScene
         return CollisionMath.ResolveSphereVsObb(c, r, center, ax, ay, az, half);
     }
 
-    // Eject the player BODY's bubble out of every collidable scene object (a couple of passes catch
-    // multiple simultaneous contacts). A sphere collider for Sphere, the world AABB for Object3d. The
-    // bubble is the body's physical presence (was the camera's, pre-B-camera); the camera derives from it.
+    // Eject the player CAPSULE out of every collidable scene object (a couple of passes catch multiple
+    // simultaneous contacts). The capsule is a vertical segment [Position ± (0,CapsuleHalf,0)] of radius
+    // CameraRadius. For a CONVEX collider the capsule's closest point lies on that segment, so the exact
+    // capsule resolution is: clamp the collider's height into the segment -> run the EXISTING sphere resolver
+    // (unchanged) at that point -> translate the whole body by the delta. This gives the player real body
+    // height (blocked by head- and foot-height obstacles, can't slip under low overhangs, slides along walls)
+    // with no new collision math. With CapsuleHalf == 0 it reduces EXACTLY to the old single-sphere bubble.
     private void ResolveBodyCollision()
     {
         for (int pass = 0; pass < 2; pass++)
             foreach (var e in _editables)
             {
                 if (e.Instance is not { Collides: true }) continue;
-                if (e.Instance is Sphere s)        _localBody.Position = CollisionMath.ResolveSphereVsSphere(_localBody.Position, CameraRadius, s.Position, s.R);
-                else if (e.Instance is Object3d o) _localBody.Position = o.Collider == ColliderShape.Obb
-                    ? ResolveSphereVsObb(_localBody.Position, CameraRadius, o)
-                    : CollisionMath.ResolveSphereVsAabb(_localBody.Position, CameraRadius, o.WorldMin, o.WorldMax);
+                Vector3 p = _localBody.Position;
+                float segY = Math.Clamp(ColliderCenterY(e.Instance), p.Y - CapsuleHalf, p.Y + CapsuleHalf);
+                Vector3 q = new Vector3(p.X, segY, p.Z);   // point on the capsule's central segment nearest this collider's height
+                Vector3 qPrime;
+                if (e.Instance is Sphere s) qPrime = CollisionMath.ResolveSphereVsSphere(q, CameraRadius, s.Position, s.R);
+                else if (e.Instance is Object3d o) qPrime = o.Collider == ColliderShape.Obb
+                    ? ResolveSphereVsObb(q, CameraRadius, o)
+                    : CollisionMath.ResolveSphereVsAabb(q, CameraRadius, o.WorldMin, o.WorldMax);
+                else continue;
+                _localBody.Position += qPrime - q;         // translate the body by the ejection delta
             }
+    }
+
+    // The representative height of a collider used to clamp the capsule segment: a Sphere's centre, an OBB's
+    // centre, else the AABB's mid-height. The sphere resolver at the clamped point still accounts for the
+    // collider's FULL extent, so the horizontal push is correct at any clamped Y (a tall wall pushes sideways,
+    // a floor clamps to the foot cap and pushes up, a ceiling clamps to the head cap and pushes down).
+    private static float ColliderCenterY(GameObject inst)
+    {
+        if (inst is Sphere s) return s.Position.Y;
+        if (inst is Object3d o)
+            return o.Collider == ColliderShape.Obb
+                ? ((o.LocalCenter * o.Scale).Rotate(o.TotalRotation) + o.Position).Y   // OBB centre (matches ResolveSphereVsObb)
+                : (o.WorldMin.Y + o.WorldMax.Y) * 0.5f;
+        return inst.Position.Y;
     }
 
     // ---- Player character controller (only when the world has gravity) ----

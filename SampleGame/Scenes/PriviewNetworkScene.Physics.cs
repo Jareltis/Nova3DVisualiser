@@ -56,6 +56,15 @@ public partial class PriviewNetworkScene
     // Legacy mode ("legacy", the default) never reaches this path and is unchanged.
     private ImpulseWorld? _impWorld;
     private readonly Dictionary<GameObject, RigidBody> _impBodies = new();   // persistent dynamic-sphere bodies (velocity/sleep/warm-start state survives frames)
+    // C2-5: the o.Scale each dynamic-MESH hull body was built with — a hull's geometry/inertia depend on scale, so a
+    // scale edit REBUILDS the ConvexHull (expensive quickhull, so build-once otherwise). Pruned alongside _impBodies.
+    private readonly Dictionary<GameObject, float> _hullScale = new();
+
+    // C1-4a joints: persistent Joint objects (so their accumulated-impulse warm-start survives frames, like bodies).
+    private readonly Dictionary<JointConfig, Joint> _impJoints = new();                          // one live Joint per world JointConfig
+    private readonly Dictionary<JointConfig, (RigidBody a, RigidBody b)> _impJointBuiltWith = new();  // the bodies each joint was built against (rebuild on change)
+    private readonly HashSet<JointConfig> _impJointsWarned = new();                              // coalesce the "joint skipped" warning to once per config
+    private RigidBody? _worldAnchor;                                                             // shared immovable WORLD anchor (origin) for BodyId -1 joint endpoints
 
     private void StepImpulse(float dt)
     {
@@ -84,22 +93,50 @@ public partial class PriviewNetworkScene
             else if (inst is Object3d o)
             {
                 live.Add(inst);
-                Vector3 half = o.Size * (0.5f * o.Scale);
                 float mass = MathF.Max(1e-4f, inst.Mass);
-                if (!_impBodies.TryGetValue(inst, out var rb))
+                // C2-5: a gravity+collides custom MESH (descriptor Type "mesh") simulates as its true convex HULL, so
+                // it rests on faces / tumbles like its real shape; every box-like PRIMITIVE (cube/ramp/pyramid/…) stays
+                // an OBB exactly as before (a cube's OBB == its hull, and BoxVsBox is cheaper).
+                bool isMesh = string.Equals(e.Descriptor.Type, "mesh", StringComparison.OrdinalIgnoreCase);
+                RigidBody rb;
+                if (isMesh)
                 {
-                    Vector3 center = (o.LocalCenter * o.Scale).Rotate(o.LocalRotate) + o.Position;
-                    rb = RigidBody.DynamicBox(center, half, Quaternions.QuatFromEuler(o.LocalRotate), mass);
-                    _impBodies[inst] = rb;
+                    // Build the hull ONCE (quickhull is expensive) — rebuild ONLY when o.Scale changed (the hull
+                    // geometry/inertia depend on scale), preserving velocity/sleep so a live scale edit keeps motion.
+                    bool have = _impBodies.TryGetValue(inst, out rb!);
+                    bool scaleChanged = !have || !_hullScale.TryGetValue(inst, out float bs) || bs != o.Scale;
+                    if (scaleChanged)
+                    {
+                        Vector3 lin = Vector3.Zero, angv = Vector3.Zero; bool sleeping = false;
+                        if (have) { lin = rb.LinVel; angv = rb.AngVel; sleeping = rb.Sleeping; }
+                        var locals = new Vector3[o.LocalVertices.Length];
+                        for (int i = 0; i < locals.Length; i++) locals[i] = o.LocalVertices[i] * o.Scale;   // scaled locals (matches the OBB's Size·Scale)
+                        rb = RigidBody.DynamicHull(locals, mass);
+                        rb.Position = rb.HullLocalCom.Rotate(o.LocalRotate) + o.Position;   // COM offset replaces LocalCenter
+                        rb.Orientation = Quaternions.QuatFromEuler(o.LocalRotate);
+                        rb.LinVel = lin; rb.AngVel = angv; rb.Sleeping = sleeping;
+                        _impBodies[inst] = rb; _hullScale[inst] = o.Scale;
+                    }
+                    // else: reuse as-is — the solver owns Position/Orientation/velocity across frames.
                 }
-                else rb.SetBoxShape(half, mass);   // refresh shape/inertia (scale/mass may have been edited)
+                else
+                {
+                    Vector3 half = o.Size * (0.5f * o.Scale);
+                    if (!_impBodies.TryGetValue(inst, out rb!))
+                    {
+                        Vector3 center = (o.LocalCenter * o.Scale).Rotate(o.LocalRotate) + o.Position;
+                        rb = RigidBody.DynamicBox(center, half, Quaternions.QuatFromEuler(o.LocalRotate), mass);
+                        _impBodies[inst] = rb;
+                    }
+                    else rb.SetBoxShape(half, mass);   // refresh shape/inertia (scale/mass may have been edited)
+                }
                 rb.Restitution = inst.Restitution; rb.Friction = inst.Friction; rb.RollingFriction = inst.RollingFriction; rb.Tag = e;
                 w.Bodies.Add(rb);
             }
         }
         // Prune bodies whose object was deleted / lost gravity.
         if (_impBodies.Count != live.Count)
-            foreach (var k in _impBodies.Keys.Where(k => !live.Contains(k)).ToList()) _impBodies.Remove(k);
+            foreach (var k in _impBodies.Keys.Where(k => !live.Contains(k)).ToList()) { _impBodies.Remove(k); _hullScale.Remove(k); }
 
         // Static collidables -> fresh static bodies each frame (they carry no solver state). A gravity+collides
         // object is a DYNAMIC body (added above); everything else that collides is a static support.
@@ -110,6 +147,9 @@ public partial class PriviewNetworkScene
             if (inst is Sphere ss) w.Bodies.Add(RigidBody.StaticSphere(ss.Position, ss.R));
             else if (inst is Object3d o) w.Bodies.Add(BuildStaticMeshBody(o));
         }
+
+        // C1-4a: (re)build the world's joints now that every solver body exists this frame. No-op if joint-free.
+        BuildFrameJoints(w);
 
         w.Step(dt);
 
@@ -126,13 +166,145 @@ public partial class PriviewNetworkScene
             else if (go is Object3d o)
             {
                 Vector3 newRot = Quaternions.EulerFromQuat(rb.Orientation);
-                Vector3 newPos = rb.Position - (o.LocalCenter * o.Scale).Rotate(newRot);   // solver Position is the OBB centre; back out the anchor offset
+                // Back out the anchor offset: a HULL body's Position is its COM (HullLocalCom, already scale-baked); a
+                // box/primitive body's is the OBB centre (LocalCenter·Scale). Same rotate-and-subtract either way.
+                Vector3 anchorOff = rb.Kind == ColliderKind.Hull ? rb.HullLocalCom : o.LocalCenter * o.Scale;
+                Vector3 newPos = rb.Position - anchorOff.Rotate(newRot);
                 moved = (newPos - o.Position).Length() > 1e-6f || (newRot - o.LocalRotate).Length() > 1e-5f;
                 o.Position = newPos;
                 o.LocalRotate = newRot;
                 o.UpdateGeometry();
             }
             if (moved && _online && _isServer && rb.Tag is EditEntry ee) _physMoved.Add(ee.Descriptor.Id);
+        }
+    }
+
+    // C1-4a: (re)build the ImpulseWorld's joints from _world.Joints each frame, PRESERVING warm-start like the
+    // bodies do — the live Joint objects live in _impJoints across frames (their accumulated-impulse warm-start
+    // persists) and are only rebuilt when a referenced body actually changes (deleted/recreated). A BodyId of -1
+    // is the fixed WORLD: a SHARED immovable anchor at the origin, so the joint's LocalAnchor (= the config's
+    // AnchorA/B) is the world anchor point. A joint whose body isn't a solver body this frame is skipped
+    // (Logger.Warning, coalesced to once per config). No-op for a joint-free world -> bit-identical to before.
+    private void BuildFrameJoints(ImpulseWorld w)
+    {
+        w.Joints.Clear();
+        var cfgs = _world.Joints;
+        if ((cfgs == null || cfgs.Count == 0) && _impJoints.Count == 0) return;   // fast path: this world has no joints
+
+        // Resolve an object id -> its solver RigidBody: id == -1 -> the shared WORLD anchor (origin); a real id ->
+        // the object's persistent dynamic body (null if it isn't a solver body this frame — e.g. static, deleted,
+        // or gravity-off). A static anchor at the origin makes AnchorA/B behave as a WORLD position for -1 sides.
+        RigidBody? Resolve(int id)
+        {
+            if (id == -1) return _worldAnchor ??= RigidBody.StaticSphere(Vector3.Zero, 0.001f);
+            int idx = _editables.FindIndex(e => e.Descriptor.Id == id);
+            if (idx < 0) return null;
+            return _impBodies.TryGetValue(_editables[idx].Instance, out var rb) ? rb : null;
+        }
+
+        // Drop persistent joints whose config was removed from the world (robust to future edits/deletes).
+        if (_impJoints.Count > 0 && cfgs != null)
+            foreach (var dead in _impJoints.Keys.Where(k => !cfgs.Contains(k)).ToList())
+            { _impJoints.Remove(dead); _impJointBuiltWith.Remove(dead); _impJointsWarned.Remove(dead); }
+
+        if (cfgs == null) return;
+        foreach (var cfg in cfgs)
+        {
+            var a = Resolve(cfg.BodyA);
+            var b = Resolve(cfg.BodyB);
+            if (a == null || b == null)
+            {
+                WarnJointOnce(cfg, $"Joint '{cfg.Kind}' ({cfg.BodyA}->{cfg.BodyB}) skipped: a referenced body is not a solver body this frame.");
+                _impJoints.Remove(cfg); _impJointBuiltWith.Remove(cfg);
+                continue;
+            }
+            // Reuse the persistent joint (warm-start intact) unless a referenced body changed (deleted/recreated).
+            if (!_impJoints.TryGetValue(cfg, out var joint)
+                || !_impJointBuiltWith.TryGetValue(cfg, out var built) || built.a != a || built.b != b)
+            {
+                joint = JointBuilder.BuildJoint(cfg, Resolve);
+                if (joint == null)   // unknown Kind
+                {
+                    WarnJointOnce(cfg, $"Joint kind '{cfg.Kind}' unknown; skipped.");
+                    _impJoints.Remove(cfg); _impJointBuiltWith.Remove(cfg);
+                    continue;
+                }
+                _impJoints[cfg] = joint;
+                _impJointBuiltWith[cfg] = (a, b);
+            }
+            _impJointsWarned.Remove(cfg);   // successfully added -> reset the warn latch (re-warns only if it breaks again)
+            w.Joints.Add(joint);
+        }
+    }
+
+    private void WarnJointOnce(JointConfig cfg, string msg) { if (_impJointsWarned.Add(cfg)) Logger.Warning(msg); }
+
+    // C1-4b: the WORLD position of a joint anchor — the placeholder marker + spawn use this to place a joint
+    // at the midpoint of its two anchors. A body id of -1 means the anchor is a WORLD point (matching the
+    // bridge's world-anchor convention); a real id resolves to the live instance and applies its world
+    // transform to the LOCAL anchor. For an Object3d the solver body is its OBB centre (LocalCenter·Scale
+    // rotated + Position), so mirror that here so the marker sits where the bridge pins. An unresolved id
+    // falls back to treating the stored anchor as a world point.
+    private Vector3 JointAnchorWorld(int bodyId, Vec3Config anchor)
+    {
+        Vector3 a = ToVec(anchor);
+        if (bodyId == -1) return a;
+        int idx = _editables.FindIndex(e => e.Descriptor.Id == bodyId);
+        if (idx < 0) return a;
+        var inst = _editables[idx].Instance;
+        if (inst is Object3d o)
+            return (o.LocalCenter * o.Scale).Rotate(o.LocalRotate) + o.Position + a.Rotate(o.LocalRotate);
+        return inst.Position + a;   // a sphere/other: its position is the centre
+    }
+
+    // The midpoint of a joint's two world anchors (kept for the descriptor's informational Position).
+    private Vector3 JointMidpoint(JointConfig cfg) =>
+        (JointAnchorWorld(cfg.BodyA, cfg.AnchorA) + JointAnchorWorld(cfg.BodyB, cfg.AnchorB)) * 0.5f;
+
+    // C1-4c: last-built anchors/axis per joint marker, so UpdateJointMarkers only rebuilds the line mesh when
+    // an endpoint (or the hinge axis) actually moved — a resting joint's marker isn't rebuilt every frame.
+    private readonly Dictionary<JointConfig, (Vector3 a, Vector3 b, Vector3 axis)> _jointMarkerCache = new();
+    private const float JointMarkerEps = 1e-3f;   // rebuild threshold (world units)
+
+    // C1-4c: the hinge rotation axis in WORLD space (Rotate(bodyA.Orientation, cfg.Axis)) — null when the
+    // joint is not a hinge or its axis is unset (the marker then draws just the connection line). BodyA -1 /
+    // an unresolved id has identity orientation, so the local axis IS the world axis.
+    private Vector3? HingeAxisWorld(JointConfig cfg)
+    {
+        if (!string.Equals(cfg.Kind?.Trim(), "hinge", StringComparison.OrdinalIgnoreCase)) return null;
+        Vector3 axis = ToVec(cfg.Axis);
+        if (axis.Length() < 1e-6f) return null;
+        int idx = _editables.FindIndex(e => e.Descriptor.Id == cfg.BodyA);   // orient by BodyA's world rotation
+        if (idx >= 0) axis = axis.Rotate(_editables[idx].Instance.LocalRotate);
+        return axis.Norm();
+    }
+
+    // C1-4c: keep every joint entry's LINE marker spanning its live anchors (its bodies move under physics /
+    // interpolation, and an anchor/body/kind/axis edit reshapes it) — rebuild the tiny mesh + swap it in via
+    // ReplaceMarker only when an endpoint or the hinge axis moved past a small epsilon (a resting joint isn't
+    // rebuilt). No joint entries → no work, so a joint-free world is bit-identical to before.
+    private void UpdateJointMarkers()
+    {
+        foreach (var e in _editables)
+        {
+            var cfg = e.Joint;
+            if (cfg == null) continue;
+            Vector3 wa = JointAnchorWorld(cfg.BodyA, cfg.AnchorA);
+            Vector3 wb = JointAnchorWorld(cfg.BodyB, cfg.AnchorB);
+            Vector3? axis = HingeAxisWorld(cfg);
+            Vector3 axisV = axis ?? Vector3.Zero;
+            if (_jointMarkerCache.TryGetValue(cfg, out var last)
+                && (wa - last.a).Length() < JointMarkerEps
+                && (wb - last.b).Length() < JointMarkerEps
+                && (axisV - last.axis).Length() < JointMarkerEps)
+                continue;   // nothing moved past epsilon — keep the current marker
+
+            var fresh = BuildJointMarkerMesh(wa, wb, cfg.Kind, axis);
+            ReplaceMarker(e, fresh);                     // swap display + _models, keep it non-colliding
+            e.Instance.Color = JointColor(cfg.Kind);     // re-apply the kind colour (a kind edit changed it; ReplaceMarker kept the OLD)
+            if (e.Instance.Position.Length() > 1e-9f)    // world-space verts → keep the transform at the origin (guards a stray move-key nudge)
+            { e.Instance.Position = Vector3.Zero; if (e.Instance is Object3d o) o.UpdateGeometry(); }
+            _jointMarkerCache[cfg] = (wa, wb, axisV);
         }
     }
 

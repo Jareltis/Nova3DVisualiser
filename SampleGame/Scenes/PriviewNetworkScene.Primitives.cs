@@ -29,6 +29,60 @@ public partial class PriviewNetworkScene
         return m;
     }
 
+    // ---- C1-4c: joint marker geometry (a thin line between the two anchors + an optional hinge-axis stub) ----
+    // A joint's on-screen marker is a raytraced, PICKABLE, non-colliding Object3d (like the camera/light
+    // markers). It's rebuilt as the jointed bodies move (UpdateJointMarkers), so it's kept tiny — a 12-tri
+    // thin rectangular prism spanning worldA→worldB, plus (for a hinge with an axis) a second 12-tri stub
+    // along the hinge axis (24 tris total). Verts are in WORLD space (the Object3d's transform stays at the
+    // origin), so a line between two arbitrary points needs no uniform-scale gymnastics. Colour is set by the
+    // caller (JointColor). Reuses BuildFlat, which derives each face normal from its (outward) winding.
+    private const float JointLineRadius = 0.03f;   // thin tube half-width
+    private const float JointAxisHalfLen = 0.4f;   // hinge axis stub half-length
+
+    public static Object3d BuildJointMarkerMesh(Vector3 worldA, Vector3 worldB, string? kind, Vector3? hingeAxisWorld)
+    {
+        var verts = new List<Vector3>();
+        var tris = new List<(int, int, int)>();
+        AppendJointPrism(verts, tris, worldA, worldB, JointLineRadius);   // the connection line A→B
+
+        // A hinge also shows a short stub along its rotation axis (centred at anchor A), so the axis reads.
+        if (string.Equals(kind?.Trim(), "hinge", StringComparison.OrdinalIgnoreCase)
+            && hingeAxisWorld is Vector3 ax && ax.Length() > 1e-6f)
+        {
+            Vector3 a = ax.Norm();
+            AppendJointPrism(verts, tris, worldA - a * JointAxisHalfLen, worldA + a * JointAxisHalfLen, JointLineRadius);
+        }
+        return BuildFlat(verts, tris);
+    }
+
+    // Appends a thin rectangular prism (8 verts, 12 outward-wound tris) spanning p0→p1 with half-width r, to
+    // the running vert/tri lists (1-based indices offset by the current vert count). TangentBasis gives a
+    // right-handed frame (u, v, d) with u×v=d, so the winding below yields outward face normals (BuildFlat
+    // derives each normal from its winding, and the renderer culls back-faces, so the tube reads as solid).
+    private static void AppendJointPrism(List<Vector3> verts, List<(int, int, int)> tris, Vector3 p0, Vector3 p1, float r)
+    {
+        Vector3 d = p1 - p0;
+        d = d.Length() > 1e-6f ? d.Norm() : new Vector3(0f, 1f, 0f);   // guard a zero-length span
+        ImpulseMath.TangentBasis(d, out Vector3 u, out Vector3 v);
+        Vector3 su = u * r, sv = v * r;
+        int b = verts.Count;   // 0-based offset; a local 1-based index n maps to b + n
+        verts.Add(p0 - su - sv);   // 1
+        verts.Add(p0 + su - sv);   // 2
+        verts.Add(p0 + su + sv);   // 3
+        verts.Add(p0 - su + sv);   // 4
+        verts.Add(p1 - su - sv);   // 5
+        verts.Add(p1 + su - sv);   // 6
+        verts.Add(p1 + su + sv);   // 7
+        verts.Add(p1 - su + sv);   // 8
+        void T(int a, int c, int e) => tris.Add((b + a, b + c, b + e));
+        T(1, 4, 3); T(1, 3, 2);   // p0 cap (−d)
+        T(5, 6, 7); T(5, 7, 8);   // p1 cap (+d)
+        T(2, 3, 7); T(2, 7, 6);   // +u face
+        T(4, 1, 5); T(4, 5, 8);   // −u face
+        T(3, 4, 8); T(3, 8, 7);   // +v face
+        T(1, 2, 6); T(1, 6, 5);   // −v face
+    }
+
     public static Object3d CreateCube()
     {
         var verts = new Vector3[]
