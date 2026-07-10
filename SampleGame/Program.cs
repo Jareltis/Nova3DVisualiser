@@ -42,6 +42,7 @@ partial class Program
         if (args.Length > 0 && args[0] == "udptest") { UdpSelfTest(); return; }                   // plan E stage E1: pure UDP framing + seq-filter (no sockets)
         if (args.Length > 0 && args[0] == "uitest") { WizardUi.UiSelfTest.Run(); return; }        // Variant B (engine-renderer wizard) toolkit tests
         if (args.Length > 0 && args[0] == "uidemo") { WizardUi.UiDemo.Run(); return; }            // Variant B stage-1 interactive demo (font-zoom check)
+        if (args.Length > 0 && args[0] == "maketestworld") { TestLab.Generate(); return; }        // F3 TOOL (not a PASS test): generate the "TestLab" showroom world, save it, exit
 
         // Crash net: the render loop is async + parallel (Parallel.For), so a crash on a worker
         // thread or an unobserved task never reaches the try/catch below. Capture those globally
@@ -126,7 +127,7 @@ partial class Program
         }
 
         Object3d.UseBvh = chosenWorld.Graphics.Bvh;
-        Logger.Info($"World='{chosenWorld.Name}'; Mode={(online ? (isServer ? "Server" : "Client") : "Local")}; Network {ip}:{port}; platform={chosenWorld.Platform.Enabled}; objects={chosenWorld.Objects.Count}; extraLight={chosenWorld.Graphics.ExtraLight}; ownLight={!chosenWorld.Graphics.DisableCameraLight}; shadows={chosenWorld.Graphics.Shadows}; bvh={chosenWorld.Graphics.Bvh}");
+        Logger.Info($"World='{chosenWorld.Name}'; Mode={(online ? (isServer ? "Server" : "Client") : "Local")}; Network {ip}:{port}; platform={chosenWorld.Platform.Enabled}; objects={chosenWorld.Objects.Count}; extraLight={chosenWorld.Graphics.ExtraLight}; ownLight={!chosenWorld.Graphics.DisableCameraLight}; shadows={chosenWorld.Graphics.Shadows}; bvh={chosenWorld.Graphics.Bvh}; nick='{wiz.Nick}'");
 
         Console.WriteLine(online
             ? $"Starting {(isServer ? "Server" : "Client")} on {ip}:{port} [world: {chosenWorld.Name}]..."
@@ -134,7 +135,7 @@ partial class Program
         Thread.Sleep(500);
         Console.Clear();
 
-        var scene = new PriviewNetworkScene(new DisplayManagerAsync(), chosenWorld, isServer, ip, port, online);
+        var scene = new PriviewNetworkScene(new DisplayManagerAsync(), chosenWorld, isServer, ip, port, online, wiz.Nick);
         scene.EnableShadows = chosenWorld.Graphics.Shadows;
 
         // Pick the renderer the world asked for. "gpu" tries an NVIDIA/ILGPU screen and silently

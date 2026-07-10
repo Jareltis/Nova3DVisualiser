@@ -32,11 +32,20 @@ public static class JointBuilder
 
             case "hinge":
             {
-                Vector3 axis = ToVec(cfg.Axis);
+                // F2 (RC5): interpret cfg.Axis in BODY A's frame (world when BodyA is the WORLD anchor, which is
+                // identity). Derive ONE world axis, then express it in EACH body's local frame — so differently-
+                // oriented bodies share the SAME physical hinge axis and their perpendicular locks don't fight
+                // (parasitic torque). For identically-oriented bodies this is bit-identical to the old verbatim
+                // copy. A zero/degenerate axis falls back to +Y.
+                Vector3 rawAxis = ToVec(cfg.Axis);
+                Vector3 localA = rawAxis.Length() > 1e-6f ? rawAxis.Norm() : new Vector3(0f, 1f, 0f);
+                Vector3 worldAxis = ImpulseMath.Rotate(a.Orientation, localA);
+                Vector3 localAxisA = ImpulseMath.RotateInv(a.Orientation, worldAxis);   // == localA
+                Vector3 localAxisB = ImpulseMath.RotateInv(b.Orientation, worldAxis);
                 return new HingeJoint
                 {
                     A = a, B = b, LocalAnchorA = anchorA, LocalAnchorB = anchorB,
-                    LocalAxisA = axis, LocalAxisB = axis,
+                    LocalAxisA = localAxisA, LocalAxisB = localAxisB,
                     LimitEnabled = cfg.LimitEnabled, LowerLimit = cfg.LowerLimit, UpperLimit = cfg.UpperLimit,
                     MotorEnabled = cfg.MotorEnabled, MotorTargetSpeed = cfg.MotorTargetSpeed, MaxMotorTorque = cfg.MaxMotorTorque,
                 };

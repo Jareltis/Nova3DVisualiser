@@ -1306,6 +1306,102 @@ partial class Program
             ok &= good;
         }
 
+        // ============================ F2 (solver-level joint × sleeping) ============================
+
+        // F2 (RC1): a dynamic body ball-socketed to a STATIC anchor across a 5-unit gap must NOT sleep mid-flight
+        // (the old "gravity disappears" freeze ~2 units short). It stays awake WHILE the constraint is violated
+        // (PositionError > tol) and ends within tol of the pin. Solver-level (no bridge snap).
+        {
+            const float tol = 0.05f;
+            var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f) };
+            var anchor = RigidBody.StaticSphere(new Vector3(0f, 5f, 0f), 0.01f); w.Bodies.Add(anchor);
+            var body = RigidBody.Sphere(Vector3.Zero, 0.4f, 1f); w.Bodies.Add(body);   // 5 units below the pin
+            var joint = new BallSocketJoint { A = anchor, B = body, LocalAnchorA = Vector3.Zero, LocalAnchorB = Vector3.Zero };
+            w.Joints.Add(joint);
+            bool frozenWhileViolated = false;
+            for (int i = 0; i < 120; i++)   // 2 s
+            {
+                w.Step(dt);
+                if (body.Sleeping && joint.PositionError() > tol) frozenWhileViolated = true;
+            }
+            float endErr = joint.PositionError();
+            bool good = !frozenWhileViolated && endErr <= tol;
+            Console.WriteLine($"  joint-nofreeze: neverSleptWhileViolated={!frozenWhileViolated}, endErr={endErr:F4} (<={tol} reached pin) -> {(good ? "ok" : "BAD")}");
+            ok &= good;
+        }
+
+        // F2: a SATISFIED hanging rod pendulum settles + SLEEPS (the joint changes don't break sleeping), and a
+        // later disturbance via Wake() revives it.
+        {
+            var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f) };
+            var anchor = RigidBody.StaticSphere(new Vector3(0f, 3f, 0f), 0.01f); w.Bodies.Add(anchor);
+            var bob = RigidBody.Sphere(new Vector3(0f, 1f, 0f), 0.3f, 1f); w.Bodies.Add(bob);   // at rod length below, at rest
+            w.Joints.Add(new DistanceJoint { A = anchor, B = bob, LocalAnchorA = Vector3.Zero, LocalAnchorB = Vector3.Zero, RestLength = 2f });
+            for (int i = 0; i < 300; i++) w.Step(dt);   // 5 s -> settle + sleep
+            bool slept = bob.Sleeping;
+            ImpulseWorld.Wake(bob);
+            bool revived = !bob.Sleeping;
+            bool good = slept && revived;
+            Console.WriteLine($"  joint-sleep-wake: satisfied pendulum slept={slept}, Wake revived={revived} -> {(good ? "ok" : "BAD")}");
+            ok &= good;
+        }
+
+        // F2: two DYNAMIC bodies joined by a rigid rod form ONE sleep island — after they settle + sleep,
+        // disturbing ONE (wake + a velocity) wakes the OTHER within a step (moving-wakes-sleeping over the joint).
+        {
+            var w = new ImpulseWorld { Gravity = Vector3.Zero };   // no gravity: they just rest, linked by the rod
+            var b1 = RigidBody.Sphere(new Vector3(-1f, 0f, 0f), 0.3f, 1f); w.Bodies.Add(b1);
+            var b2 = RigidBody.Sphere(new Vector3(1f, 0f, 0f), 0.3f, 1f); w.Bodies.Add(b2);
+            w.Joints.Add(new DistanceJoint { A = b1, B = b2, LocalAnchorA = Vector3.Zero, LocalAnchorB = Vector3.Zero, RestLength = 2f });
+            for (int i = 0; i < 120; i++) w.Step(dt);   // settle + sleep as one island
+            bool bothSlept = b1.Sleeping && b2.Sleeping;
+            ImpulseWorld.Wake(b1); b1.LinVel = new Vector3(0f, 2f, 0f);   // disturb ONE
+            w.Step(dt);
+            bool otherWoke = !b2.Sleeping;
+            bool good = bothSlept && otherWoke;
+            Console.WriteLine($"  joint-island: rod pair slept={bothSlept}, disturbing one woke the other={otherWoke} -> {(good ? "ok" : "BAD")}");
+            ok &= good;
+        }
+
+        // F2 (RC5): a hinge BUILT VIA JointBuilder between two DIFFERENTLY-ORIENTED bodies keeps ONE physical
+        // axis — the two world axes AGREE at build (dot ~1, despite the tilt) and stay parallel through a settle;
+        // the pin closes and nothing runs away. (The old verbatim LocalAxisA=LocalAxisB=cfg.Axis disagreed.)
+        {
+            var anchor = RigidBody.StaticSphere(Vector3.Zero, 0.01f);                       // identity orientation
+            Quat doorOri = Quaternions.QuatFromEuler(new Vector3(0.4f, 0.7f, 0.2f));         // a tilted body
+            var door = RigidBody.DynamicBox(new Vector3(1f, 0f, 0f), new Vector3(0.5f, 0.5f, 0.5f), doorOri, 1f);
+            Func<int, RigidBody?> resolve = id => id == 0 ? anchor : id == 1 ? door : (RigidBody?)null;
+            var hj = (HingeJoint)JointBuilder.BuildJoint(new JointConfig { Kind = "hinge", BodyA = 0, BodyB = 1,
+                Axis = new Vec3Config { X = 0f, Y = 0f, Z = 1f }, AnchorA = new Vec3Config(), AnchorB = new Vec3Config() }, resolve)!;
+            Vector3 aA = ImpulseMath.Rotate(anchor.Orientation, hj.LocalAxisA);
+            Vector3 aB = ImpulseMath.Rotate(door.Orientation, hj.LocalAxisB);
+            float dotAtBuild = aA.Norm() * aB.Norm();
+            bool axesAgree = dotAtBuild > 0.999f;   // ONE physical world axis despite the different body orientations
+            var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f) };
+            w.Bodies.Add(anchor); w.Bodies.Add(door); w.Joints.Add(hj);
+            float maxAxisErr = 0f;
+            for (int i = 0; i < 180; i++) { w.Step(dt); maxAxisErr = MathF.Max(maxAxisErr, HingeAxisErr(hj)); }
+            float endPin = (Anchor(door, hj.LocalAnchorB) - Anchor(anchor, hj.LocalAnchorA)).Length();
+            bool bounded = MathF.Abs(door.Position.X) < 3f && MathF.Abs(door.Position.Y) < 3f && MathF.Abs(door.Position.Z) < 3f;
+            bool good = axesAgree && maxAxisErr < 0.05f && endPin < 0.1f && bounded;
+            Console.WriteLine($"  hinge-misaligned-build: axesDot@build={dotAtBuild:F4} (agree), maxAxisErr={maxAxisErr:F4} (parallel), endPin={endPin:F4} -> {(good ? "ok" : "BAD")}");
+            ok &= good;
+        }
+
+        // F2: a rigid rod holds its RestLength through settling to rest — no steady "contraction" creep.
+        {
+            const float L = 3f;
+            var w = new ImpulseWorld { Gravity = new Vector3(0f, -g, 0f) };
+            var anchor = RigidBody.StaticSphere(new Vector3(0f, 5f, 0f), 0.01f); w.Bodies.Add(anchor);
+            var bob = RigidBody.Sphere(new Vector3(0f, 5f - L, 0f), 0.3f, 1f); w.Bodies.Add(bob);   // hangs at rod length
+            w.Joints.Add(new DistanceJoint { A = anchor, B = bob, LocalAnchorA = Vector3.Zero, LocalAnchorB = Vector3.Zero, RestLength = L });
+            float maxLenErr = 0f;
+            for (int i = 0; i < 120; i++) { w.Step(dt); maxLenErr = MathF.Max(maxLenErr, MathF.Abs((bob.Position - anchor.Position).Length() - L)); }
+            bool good = maxLenErr < 0.02f;
+            Console.WriteLine($"  rod-honesty: maxLenErr={maxLenErr:F5} (<0.02, no creep) -> {(good ? "ok" : "BAD")}");
+            ok &= good;
+        }
+
         Console.WriteLine(ok ? "JOINT TEST PASSED" : "JOINT TEST FAILED");
     }
 

@@ -134,6 +134,12 @@ public class JointConfig
     public int BodyB { get; set; } = -1;
     public Vec3Config AnchorA { get; set; } = new();    // anchor in BodyA's LOCAL frame (or WORLD position when BodyA == -1)
     public Vec3Config AnchorB { get; set; } = new();    // anchor in BodyB's LOCAL frame (or WORLD position when BodyB == -1)
+    // F4 (Box2D collideConnected): do the two connected bodies ALSO collide with each other? Default OFF — a
+    // centre-anchored pin's satisfied pose overlaps, so colliding would fight the pin. Turn ON only when the
+    // joint's satisfied geometry does NOT force overlap (surface/edge anchors) — e.g. real chain links that
+    // should bump instead of folding through each other. Serializes with the rest of the world (old saves/peers
+    // default it false). A world-side (-1) endpoint contributes no collidable pair, so this is ignored there.
+    public bool Collide { get; set; } = false;
     // ---- hinge (revolute) ----
     public Vec3Config Axis { get; set; } = new();       // hinge axis in local frame (shared -> both bodies' LocalAxis)
     public bool LimitEnabled { get; set; }

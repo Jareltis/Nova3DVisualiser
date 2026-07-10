@@ -327,14 +327,16 @@ public partial class PriviewNetworkScene
                 }
                 break;
             // Body ids reference LIVE runtime object ids; floored at -1 (= the static world), like FollowTargetId.
-            case Field.JBodyA: if (entry.Joint != null) entry.Joint.BodyA = Math.Max(-1, entry.Joint.BodyA + dir); break;
-            case Field.JBodyB: if (entry.Joint != null) entry.Joint.BodyB = Math.Max(-1, entry.Joint.BodyB + dir); break;
+            // F2 (RC3): retarget PRESERVES the anchor's world point so the body doesn't lunge sideways.
+            case Field.JBodyA: if (entry.Joint != null) RetargetJointBody(entry.Joint, isA: true,  Math.Max(-1, entry.Joint.BodyA + dir)); break;
+            case Field.JBodyB: if (entry.Joint != null) RetargetJointBody(entry.Joint, isA: false, Math.Max(-1, entry.Joint.BodyB + dir)); break;
             case Field.JAnchorAX: if (entry.Joint != null) entry.Joint.AnchorA.X += dir * MoveStep; break;
             case Field.JAnchorAY: if (entry.Joint != null) entry.Joint.AnchorA.Y += dir * MoveStep; break;
             case Field.JAnchorAZ: if (entry.Joint != null) entry.Joint.AnchorA.Z += dir * MoveStep; break;
             case Field.JAnchorBX: if (entry.Joint != null) entry.Joint.AnchorB.X += dir * MoveStep; break;
             case Field.JAnchorBY: if (entry.Joint != null) entry.Joint.AnchorB.Y += dir * MoveStep; break;
             case Field.JAnchorBZ: if (entry.Joint != null) entry.Joint.AnchorB.Z += dir * MoveStep; break;
+            case Field.JCollide: if (entry.Joint != null) entry.Joint.Collide = !entry.Joint.Collide; break;   // F4: N or M toggles (Box2D collideConnected)
             case Field.JAxisX: if (entry.Joint != null) entry.Joint.Axis.X += dir * MoveStep; break;
             case Field.JAxisY: if (entry.Joint != null) entry.Joint.Axis.Y += dir * MoveStep; break;
             case Field.JAxisZ: if (entry.Joint != null) entry.Joint.Axis.Z += dir * MoveStep; break;
@@ -349,6 +351,9 @@ public partial class PriviewNetworkScene
             case Field.JFrequency: if (entry.Joint != null) entry.Joint.Frequency = MathF.Max(0f, entry.Joint.Frequency + dir * JointFreqStep); break;
             case Field.JDamping: if (entry.Joint != null) entry.Joint.DampingRatio = MathF.Max(0f, entry.Joint.DampingRatio + dir * JointDampStep); break;
         }
+        // F3: a joint-param edit rebuilds the live solver joint next frame (its params are copied at build), so it
+        // converges to the fresh anchors/axis/kind DYNAMICALLY (no re-snap — the cfg stays snap-evaluated).
+        if (entry.Joint != null && FieldGroup(f) == "Joint") InvalidateBuiltJoint(entry.Joint);
     }
 
     // Cycles a joint Kind ballsocket -> hinge -> distance -> ballsocket (N = forward, M = back).
@@ -489,11 +494,12 @@ public partial class PriviewNetworkScene
         // C1-4b: deleting a joint entry drops its config from _world.Joints (so it's gone everywhere — the
         // save list + the physics bridge). Deleting an OBJECT never touches _world.Joints; a joint left
         // dangling by a deleted body is harmless (the bridge skips a joint whose id doesn't resolve — C1-4a).
-        if (entry.Joint != null) { _world.Joints.Remove(entry.Joint); _jointMarkerCache.Remove(entry.Joint); }   // C1-4c: drop its marker-rebuild cache too
+        if (entry.Joint != null) { _world.Joints.Remove(entry.Joint); _jointMarkerCache.Remove(entry.Joint); _jointStatus.Remove(entry.Joint); }   // C1-4c: drop its marker-rebuild cache + F1 status too
         if (entry.Instance is IDisplays disp) RemoveDisplaysObject(disp);
         if (entry.Instance is Object3d o) _models.Remove(o);
         if (entry.Light != null) RemoveLight(entry.Light);   // a light: actually turn it off, not just hide the marker
         _impBodies.Remove(entry.Instance); _hullScale.Remove(entry.Instance);   // drop the solver RigidBody state
+        _impStaticAnchors.Remove(entry.Instance);            // F1: and any kinematic joint-anchor body for it
         _physMoved.Remove(entry.Descriptor.Id);              // and any pending/interp sync state
         _physTargets.Remove(entry.Descriptor.Id);
         _editables.RemoveAt(index);

@@ -1089,6 +1089,14 @@ partial class Program
             Console.WriteLine($"  chat-scroll: slices={sliceOk}, auto-bottom={autoBottom}, scrolled-up-stays={notJump} -> {((sliceOk && autoBottom && notJump) ? "ok" : "BAD")}");
             dockOk &= sliceOk && autoBottom && notJump;
 
+            // N2 — FormatChatLine (client-self-signed): a non-empty nick prefixes "{nick}: "; an empty nick
+            // falls back to the SAME "player #<id>:" wording as NameForNetId / LocalBodyName.
+            bool chatNick  = PriviewNetworkScene.FormatChatLine("Nick", 5, "hi") == "Nick: hi";
+            bool chatEmpty = PriviewNetworkScene.FormatChatLine("", 7, "hi") == "player #7: hi";
+            bool fmtOk = chatNick && chatEmpty;
+            Console.WriteLine($"  chat-format: nick='{PriviewNetworkScene.FormatChatLine("Nick", 5, "hi")}', empty='{PriviewNetworkScene.FormatChatLine("", 7, "hi")}' -> {(fmtOk ? "ok" : "BAD")}");
+            dockOk &= fmtOk;
+
             // (3) Placement: the chat box never intersects the HUD panels (per mode).
             bool Hit(PriviewNetworkScene.DockRect a, PriviewNetworkScene.DockRect b)
                 => a.W > 0 && a.H > 0 && b.W > 0 && b.H > 0
@@ -1370,6 +1378,30 @@ partial class Program
             ok &= connOk;
         }
 
+        // N2 — nickname roster (netId -> nick), the RECORD/read/prune logic (headless; the socket-level hub +
+        // back-fill are glue, verified live). A received PlayerInfoPacket records a SANITIZED nick keyed by
+        // the packet's NetId; NameForNetId reads it back and falls back to "player #<id>" for an unknown id;
+        // and the leave path drops the entry.
+        {
+            var rs = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig { Name = "roster",
+                Platform = new PlatformConfig { Enabled = false }, Objects = new List<WorldObject>() },
+                isServer: false, "127.0.0.1", 0, online: false);
+            rs.Start();
+
+            // A junky nick sanitizes on record (space + punctuation dropped, kept chars preserved).
+            rs.ReceivePlayerInfoForTest(555, "Bo b!@#", senderId: 42);
+            string recordedName = rs.NameForNetId(555);
+            bool recorded = recordedName == "Bob";
+            // An unknown net id (never seen; outside the 2..9999 self-id range) falls back to the system name.
+            bool fallback = rs.NameForNetId(99999) == "player #99999";
+            // Leaving prunes the entry -> back to the fallback.
+            rs.PlayerLeftForTest(555);
+            bool pruned = rs.NameForNetId(555) == "player #555";
+            bool rosterOk = recorded && fallback && pruned;
+            Console.WriteLine($"  roster: record='{recordedName}' (want 'Bob'), fallback={fallback}, pruned='{rs.NameForNetId(555)}'({pruned}) -> {(rosterOk ? "ok" : "BAD")}");
+            ok &= rosterOk;
+        }
+
         // C1-4b — in-editor JOINT authoring: spawn a joint with a body selected, edit ALL its params through
         // the field inspector (kind swaps the field set; body ids, anchors, limit/motor, spring), and delete
         // it — keeping _world.Joints (the C1-4a bridge source) in sync. Plus a load round-trip.
@@ -1479,6 +1511,557 @@ partial class Program
             ok &= jok;
         }
 
+        // F1 — joint scene-bridge fix: STATIC/KINEMATIC anchors + visible status (the v1.0.1 "joints unusable
+        // from the editor" bug — a joint side that wasn't a live DYNAMIC body used to resolve to null, so the
+        // WHOLE joint was silently inert; a light/static prop/the platform could never be an anchor). World
+        // gravity is ON for the bridge cases (the physics step runs).
+        {
+            bool f1 = true;
+
+            // --- PURE JointStatusReason: priority order (gravity off beats deleted beats both-static; else null) ---
+            bool prG    = PriviewNetworkScene.JointStatusReason(false, true, true, false, false) == "world gravity is off";
+            bool prGwin = PriviewNetworkScene.JointStatusReason(false, false, false, true, true) == "world gravity is off";   // beats deleted + both-static
+            bool prDel  = PriviewNetworkScene.JointStatusReason(true, false, true, false, false) == "a referenced body was deleted";
+            bool prStat = PriviewNetworkScene.JointStatusReason(true, true, true, true, true) == "both sides are static — nothing to move";
+            bool prAct  = PriviewNetworkScene.JointStatusReason(true, true, true, false, true) == null;   // one dynamic side -> active
+            bool prAct2 = PriviewNetworkScene.JointStatusReason(true, true, true, true, false) == null;
+            bool pureOk = prG && prGwin && prDel && prStat && prAct && prAct2;
+            Console.WriteLine($"  joint-status-pure: gravity={prG}&{prGwin}, deleted={prDel}, both-static={prStat}, active={prAct}&{prAct2} -> {(pureOk ? "ok" : "BAD")}");
+            f1 &= pureOk;
+
+            // Scene helper: gravity ON, platform enabled (id 0 = a STATIC collidable), a dynamic cube (id 1) +
+            // a LIGHT (id 2, a non-colliding => STATIC side). Caller supplies the joint list.
+            PriviewNetworkScene MakeScene(List<JointConfig> joints, bool light = true)
+            {
+                var objs = new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Color = "White", Gravity = true, Position = new Vec3Config { X = 0f, Y = 8.5f, Z = 0f } } };
+                if (light) objs.Add(new WorldObject { Id = 2, Type = "light", Color = "White", Position = new Vec3Config { X = 0f, Y = 9f, Z = 0f } });
+                var s = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig
+                {
+                    Name = "jointbridge",
+                    Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 10f },
+                    Platform = new PlatformConfig { Enabled = true, Size = 40f, Position = new Vec3Config { Y = -2f } },
+                    Objects = objs,
+                    Joints = joints,
+                }, isServer: false, "127.0.0.1", 0, online: false);
+                s.Start();
+                return s;
+            }
+            void Step(PriviewNetworkScene s, int n) { for (int i = 0; i < n; i++) s.StepPhysicsForTest(1f / 60f); }
+            bool Finite(Vector3 v) => !(float.IsNaN(v.X) || float.IsInfinity(v.X) || float.IsNaN(v.Y) || float.IsInfinity(v.Y) || float.IsNaN(v.Z) || float.IsInfinity(v.Z));
+
+            // (1) HOLD: a ballsocket cube<->light pins the cube's origin to the light's. The cube (below the
+            // light, under gravity) is pulled up and HELD there — the two world anchors coincide + status is
+            // active. If the joint were inert (the bug), the cube would fall ~11 units to the platform.
+            var hs = MakeScene(new List<JointConfig> { new JointConfig { Id = 50, Kind = "ballsocket", BodyA = 1, BodyB = 2,
+                AnchorA = new Vec3Config(), AnchorB = new Vec3Config() } });
+            Step(hs, 400);
+            var (ha, hb) = hs.JointAnchorsForTest(50);
+            bool holds = (ha - hb).Length() < 0.1f && hs.JointStatusForTest(50) == null;
+            Console.WriteLine($"  joint-hold: |anchorA-anchorB|={(ha - hb).Length():F3} (<0.1), status={hs.JointStatusForTest(50) ?? "active"} -> {(holds ? "ok" : "BAD")}");
+            f1 &= holds;
+
+            // (2) KINEMATIC DRAG: teleport the LIGHT anchor (+1 in X). The moving anchor WAKES + drags the
+            // (settled) pinned cube, so after settling the two anchors coincide again at the new spot.
+            float beforeX = hs.JointAnchorsForTest(50).a.X;
+            int li = hs.EditableEntries.ToList().FindIndex(e => e.Descriptor.Id == 2);
+            var lightInst = hs.EditableEntries[li].Instance;
+            lightInst.Position += new Vector3(1f, 0f, 0f);
+            if (lightInst is Object3d lo) lo.UpdateGeometry();
+            Step(hs, 150);
+            var (da, db) = hs.JointAnchorsForTest(50);
+            bool follows = (da - db).Length() < 0.12f && (da.X - beforeX) > 0.7f;   // coincident again + moved with the light
+            Console.WriteLine($"  joint-drag: cubeAnchorX {beforeX:F2}->{da.X:F2} (followed the light), |a-b|={(da - db).Length():F3} -> {(follows ? "ok" : "BAD")}");
+            f1 &= follows;
+
+            // (3) BOTH-STATIC (platform<->world) is INACTIVE with the both-static reason (no NaN, keeps
+            // stepping); re-pointing BodyA at the dynamic cube flips the status to ACTIVE.
+            var bs = MakeScene(new List<JointConfig> { new JointConfig { Id = 60, Kind = "ballsocket", BodyA = 0, BodyB = -1,
+                AnchorA = new Vec3Config(), AnchorB = new Vec3Config { Y = 3f } } });
+            Step(bs, 30);
+            bool bothStatic = bs.JointStatusForTest(60) == "both sides are static — nothing to move";
+            bs.WorldJointsForTest[0].BodyA = 1;   // flip BodyA to the dynamic cube (live cfg ref)
+            Step(bs, 30);
+            bool flipped = bs.JointStatusForTest(60) == null && Finite(bs.EditableEntries.First(e => e.Descriptor.Id == 1).Instance.Position);
+            bool bsOk = bothStatic && flipped;
+            Console.WriteLine($"  joint-both-static: platform<->world inactive={bothStatic}, after-flip-to-cube active={flipped} -> {(bsOk ? "ok" : "BAD")}");
+            f1 &= bsOk;
+
+            // (4) DELETED anchor: delete the light the cube hangs from -> the joint reports the deleted-body
+            // reason and the sim stays finite (never NaNs; the cube just falls free).
+            var ds = MakeScene(new List<JointConfig> { new JointConfig { Id = 70, Kind = "ballsocket", BodyA = 1, BodyB = 2,
+                AnchorA = new Vec3Config(), AnchorB = new Vec3Config() } });
+            Step(ds, 60);
+            int li2 = ds.EditableEntries.ToList().FindIndex(e => e.Descriptor.Id == 2);
+            ds.DeleteSelectedForTest(li2);   // remove the light (the anchor side)
+            Step(ds, 60);
+            bool deletedReason = ds.JointStatusForTest(70) == "a referenced body was deleted"
+                && Finite(ds.EditableEntries.First(e => e.Descriptor.Id == 1).Instance.Position);
+            Console.WriteLine($"  joint-deleted-anchor: status='{ds.JointStatusForTest(70)}', cube finite -> {(deletedReason ? "ok" : "BAD")}");
+            f1 &= deletedReason;
+
+            // (5) GRAVITY OFF: the master switch is off so the physics step never runs — the status must still be
+            // meaningful (computed at read time), not a stale/blank state.
+            var gs = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig
+            {
+                Name = "jointgravoff",
+                Physics = new PhysicsConfig { GravityEnabled = false },
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Gravity = true, Position = new Vec3Config { Y = 4f } } },
+                Joints = new List<JointConfig> { new JointConfig { Id = 80, Kind = "ballsocket", BodyA = 1, BodyB = -1 } },
+            }, isServer: false, "127.0.0.1", 0, online: false);
+            gs.Start();
+            gs.StepPhysicsForTest(1f / 60f);   // no-op (gravity off)
+            bool gravOff = gs.JointStatusForTest(80) == "world gravity is off";
+            Console.WriteLine($"  joint-gravity-off: status='{gs.JointStatusForTest(80)}' -> {(gravOff ? "ok" : "BAD")}");
+            f1 &= gravOff;
+
+            ok &= f1;
+        }
+
+        // F2 — joint × solver INTEGRATION defects (bridge-level): assembly snap, retarget anchor remap,
+        // collideConnected. World gravity ON, collision ON.
+        {
+            bool f2 = true;
+            void Step(PriviewNetworkScene s, int n) { for (int i = 0; i < n; i++) s.StepPhysicsForTest(1f / 60f); }
+            bool Finite(Vector3 v) => !(float.IsNaN(v.X) || float.IsInfinity(v.X) || float.IsNaN(v.Y) || float.IsInfinity(v.Y) || float.IsNaN(v.Z) || float.IsInfinity(v.Z));
+            PriviewNetworkScene Scene(List<WorldObject> objs, List<JointConfig> joints, bool platform = false) =>
+                new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig
+                {
+                    Name = "f2",
+                    Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 10f, CollisionEnabled = true },
+                    Platform = new PlatformConfig { Enabled = platform, Size = 40f, Position = new Vec3Config { Y = -3f } },
+                    Objects = objs,
+                    Joints = joints,
+                }, isServer: false, "127.0.0.1", 0, online: false);
+
+            // (A1) ASSEMBLY SNAP — ballsocket to a FAR world point coincides in ONE physics step (no creep).
+            var sa = Scene(
+                new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Gravity = true, Position = new Vec3Config { X = 0f, Y = 8f, Z = 0f } } },
+                new List<JointConfig> { new JointConfig { Id = 90, Kind = "ballsocket", BodyA = 1, BodyB = -1,
+                    AnchorA = new Vec3Config(), AnchorB = new Vec3Config { X = 5f, Y = 8f, Z = 0f } } });
+            sa.Start();
+            sa.StepPhysicsForTest(1f / 60f);   // ONE step
+            var (ba0, ba1) = sa.JointAnchorsForTest(90);
+            Vector3 saCube = sa.EditableEntries.First(e => e.Descriptor.Id == 1).Instance.Position;
+            bool snapBall = (ba0 - ba1).Length() <= 0.06f && Finite(saCube);
+            Console.WriteLine($"  joint-snap-ball: |a-b| after 1 step={(ba0 - ba1).Length():F4} (<=0.06), finite={Finite(saCube)} -> {(snapBall ? "ok" : "BAD")}");
+            f2 &= snapBall;
+
+            // (A2) ASSEMBLY SNAP — distance snaps to RestLength in ONE step.
+            var sd = Scene(
+                new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Gravity = true, Position = new Vec3Config { X = 0f, Y = 8f, Z = 0f } } },
+                new List<JointConfig> { new JointConfig { Id = 91, Kind = "distance", BodyA = 1, BodyB = -1, RestLength = 3f,
+                    AnchorA = new Vec3Config(), AnchorB = new Vec3Config { X = 5f, Y = 8f, Z = 0f } } });
+            sd.Start();
+            sd.StepPhysicsForTest(1f / 60f);
+            var (da0, da1) = sd.JointAnchorsForTest(91);
+            float sdDist = (da0 - da1).Length();
+            bool snapDist = MathF.Abs(sdDist - 3f) <= 0.1f;
+            Console.WriteLine($"  joint-snap-dist: sep after 1 step={sdDist:F4} (RestLength 3 ±0.1) -> {(snapDist ? "ok" : "BAD")}");
+            f2 &= snapDist;
+
+            // (B) RETARGET REMAP — a joint anchored to a WORLD point, retargeted onto a real cube via the field
+            // path, keeps its anchor's WORLD position (no sideways lunge).
+            var rm = Scene(
+                new List<WorldObject>
+                {
+                    new WorldObject { Id = 1, Type = "cube", Gravity = true, Position = new Vec3Config { X = 0f, Y = 5f, Z = 0f } },
+                    new WorldObject { Id = 2, Type = "cube", Position = new Vec3Config { X = 3f, Y = 2f, Z = 1f } },
+                },
+                new List<JointConfig> { new JointConfig { Id = 92, Kind = "ballsocket", BodyA = 1, BodyB = -1,
+                    AnchorA = new Vec3Config(), AnchorB = new Vec3Config { X = 4f, Y = 6f, Z = 0f } } });
+            rm.Start();
+            Vector3 worldBefore = rm.JointAnchorsForTest(92).b;   // AnchorB world point before retarget
+            int jIdx = rm.EditableEntries.ToList().FindIndex(e => e.Joint != null && e.Joint.Id == 92);
+            rm.TypeFieldForTest(jIdx, "JBodyB", "2", confirm: true);   // retarget onto cube #2 via the numeric field
+            Vector3 worldAfter = rm.JointAnchorsForTest(92).b;
+            int newBodyB = rm.WorldJointsForTest.First(j => j.Id == 92).BodyB;
+            bool remapOk = (worldAfter - worldBefore).Length() < 1e-3f && newBodyB == 2;
+            Console.WriteLine($"  joint-retarget: worldAnchorB ({worldBefore.X:F2},{worldBefore.Y:F2},{worldBefore.Z:F2})->({worldAfter.X:F2},{worldAfter.Y:F2},{worldAfter.Z:F2}), BodyB={newBodyB}(want 2) -> {(remapOk ? "ok" : "BAD")}");
+            f2 &= remapOk;
+
+            // (C) collideConnected — a dynamic cube #1 dropped from just above a static collidable cube #2, but
+            // ball-socketed centre-to-centre: the pin pulls it DOWN into full overlap and the excluded contact
+            // never pushes it back out — the two centres END coincident (distance ~0), no NaN.
+            Func<PriviewNetworkScene, float> pairDist = s =>
+                (s.EditableEntries.First(e => e.Descriptor.Id == 1).Instance.Position
+                 - s.EditableEntries.First(e => e.Descriptor.Id == 2).Instance.Position).Length();
+            var cc = Scene(
+                new List<WorldObject>
+                {
+                    new WorldObject { Id = 1, Type = "cube", Gravity = true, Position = new Vec3Config { X = 0f, Y = 6.5f, Z = 0f } },
+                    new WorldObject { Id = 2, Type = "cube", Gravity = false, Position = new Vec3Config { X = 0f, Y = 5f, Z = 0f } },
+                },
+                new List<JointConfig> { new JointConfig { Id = 93, Kind = "ballsocket", BodyA = 1, BodyB = 2,
+                    AnchorA = new Vec3Config(), AnchorB = new Vec3Config() } });
+            cc.Start();
+            Step(cc, 120);
+            Vector3 ccCube = cc.EditableEntries.First(e => e.Descriptor.Id == 1).Instance.Position;
+            bool jointedOverlap = pairDist(cc) < 0.1f && Finite(ccCube);   // pinned into overlap, NOT ejected by the (excluded) contact
+            Console.WriteLine($"  joint-collideconn: jointed centre distance={pairDist(cc):F4} (<0.1, not pushed out), finite={Finite(ccCube)} -> {(jointedOverlap ? "ok" : "BAD")}");
+            f2 &= jointedOverlap;
+
+            // control: the SAME drop WITHOUT a joint RESTS ON TOP (contacts intact — it does NOT fall through the
+            // static cube), ending well separated (~1 unit, resting).
+            var nj = Scene(
+                new List<WorldObject>
+                {
+                    new WorldObject { Id = 1, Type = "cube", Gravity = true, Position = new Vec3Config { X = 0f, Y = 6.5f, Z = 0f } },
+                    new WorldObject { Id = 2, Type = "cube", Gravity = false, Position = new Vec3Config { X = 0f, Y = 5f, Z = 0f } },
+                },
+                new List<JointConfig>());
+            nj.Start();
+            Step(nj, 180);
+            Vector3 njCube = nj.EditableEntries.First(e => e.Descriptor.Id == 1).Instance.Position;
+            bool njResolved = pairDist(nj) > 0.7f && Finite(njCube);   // rested on top (sep ~1.0), did NOT fall through
+            Console.WriteLine($"  joint-collideconn-control: non-jointed centre distance={pairDist(nj):F3} (>0.7 rested on top, contacts intact) -> {(njResolved ? "ok" : "BAD")}");
+            f2 &= njResolved;
+
+            // (F3-A) GRAVITY RE-TOGGLE must NOT teleport a jointed body into its anchor (the F2 snap-on-every-
+            // rebuild bug). Satisfied distance joint (static anchor #1 + dynamic bob #2, RestLength 2). Toggle #2
+            // gravity OFF, move it +4 in X, toggle ON: it is pulled back DYNAMICALLY — no single-frame teleport
+            // (per-frame step bounded), never sleeps while violated, converges within ~2 s.
+            var gt = Scene(
+                new List<WorldObject>
+                {
+                    new WorldObject { Id = 1, Type = "cube", Gravity = false, Position = new Vec3Config { X = 0f, Y = 8f, Z = 0f } },
+                    new WorldObject { Id = 2, Type = "cube", Gravity = true,  Position = new Vec3Config { X = 0f, Y = 6f, Z = 0f } },
+                },
+                new List<JointConfig> { new JointConfig { Id = 95, Kind = "distance", BodyA = 1, BodyB = 2, RestLength = 2f,
+                    AnchorA = new Vec3Config(), AnchorB = new Vec3Config() } });
+            gt.Start();
+            Step(gt, 60);   // settle the authored (already-snapped) joint
+            int bi = gt.EditableEntries.ToList().FindIndex(e => e.Descriptor.Id == 2);
+            gt.StepFieldForTest(bi, "Gravity", +1);   // #2 gravity OFF (field path — the real editor toggle)
+            Step(gt, 5);
+            var binst = gt.EditableEntries[bi].Instance;
+            binst.Position += new Vector3(4f, 0f, 0f);            // drag it a few units away while inactive
+            if (binst is Object3d bo) bo.UpdateGeometry();
+            gt.StepFieldForTest(bi, "Gravity", +1);   // #2 gravity ON again -> rebuild, but must NOT re-snap
+            const float rtTol = 0.05f, rtRest = 2f;
+            float maxPerFrame = 0f; bool sleptWhileViolated = false;
+            Vector3 prevPos = gt.EditableEntries[bi].Instance.Position;
+            for (int i = 0; i < 120; i++)   // 2 s
+            {
+                gt.StepPhysicsForTest(1f / 60f);
+                Vector3 nowPos = gt.EditableEntries[bi].Instance.Position;
+                maxPerFrame = MathF.Max(maxPerFrame, (nowPos - prevPos).Length());
+                prevPos = nowPos;
+                var (wa, wb) = gt.JointAnchorsForTest(95);
+                float viol = MathF.Abs((wa - wb).Length() - rtRest);
+                if (viol > rtTol && gt.BodySleepingForTest(2) == true) sleptWhileViolated = true;
+            }
+            var (fa, fb) = gt.JointAnchorsForTest(95);
+            float finalViol = MathF.Abs((fa - fb).Length() - rtRest);
+            // A teleport would move ~4 units in one frame; the dynamic pull is bounded by MaxBiasSpeed·dt (~0.067)
+            // plus gravity/swing slack — 0.35 comfortably separates the two.
+            bool noTeleport = maxPerFrame < 0.35f;
+            bool converged = finalViol <= rtTol;
+            bool retoggleOk = noTeleport && !sleptWhileViolated && converged;
+            Console.WriteLine($"  joint-gravity-retoggle: maxPerFrame={maxPerFrame:F4} (<0.35 no teleport), sleptWhileViolated={sleptWhileViolated}, finalViol={finalViol:F4} (<={rtTol}) -> {(retoggleOk ? "ok" : "BAD")}");
+            f2 &= retoggleOk;
+
+            // (F3-A) a RUNTIME joint-param EDIT rebuilds the joint (joint-edit liveness) but does NOT re-snap
+            // (cfg already snap-evaluated) — it converges DYNAMICALLY. Author a satisfied distance joint (rod
+            // length 2), then edit RestLength -> 4 via the field path: the bob must extend to the new length with
+            // NO single-frame teleport, and the edit must actually take effect (rod length becomes 4).
+            var re = Scene(
+                new List<WorldObject>
+                {
+                    new WorldObject { Id = 1, Type = "cube", Gravity = false, Position = new Vec3Config { X = 0f, Y = 8f, Z = 0f } },
+                    new WorldObject { Id = 2, Type = "cube", Gravity = true,  Position = new Vec3Config { X = 0f, Y = 6f, Z = 0f } },
+                },
+                new List<JointConfig> { new JointConfig { Id = 96, Kind = "distance", BodyA = 1, BodyB = 2, RestLength = 2f,
+                    AnchorA = new Vec3Config(), AnchorB = new Vec3Config() } });
+            re.Start();
+            Step(re, 60);   // settle at rod length 2
+            int rjIdx = re.EditableEntries.ToList().FindIndex(e => e.Joint != null && e.Joint.Id == 96);
+            int rbi = re.EditableEntries.ToList().FindIndex(e => e.Descriptor.Id == 2);
+            re.TypeFieldForTest(rjIdx, "JRestLength", "4", confirm: true);   // edit rod length 2 -> 4 (invalidates + rebuilds, no re-snap)
+            float reMaxPerFrame = 0f;
+            Vector3 rePrev = re.EditableEntries[rbi].Instance.Position;
+            for (int i = 0; i < 180; i++)   // 3 s to extend + settle
+            {
+                re.StepPhysicsForTest(1f / 60f);
+                Vector3 reNow = re.EditableEntries[rbi].Instance.Position;
+                reMaxPerFrame = MathF.Max(reMaxPerFrame, (reNow - rePrev).Length());
+                rePrev = reNow;
+            }
+            var (rea, reb) = re.JointAnchorsForTest(96);
+            float reFinalLen = (rea - reb).Length();
+            bool editNoSnap = reMaxPerFrame < 0.35f && MathF.Abs(reFinalLen - 4f) <= 0.05f;   // no teleport, converged to the NEW length
+            Console.WriteLine($"  joint-edit-nosnap: maxPerFrame={reMaxPerFrame:F4} (<0.35 no teleport), finalRodLen={reFinalLen:F4} (edit 2->4 applied dynamically) -> {(editNoSnap ? "ok" : "BAD")}");
+            f2 &= editNoSnap;
+
+            // (F4) per-joint COLLIDE (Box2D collideConnected). A SURFACE-anchored ballsocket between two cubes;
+            // cube 1 is world-pinned in place, cube 2 hangs from it via the tested joint. Gravity STRENGTH 0 (the
+            // master switch stays on so the solver steps) so overlap is the natural rest with the flag off, and a
+            // fold (180° about Z) into overlap tests whether the pair collides.
+            PriviewNetworkScene CollideScene(bool collide) => new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig
+            {
+                Name = "collide",
+                Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 0f, CollisionEnabled = true },
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 1, Type = "cube", Gravity = true, Position = new Vec3Config { X = 0f, Y = 6f, Z = 0f } },
+                    new WorldObject { Id = 2, Type = "cube", Gravity = true, Position = new Vec3Config { X = 2f, Y = 6f, Z = 0f } },
+                },
+                Joints = new List<JointConfig>
+                {
+                    new JointConfig { Id = 96, Kind = "ballsocket", BodyA = -1, BodyB = 1,   // pin cube 1's centre to a WORLD point (stable; -1 side -> no pair)
+                        AnchorA = new Vec3Config { X = 0f, Y = 6f, Z = 0f }, AnchorB = new Vec3Config() },
+                    new JointConfig { Id = 97, Kind = "ballsocket", BodyA = 1, BodyB = 2,   // the TESTED pair: surface anchors (cube1 +X face <-> cube2 -X face)
+                        AnchorA = new Vec3Config { X = 1f, Y = 0f, Z = 0f }, AnchorB = new Vec3Config { X = -1f, Y = 0f, Z = 0f }, Collide = collide },
+                },
+            }, isServer: false, "127.0.0.1", 0, online: false);
+            float CPairDist(PriviewNetworkScene s) =>
+                (s.EditableEntries.First(e => e.Descriptor.Id == 1).Instance.Position
+                 - s.EditableEntries.First(e => e.Descriptor.Id == 2).Instance.Position).Length();
+
+            // (F4-on) flag ON: fold cube 2 into overlap with cube 1 -> the contact opens them back to non-overlap
+            // (penetration resolves), the pin still holds, finite.
+            var con = CollideScene(true);
+            con.Start();
+            con.StepPhysicsForTest(1f / 60f);   // create solver bodies
+            Vector3 a1 = con.EditableEntries.First(e => e.Descriptor.Id == 1).Instance.Position;
+            con.SetBodyPoseForTest(2, a1 + new Vector3(0.1f, 0f, 0f), new Vector3(0f, 0f, MathF.PI));   // fold cube 2 onto cube 1
+            for (int i = 0; i < 240; i++) con.StepPhysicsForTest(1f / 60f);
+            var (cga, cgb) = con.JointAnchorsForTest(97);
+            float conDist = CPairDist(con);
+            Vector3 conP = con.EditableEntries.First(e => e.Descriptor.Id == 2).Instance.Position;
+            bool onSep = conDist > 1.5f && (cga - cgb).Length() < 0.15f && Finite(conP);   // separated to contact + pin holds
+            Console.WriteLine($"  joint-collide-on: after fold pairDist={conDist:F3} (>1.5 separated), pinGap={(cga - cgb).Length():F4} (<0.15 holds), finite={Finite(conP)} -> {(onSep ? "ok" : "BAD")}");
+            f2 &= onSep;
+
+            // (F4-off control) flag OFF: the SAME fold stays free to overlap (the pair is excluded from contacts).
+            var coff = CollideScene(false);
+            coff.Start();
+            coff.StepPhysicsForTest(1f / 60f);
+            Vector3 a1b = coff.EditableEntries.First(e => e.Descriptor.Id == 1).Instance.Position;
+            coff.SetBodyPoseForTest(2, a1b + new Vector3(0.1f, 0f, 0f), new Vector3(0f, 0f, MathF.PI));
+            for (int i = 0; i < 240; i++) coff.StepPhysicsForTest(1f / 60f);
+            float offDist = CPairDist(coff);
+            bool offOverlap = offDist < 0.5f;   // stayed overlapping (contact excluded)
+            Console.WriteLine($"  joint-collide-off: after fold pairDist={offDist:F3} (<0.5 still overlapping, excluded) -> {(offOverlap ? "ok" : "BAD")}");
+            f2 &= offOverlap;
+
+            // (F4 live-toggle) the NoCollide refill reflects a live Collide field toggle on the next step.
+            var clt = CollideScene(false);
+            clt.Start();
+            clt.StepPhysicsForTest(1f / 60f);
+            bool excludedBefore = clt.NoCollidePairForTest(1, 2);   // Collide=false -> excluded
+            int cjidx = clt.EditableEntries.ToList().FindIndex(e => e.Joint != null && e.Joint.Id == 97);
+            clt.StepFieldForTest(cjidx, "JCollide", +1);   // toggle Collide -> true via the field path
+            clt.StepPhysicsForTest(1f / 60f);
+            bool excludedAfter = clt.NoCollidePairForTest(1, 2);   // Collide=true -> NOT excluded
+            bool toggleOk = excludedBefore && !excludedAfter;
+            Console.WriteLine($"  joint-collide-toggle: excluded before={excludedBefore}, after JCollide on={excludedAfter} (want T/F) -> {(toggleOk ? "ok" : "BAD")}");
+            f2 &= toggleOk;
+
+            // (F5-B) hinge limit angles render degrees alongside radians (DISPLAY only — storage/sync/editing stay
+            // radians). The overlay panel + docked inspector both format via this helper.
+            bool fmtLo = PriviewNetworkScene.FormatLimitAngle(-1.57f) == "-1.57 (-90°)";
+            bool fmtHi = PriviewNetworkScene.FormatLimitAngle(1.2f) == "1.20 (69°)";
+            bool fmtZero = PriviewNetworkScene.FormatLimitAngle(0f) == "0.00 (0°)";
+            bool fmtOk = fmtLo && fmtHi && fmtZero;
+            Console.WriteLine($"  joint-limit-degrees: -1.57->'{PriviewNetworkScene.FormatLimitAngle(-1.57f)}', 1.2->'{PriviewNetworkScene.FormatLimitAngle(1.2f)}', 0->'{PriviewNetworkScene.FormatLimitAngle(0f)}' -> {(fmtOk ? "ok" : "BAD")}");
+            f2 &= fmtOk;
+
+            ok &= f2;
+        }
+
+        // F3 (Part B) — the TestLab generator produces a VALID, round-tripping world with the right joint
+        // structure (all three kinds + a motor + a limit). BuildTestLab() is pure — this never touches worlds/.
+        {
+            bool tl = true;
+            var lab = TestLab.BuildTestLab();
+
+            // (1) VALIDATION via the load path: build the scene from it + Start (the same build a world load runs).
+            // It must materialize every object + joint without crashing.
+            var labScene = new PriviewNetworkScene(new DisplayManagerAsync(), lab, isServer: false, "127.0.0.1", 0, online: false);
+            labScene.Start();
+            bool built = labScene.WorldJointsForTest.Count == lab.Joints.Count && labScene.EditableEntries.Count >= lab.Objects.Count;
+            Console.WriteLine($"  testlab-build: objects={lab.Objects.Count}, joints={labScene.WorldJointsForTest.Count}/{lab.Joints.Count}, editables={labScene.EditableEntries.Count} -> {(built ? "ok" : "BAD")}");
+            tl &= built;
+
+            // (2) ROUND-TRIP through save+load in a TEMP folder (never the real worlds/), then CompareWorlds.
+            string tmp = Path.Combine(Path.GetTempPath(), $"nova3d_testlab_{Guid.NewGuid():N}.json");
+            var wopts = new JsonSerializerOptions { WriteIndented = true };                    // mirrors WorldManager.WriteOptions
+            var ropts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };      // mirrors WorldManager.ReadOptions
+            string rtReason = "write failed";
+            try
+            {
+                File.WriteAllText(tmp, JsonSerializer.Serialize(lab, wopts));
+                var reloaded = JsonSerializer.Deserialize<WorldConfig>(File.ReadAllText(tmp), ropts);
+                rtReason = reloaded == null ? "deserialized null" : (CompareWorlds(lab, reloaded) ?? "");
+            }
+            finally { try { File.Delete(tmp); } catch { } }
+            bool roundtrip = rtReason == "";
+            Console.WriteLine($"  testlab-roundtrip: temp save+load CompareWorlds -> {(roundtrip ? "ok" : "BAD: " + rtReason)}");
+            tl &= roundtrip;
+
+            // (3) JOINT STRUCTURE (v3): >=11 joints covering all three kinds, with >=1 motor, >=1 limit, and
+            // >=3 Collide=true (the real-chain links).
+            var kinds = new HashSet<string>(lab.Joints.Select(j => j.Kind));
+            bool allKinds = kinds.Contains("ballsocket") && kinds.Contains("hinge") && kinds.Contains("distance");
+            bool hasMotor = lab.Joints.Any(j => j.MotorEnabled);
+            bool hasLimit = lab.Joints.Any(j => j.LimitEnabled);
+            int collideCount = lab.Joints.Count(j => j.Collide);
+            bool structure = lab.Joints.Count >= 11 && allKinds && hasMotor && hasLimit && collideCount >= 3;
+            Console.WriteLine($"  testlab-joints: count={lab.Joints.Count}(>=11), kinds=[{string.Join(",", kinds)}] all3={allKinds}, motor={hasMotor}, limit={hasLimit}, collide={collideCount}(>=3) -> {(structure ? "ok" : "BAD")}");
+            tl &= structure;
+
+            // (4) the Collide=true CHAIN rests without perma-jitter: a stand-alone 3-link chain (same gap +
+            // Collide as TestLab's J6) settles + SLEEPS within a few seconds (the marginal-touch gap prevents a
+            // resting contact wake-loop). Fold-then-separate is already proven by joint-collide-on above.
+            var chainW = new WorldConfig
+            {
+                Name = "chain",
+                Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 9.8f, CollisionEnabled = true },
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 1, Type = "cube", Scale = 0.4f, Gravity = false, Position = new Vec3Config { X = 0f, Y = 8f, Z = 0f } },
+                    new WorldObject { Id = 2, Type = "cube", Scale = 0.8f, Gravity = true, Position = new Vec3Config { X = 0f, Y = 6.5f, Z = 0f } },
+                    new WorldObject { Id = 3, Type = "cube", Scale = 0.8f, Gravity = true, Position = new Vec3Config { X = 0f, Y = 4.9f, Z = 0f } },
+                    new WorldObject { Id = 4, Type = "cube", Scale = 0.8f, Gravity = true, Position = new Vec3Config { X = 0f, Y = 3.3f, Z = 0f } },
+                },
+                Joints = new List<JointConfig>
+                {
+                    new JointConfig { Id = 10, Kind = "ballsocket", BodyA = 1, BodyB = 2, AnchorA = new Vec3Config { Y = -0.41f }, AnchorB = new Vec3Config { Y = 0.81f }, Collide = true },
+                    new JointConfig { Id = 11, Kind = "ballsocket", BodyA = 2, BodyB = 3, AnchorA = new Vec3Config { Y = -0.81f }, AnchorB = new Vec3Config { Y = 0.81f }, Collide = true },
+                    new JointConfig { Id = 12, Kind = "ballsocket", BodyA = 3, BodyB = 4, AnchorA = new Vec3Config { Y = -0.81f }, AnchorB = new Vec3Config { Y = 0.81f }, Collide = true },
+                },
+            };
+            var chainS = new PriviewNetworkScene(new DisplayManagerAsync(), chainW, isServer: false, "127.0.0.1", 0, online: false);
+            chainS.Start();
+            for (int i = 0; i < 360; i++) chainS.StepPhysicsForTest(1f / 60f);   // 6 s
+            bool chainSleeps = chainS.BodySleepingForTest(2) == true && chainS.BodySleepingForTest(3) == true && chainS.BodySleepingForTest(4) == true;
+            Console.WriteLine($"  testlab-chain-rest: colliding chain sleeps l2={chainS.BodySleepingForTest(2)}, l3={chainS.BodySleepingForTest(3)}, l4={chainS.BodySleepingForTest(4)} (no jitter) -> {(chainSleeps ? "ok" : "BAD")}");
+            tl &= chainSleeps;
+
+            // (F4 door-Collide) TestLab's J4 door uses Collide=true (evaluated + adopted): a post+door hinge with
+            // Collide=true still reaches its ±90° limit (the swing sweeps AWAY from the post) and doesn't jitter at
+            // the stop. (A motor is added HERE only to drive it to the limit; TestLab's door has no motor and
+            // rests stably — sleeps, jitter 0 — verified during evaluation.)
+            var doorW = new WorldConfig
+            {
+                Name = "door",
+                Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 9.8f, CollisionEnabled = true },
+                Platform = new PlatformConfig { Enabled = false },
+                Objects = new List<WorldObject>
+                {
+                    new WorldObject { Id = 1, Type = "cube", Scale = 0.3f, Gravity = false, Position = new Vec3Config { X = 0f, Y = 1.5f, Z = 0f } },
+                    new WorldObject { Id = 2, Type = "cube", Scale = 0.6f, Gravity = true, Position = new Vec3Config { X = 1.2f, Y = 1.5f, Z = 0f } },
+                },
+                Joints = new List<JointConfig> { new JointConfig { Id = 10, Kind = "hinge", BodyA = 1, BodyB = 2,
+                    Axis = new Vec3Config { Y = 1f }, AnchorA = new Vec3Config { X = 0.3f }, AnchorB = new Vec3Config { X = -0.6f },
+                    LimitEnabled = true, LowerLimit = -1.57f, UpperLimit = 1.57f,
+                    MotorEnabled = true, MotorTargetSpeed = 2f, MaxMotorTorque = 30f, Collide = true } },
+            };
+            var doorS = new PriviewNetworkScene(new DisplayManagerAsync(), doorW, isServer: false, "127.0.0.1", 0, online: false);
+            doorS.Start();
+            float doorMaxYaw = 0f;
+            for (int i = 0; i < 180; i++)   // 3 s — the motor drives the door to its +limit
+            {
+                doorS.StepPhysicsForTest(1f / 60f);
+                doorMaxYaw = MathF.Max(doorMaxYaw, MathF.Abs(doorS.EditableEntries.First(e => e.Descriptor.Id == 2).Instance.LocalRotate.Y));
+            }
+            // now let it rest 3 s at the limit and measure jitter.
+            float doorJitter = 0f; Vector3 dprev = doorS.EditableEntries.First(e => e.Descriptor.Id == 2).Instance.Position;
+            for (int i = 0; i < 180; i++)
+            {
+                doorS.StepPhysicsForTest(1f / 60f);
+                Vector3 dnow = doorS.EditableEntries.First(e => e.Descriptor.Id == 2).Instance.Position;
+                if (i >= 120) doorJitter = MathF.Max(doorJitter, (dnow - dprev).Length());
+                dprev = dnow;
+            }
+            bool doorOk = doorMaxYaw > 1.4f && doorMaxYaw < 1.62f && doorJitter < 0.01f;   // reaches ~±90° limit + no jitter at the stop
+            Console.WriteLine($"  testlab-door-collide: reachedYaw={doorMaxYaw:F3} (limit 1.57), stop jitter={doorJitter:F5} (<0.01) -> {(doorOk ? "ok" : "BAD")}");
+            tl &= doorOk;
+
+            // (F5-A) WINDMILL geometry: the blade (id 10) completes >=1 full revolution while its body NEVER
+            // overlaps the post (id 9) — its rotation plane is offset in Z, so the boxes are always Z-separated
+            // (a rotation about +Z can't change the Z extent). Simulate the BUILT TestLab windmill.
+            var wm = new PriviewNetworkScene(new DisplayManagerAsync(), TestLab.BuildTestLab(), isServer: false, "127.0.0.1", 0, online: false);
+            wm.Start();
+            var wmPost = wm.EditableEntries.First(e => e.Descriptor.Id == 9).Instance;    // post  (Scale 0.3 -> half-Z 0.3)
+            var wmBlade = wm.EditableEntries.First(e => e.Descriptor.Id == 10).Instance;  // blade (Scale 0.8 -> half-Z 0.8)
+            float totalRot = 0f, prevRotZ = wmBlade.LocalRotate.Z, worstZOverlap = -999f;
+            for (int i = 0; i < 420; i++)   // 7 s @ 1.2 rad/s -> ~8 rad > 2π
+            {
+                wm.StepPhysicsForTest(1f / 60f);
+                float d = wmBlade.LocalRotate.Z - prevRotZ;
+                while (d > MathF.PI) d -= 2f * MathF.PI; while (d < -MathF.PI) d += 2f * MathF.PI;   // shortest-arc delta
+                totalRot += d; prevRotZ = wmBlade.LocalRotate.Z;
+                float zOverlap = MathF.Min(wmBlade.Position.Z + 0.8f, wmPost.Position.Z + 0.3f)
+                               - MathF.Max(wmBlade.Position.Z - 0.8f, wmPost.Position.Z - 0.3f);   // >0 = boxes overlap in Z
+                worstZOverlap = MathF.Max(worstZOverlap, zOverlap);
+            }
+            bool spun = MathF.Abs(totalRot) > 2f * MathF.PI;   // completed >= 1 full revolution
+            bool noPostOverlap = worstZOverlap < 0.005f;       // Z-separated throughout (Slop) -> the boxes never overlap
+            bool windmillOk = spun && noPostOverlap;
+            Console.WriteLine($"  testlab-windmill: totalRot={totalRot:F2} rad (>{2f * MathF.PI:F2} = 1 rev), worst blade/post Z-overlap={worstZOverlap:F3} (<Slop, cleared) -> {(windmillOk ? "ok" : "BAD")}");
+            tl &= windmillOk;
+
+            // (F5-D) TRAPDOOR: the lid (id 19) flops open under gravity ON LOAD and comes to REST at the hinge's
+            // Upper limit (1.2 rad ≈ 69° about X — held BEFORE its 90° free hang), then settles — limits
+            // demonstrated with no user input.
+            var td = new PriviewNetworkScene(new DisplayManagerAsync(), TestLab.BuildTestLab(), isServer: false, "127.0.0.1", 0, online: false);
+            td.Start();
+            var tdLid = td.EditableEntries.First(e => e.Descriptor.Id == 19).Instance;
+            for (int i = 0; i < 480; i++) td.StepPhysicsForTest(1f / 60f);   // 8 s -> settle at the stop
+            float lastMove = 0f; Vector3 tdPrev = tdLid.Position;
+            for (int i = 0; i < 120; i++)   // measure residual motion over the final 2 s
+            {
+                td.StepPhysicsForTest(1f / 60f);
+                lastMove = MathF.Max(lastMove, (tdLid.Position - tdPrev).Length());
+                tdPrev = tdLid.Position;
+            }
+            float lidAngle = MathF.Abs(tdLid.LocalRotate.X);
+            bool lidAtStop = MathF.Abs(lidAngle - 1.2f) < 0.12f;   // settled at the Upper stop (1.2), held before its 90° free hang
+            bool lidAsleep = td.BodySleepingForTest(19) == true;
+            bool lidRested = lidAsleep || lastMove < 2e-3f;   // asleep, or at rest against the limit (a limit constraint can keep a body marginally awake)
+            bool trapdoorOk = lidAtStop && lidRested;
+            Console.WriteLine($"  testlab-trapdoor: lid angle={lidAngle:F3} (Upper 1.20 stop), asleep={lidAsleep}, residualMove={lastMove:F5} -> {(trapdoorOk ? "ok" : "BAD")}");
+            tl &= trapdoorOk;
+
+            // (F5 Collide evals — informational): windmill Collide=true (blade never contacts the post, so it's
+            // a no-op) and trapdoor Collide=true (lid vs frame). Report full-rev/jam and settle/jitter evidence.
+            {
+                var wmC = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig { Name = "wmC",
+                    Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 9.8f, CollisionEnabled = true },
+                    Platform = new PlatformConfig { Enabled = false },
+                    Objects = new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Scale = 0.3f, Gravity = false, Position = new Vec3Config { X = 0f, Y = 5f, Z = -8f } },
+                        new WorldObject { Id = 2, Type = "cube", Scale = 0.8f, Gravity = true, Position = new Vec3Config { X = 0f, Y = 5f, Z = -6.8f } } },
+                    Joints = new List<JointConfig> { new JointConfig { Id = 10, Kind = "hinge", BodyA = 1, BodyB = 2, Axis = new Vec3Config { Z = 1f },
+                        AnchorA = new Vec3Config { Z = 1.2f }, AnchorB = new Vec3Config(), MotorEnabled = true, MotorTargetSpeed = 1.2f, MaxMotorTorque = 60f, Collide = true } } },
+                    isServer: false, "127.0.0.1", 0, online: false);
+                wmC.Start();
+                var wb = wmC.EditableEntries.First(e => e.Descriptor.Id == 2).Instance; float rot = 0f, pz = wb.LocalRotate.Z;
+                for (int i = 0; i < 420; i++) { wmC.StepPhysicsForTest(1f / 60f); float dd = wb.LocalRotate.Z - pz; while (dd > MathF.PI) dd -= 2f * MathF.PI; while (dd < -MathF.PI) dd += 2f * MathF.PI; rot += dd; pz = wb.LocalRotate.Z; }
+                Console.WriteLine($"  [eval] windmill Collide=true: totalRot={rot:F2} rad (>2π = no jam) — moot (blade clears the post, no contact possible)");
+
+                var tdC = new PriviewNetworkScene(new DisplayManagerAsync(), new WorldConfig { Name = "tdC",
+                    Physics = new PhysicsConfig { GravityEnabled = true, GravityStrength = 9.8f, CollisionEnabled = true },
+                    Platform = new PlatformConfig { Enabled = false },
+                    Objects = new List<WorldObject> { new WorldObject { Id = 1, Type = "cube", Scale = 0.5f, Gravity = false, Position = new Vec3Config { X = 0f, Y = 3f, Z = -8f } },
+                        new WorldObject { Id = 2, Type = "cube", Scale = 0.5f, Gravity = true, Position = new Vec3Config { X = 0f, Y = 3f, Z = -6.98f } } },
+                    Joints = new List<JointConfig> { new JointConfig { Id = 10, Kind = "hinge", BodyA = 1, BodyB = 2, Axis = new Vec3Config { X = 1f },
+                        AnchorA = new Vec3Config { Z = 0.51f }, AnchorB = new Vec3Config { Z = -0.51f }, LimitEnabled = true, LowerLimit = 0f, UpperLimit = 1.2f, Collide = true } } },
+                    isServer: false, "127.0.0.1", 0, online: false);
+                tdC.Start();
+                var tl2 = tdC.EditableEntries.First(e => e.Descriptor.Id == 2).Instance;
+                for (int i = 0; i < 480; i++) tdC.StepPhysicsForTest(1f / 60f);
+                float tj = 0f; Vector3 tp = tl2.Position;
+                for (int i = 0; i < 120; i++) { tdC.StepPhysicsForTest(1f / 60f); tj = MathF.Max(tj, (tl2.Position - tp).Length()); tp = tl2.Position; }
+                Console.WriteLine($"  [eval] trapdoor Collide=true: lidAngle={MathF.Abs(tl2.LocalRotate.X):F3} (stop 1.2), residualMove={tj:F5}, asleep={tdC.BodySleepingForTest(2)}");
+            }
+
+            ok &= tl;
+        }
+
         // C1-4c — the joint marker is now a thin LINE mesh (not a placeholder sphere): its world bbox spans
         // both anchors and is thin perpendicular to the A→B axis; a hinge adds an axis stub (more geometry +
         // the bbox extends along the axis direction). Visual correctness (it reads as a coloured line) is
@@ -1562,12 +2145,12 @@ partial class Program
             // Op 3 (JointModify): the LIVE cfg is mutated IN PLACE (SAME reference the bridge/marker hold).
             var liveJoint = client.EditableEntries.First(e => e.Descriptor.Type == "joint").Joint!;
             var modCfg = new JointConfig { Id = 500, Kind = "hinge", BodyA = 1, BodyB = -1,
-                Axis = new Vec3Config { X = 0f, Y = 0f, Z = 1f }, LimitEnabled = true, LowerLimit = -0.7f, UpperLimit = 0.9f };
+                Axis = new Vec3Config { X = 0f, Y = 0f, Z = 1f }, LimitEnabled = true, LowerLimit = -0.7f, UpperLimit = 0.9f, Collide = true };   // F4: Collide rides the op-3 JSON
             client.ApplyWorldEditForTest(new WorldEditPacket { Op = 3, Id = 500, ObjectJson = JsonSerializer.Serialize(modCfg) });
             var liveJoint2 = client.EditableEntries.First(e => e.Descriptor.Type == "joint").Joint!;
             bool modOk = ReferenceEquals(liveJoint, liveJoint2) && liveJoint.Kind == "hinge" && liveJoint.LimitEnabled
-                && Math.Abs(liveJoint.LowerLimit + 0.7f) < 1e-4f && Math.Abs(liveJoint.UpperLimit - 0.9f) < 1e-4f && liveJoint.Id == 500;
-            Console.WriteLine($"  joint-sync-op3: in-place (same-ref={ReferenceEquals(liveJoint, liveJoint2)}), kind={liveJoint.Kind}, limit={liveJoint.LimitEnabled}, id={liveJoint.Id} -> {(modOk ? "ok" : "BAD")}");
+                && Math.Abs(liveJoint.LowerLimit + 0.7f) < 1e-4f && Math.Abs(liveJoint.UpperLimit - 0.9f) < 1e-4f && liveJoint.Id == 500 && liveJoint.Collide;
+            Console.WriteLine($"  joint-sync-op3: in-place (same-ref={ReferenceEquals(liveJoint, liveJoint2)}), kind={liveJoint.Kind}, limit={liveJoint.LimitEnabled}, collide={liveJoint.Collide}, id={liveJoint.Id} -> {(modOk ? "ok" : "BAD")}");
             cok &= modOk;
 
             // Op 5 (JointDelete): the entry + the cfg are gone.
@@ -1865,7 +2448,7 @@ partial class Program
                     Axis = new Vec3Config { X = 0.1f, Y = 0.9f, Z = 0f },
                     LimitEnabled = true, LowerLimit = -0.5f, UpperLimit = 1.5f,
                     MotorEnabled = true, MotorTargetSpeed = 1.1f, MaxMotorTorque = 7f,
-                    RestLength = 3.3f, SpringEnabled = true, Frequency = 2.2f, DampingRatio = 0.6f },
+                    RestLength = 3.3f, SpringEnabled = true, Frequency = 2.2f, DampingRatio = 0.6f, Collide = true },   // F4: non-default Collide rides save/sync
                 new JointConfig { Id = 21, Kind = "distance", BodyA = 12, BodyB = 11,
                     AnchorA = new Vec3Config { X = 0f, Y = 1f, Z = 0f }, AnchorB = new Vec3Config { X = 2f, Y = 0f, Z = -1f },
                     Axis = new Vec3Config { X = 0f, Y = 0f, Z = 1f },
@@ -1954,6 +2537,31 @@ partial class Program
             bool leftOk = recvLeft.NetId == 4242;
             Console.WriteLine($"PlayerLeft round-trip: {lbytes.Length} bytes, NetId={recvLeft.NetId} -> {(leftOk ? "ok" : "BAD")}");
             if (!leftOk) { Fail("PlayerLeft packet round-trip lost NetId."); return; }
+        }
+
+        // N2 — PlayerInfo delta: round-trip the packet through its OWN serialize/deserialize; NetId + Nick
+        // survive, including an empty nick and a 16-char (max-length) nick.
+        {
+            bool RoundTrip(int netId, string nick, out int gotId, out string gotNick)
+            {
+                var info = new PlayerInfoPacket { NetId = netId, Nick = nick };
+                byte[] ibytes;
+                using (var ms = new MemoryStream())
+                {
+                    using (var w = new BinaryWriter(ms)) info.Serialize(w);
+                    ibytes = ms.ToArray();
+                }
+                var recv = new PlayerInfoPacket();
+                using (var r = new BinaryReader(new MemoryStream(ibytes))) recv.Deserialize(r);
+                gotId = recv.NetId; gotNick = recv.Nick;
+                return gotId == netId && gotNick == nick;
+            }
+            bool named = RoundTrip(7, "Nova_Player-01", out _, out _);   // typical
+            bool empty = RoundTrip(3, "", out _, out string emptyNick); // empty nick
+            bool maxLen = RoundTrip(9999, "ABCDEFGHIJKLMNOP", out _, out string longNick);   // 16 chars
+            bool infoOk = named && empty && maxLen;
+            Console.WriteLine($"PlayerInfo round-trip: named={named}, empty(len={emptyNick.Length})={empty}, 16-char(len={longNick.Length})={maxLen} -> {(infoOk ? "ok" : "BAD")}");
+            if (!infoOk) { Fail("PlayerInfo packet round-trip lost NetId/Nick."); return; }
         }
 
         // MeshChunk delta: round-trip the packet through its OWN serialize/deserialize; fields survive.
@@ -2292,6 +2900,7 @@ partial class Program
             if (x.BodyB != y.BodyB) return $"joint[{i}].BodyB {x.BodyB} != {y.BodyB}";
             if (!Eq(x.AnchorA.X, y.AnchorA.X) || !Eq(x.AnchorA.Y, y.AnchorA.Y) || !Eq(x.AnchorA.Z, y.AnchorA.Z)) return $"joint[{i}].AnchorA differs";
             if (!Eq(x.AnchorB.X, y.AnchorB.X) || !Eq(x.AnchorB.Y, y.AnchorB.Y) || !Eq(x.AnchorB.Z, y.AnchorB.Z)) return $"joint[{i}].AnchorB differs";
+            if (x.Collide != y.Collide) return $"joint[{i}].Collide {x.Collide} != {y.Collide}";
             if (!Eq(x.Axis.X, y.Axis.X) || !Eq(x.Axis.Y, y.Axis.Y) || !Eq(x.Axis.Z, y.Axis.Z)) return $"joint[{i}].Axis differs";
             if (x.LimitEnabled != y.LimitEnabled) return $"joint[{i}].LimitEnabled differs";
             if (!Eq(x.LowerLimit, y.LowerLimit) || !Eq(x.UpperLimit, y.UpperLimit)) return $"joint[{i}].Limit differs";

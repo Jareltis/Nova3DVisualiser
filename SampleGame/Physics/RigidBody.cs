@@ -72,6 +72,11 @@ public sealed class RigidBody
     public object? Tag;
     private static int _nextId;
 
+    // F2 (RC4 collideConnected): the SCENE object id this body represents (WorldObject.Id), or -1 for a body
+    // with no scene id (the player capsule etc.). The bridge sets it on dynamic bodies, per-frame static contact
+    // bodies, and F1 kinematic anchors, so ImpulseWorld.NoCollide can exclude a jointed pair's contacts.
+    public int SceneId = -1;
+
     public bool IsStatic => InvMass == 0f;
 
     // Velocity of the world point 'p' on this body (rigid: linear + ω × r).

@@ -64,7 +64,26 @@ public partial class PriviewNetworkScene
     private readonly Dictionary<JointConfig, Joint> _impJoints = new();                          // one live Joint per world JointConfig
     private readonly Dictionary<JointConfig, (RigidBody a, RigidBody b)> _impJointBuiltWith = new();  // the bodies each joint was built against (rebuild on change)
     private readonly HashSet<JointConfig> _impJointsWarned = new();                              // coalesce the "joint skipped" warning to once per config
+    // F3 (Part A): configs whose assembly SNAP has already fired ONCE (at authoring / saved-world load). The
+    // snap is one-shot per config — a later runtime rebuild (gravity toggle, body recreation, retarget, anchor
+    // edit) must NOT re-snap (that teleported a jointed body into its anchor); it converges DYNAMICALLY instead
+    // (F2 keeps a violated joint awake). Pruned with the dead-cfg sweep; cleared when _impJoints is cleared.
+    private readonly HashSet<JointConfig> _snapEvaluated = new();
     private RigidBody? _worldAnchor;                                                             // shared immovable WORLD anchor (origin) for BodyId -1 joint endpoints
+    // F1 fix: persistent STATIC/KINEMATIC anchor bodies for joint sides that are NOT live dynamic bodies (a
+    // light/camera marker, a static prop, the platform). Immovable (InvMass 0) so the solver never pushes them,
+    // but their POSE is refreshed from the live instance every frame — so an editor move drags the anchor and
+    // the hanging body follows. Cached by instance so the reference is STABLE across frames (keeps the (a,b)-
+    // reuse + warm-start). Pruned in RemoveEntryAt / ApplyReceivedWorld / the per-frame sweep, like _impBodies.
+    private readonly Dictionary<GameObject, RigidBody> _impStaticAnchors = new();
+    // F1 fix: kinematic anchors whose pose CHANGED this frame (the editor moved the anchor object) — scratch,
+    // cleared each BuildFrameJoints. A static anchor never joins a contact island, so the sleep system won't wake
+    // a hanging body on its own; the bridge wakes the pinned partner of a moved anchor so it FOLLOWS the drag.
+    private readonly HashSet<RigidBody> _anchorMoved = new();
+    // F1 fix: per-config joint status — the INACTIVE reason (null = active), EXCLUDING the world-gravity check
+    // (applied at read time in JointStatus, since the physics step — and thus this map — never runs while
+    // gravity is off). Refreshed each frame in BuildFrameJoints; read by the editor's joint status row.
+    private readonly Dictionary<JointConfig, string?> _jointStatus = new();
 
     private void StepImpulse(float dt)
     {
@@ -88,6 +107,7 @@ public partial class PriviewNetworkScene
                 if (!_impBodies.TryGetValue(inst, out var rb)) { rb = RigidBody.Sphere(sph.Position, sph.R, MathF.Max(1e-4f, inst.Mass)); _impBodies[inst] = rb; }
                 rb.Radius = sph.R;
                 rb.Restitution = inst.Restitution; rb.Friction = inst.Friction; rb.RollingFriction = inst.RollingFriction; rb.Tag = e;
+                rb.SceneId = e.Descriptor.Id;   // F2: for the collideConnected (NoCollide) filter
                 w.Bodies.Add(rb);
             }
             else if (inst is Object3d o)
@@ -131,6 +151,7 @@ public partial class PriviewNetworkScene
                     else rb.SetBoxShape(half, mass);   // refresh shape/inertia (scale/mass may have been edited)
                 }
                 rb.Restitution = inst.Restitution; rb.Friction = inst.Friction; rb.RollingFriction = inst.RollingFriction; rb.Tag = e;
+                rb.SceneId = e.Descriptor.Id;   // F2: for the collideConnected (NoCollide) filter
                 w.Bodies.Add(rb);
             }
         }
@@ -144,8 +165,10 @@ public partial class PriviewNetworkScene
         {
             var inst = e.Instance;
             if (!inst.Collides || inst.Gravity) continue;
-            if (inst is Sphere ss) w.Bodies.Add(RigidBody.StaticSphere(ss.Position, ss.R));
-            else if (inst is Object3d o) w.Bodies.Add(BuildStaticMeshBody(o));
+            RigidBody? sb = null;
+            if (inst is Sphere ss) sb = RigidBody.StaticSphere(ss.Position, ss.R);
+            else if (inst is Object3d o) sb = BuildStaticMeshBody(o);
+            if (sb != null) { sb.SceneId = e.Descriptor.Id; w.Bodies.Add(sb); }   // F2: tag for the collideConnected filter
         }
 
         // C1-4a: (re)build the world's joints now that every solver body exists this frame. No-op if joint-free.
@@ -188,33 +211,74 @@ public partial class PriviewNetworkScene
     private void BuildFrameJoints(ImpulseWorld w)
     {
         w.Joints.Clear();
+        w.NoCollide.Clear();    // F2 (RC4): refilled below from real-real jointed pairs
+        _anchorMoved.Clear();   // F1: recomputed per frame by ResolveStaticAnchor
         var cfgs = _world.Joints;
+        // F4 (per-joint Collide — Box2D ShouldCollide): a real-real jointed pair is EXCLUDED from contacts if ANY
+        // connecting joint has Collide == false; a pair whose EVERY connecting joint has Collide == true collides
+        // normally. Since NoCollide is a set, adding the pair for each Collide==false joint yields exactly that
+        // (any false → excluded; all true → never added). A joint to the world -1 has no real-real pair. Done
+        // BEFORE the joint-free fast-return so a joint-free world keeps an empty NoCollide set (bit-identical).
+        if (cfgs != null)
+            foreach (var cfg in cfgs)
+                if (cfg.BodyA >= 0 && cfg.BodyB >= 0 && !cfg.Collide)
+                    w.NoCollide.Add((Math.Min(cfg.BodyA, cfg.BodyB), Math.Max(cfg.BodyA, cfg.BodyB)));
         if ((cfgs == null || cfgs.Count == 0) && _impJoints.Count == 0) return;   // fast path: this world has no joints
 
-        // Resolve an object id -> its solver RigidBody: id == -1 -> the shared WORLD anchor (origin); a real id ->
-        // the object's persistent dynamic body (null if it isn't a solver body this frame — e.g. static, deleted,
-        // or gravity-off). A static anchor at the origin makes AnchorA/B behave as a WORLD position for -1 sides.
+        // Resolve an object id -> its solver RigidBody: id == -1 -> the shared WORLD anchor (origin); a real id
+        // that is a live DYNAMIC body (gravity+collides) -> that body; ANY OTHER existing object (a light/camera
+        // marker, a static prop, the platform) -> its persistent STATIC/KINEMATIC anchor (F1 fix), so it can be
+        // pinned to. A deleted id -> null (skip + status). The static anchor at the origin makes AnchorA/B behave
+        // as a WORLD position for -1 sides.
         RigidBody? Resolve(int id)
         {
             if (id == -1) return _worldAnchor ??= RigidBody.StaticSphere(Vector3.Zero, 0.001f);
             int idx = _editables.FindIndex(e => e.Descriptor.Id == id);
-            if (idx < 0) return null;
-            return _impBodies.TryGetValue(_editables[idx].Instance, out var rb) ? rb : null;
+            if (idx < 0) return null;                                   // deleted → no body
+            var inst = _editables[idx].Instance;
+            if (_impBodies.TryGetValue(inst, out var rb)) return rb;    // a live DYNAMIC body
+            var anchor = ResolveStaticAnchor(inst);                    // otherwise a kinematic anchor that follows the instance
+            anchor.SceneId = id;                                       // F2: tag for the collideConnected filter
+            return anchor;
         }
 
-        // Drop persistent joints whose config was removed from the world (robust to future edits/deletes).
+        // Drop persistent joints whose config was removed from the world (robust to future edits/deletes), and
+        // the parallel status/anchor state (the per-frame sweep; deletions also prune directly in RemoveEntryAt).
         if (_impJoints.Count > 0 && cfgs != null)
             foreach (var dead in _impJoints.Keys.Where(k => !cfgs.Contains(k)).ToList())
             { _impJoints.Remove(dead); _impJointBuiltWith.Remove(dead); _impJointsWarned.Remove(dead); }
+        if (_jointStatus.Count > 0 && cfgs != null)
+            foreach (var dead in _jointStatus.Keys.Where(k => !cfgs.Contains(k)).ToList()) _jointStatus.Remove(dead);
+        if (_snapEvaluated.Count > 0 && cfgs != null)   // F3: drop snap-evaluated marks for removed configs
+            _snapEvaluated.RemoveWhere(k => !cfgs.Contains(k));
+        if (_impStaticAnchors.Count > 0)
+        {
+            var liveInst = new HashSet<GameObject>();
+            foreach (var e in _editables) liveInst.Add(e.Instance);
+            foreach (var k in _impStaticAnchors.Keys.Where(k => !liveInst.Contains(k)).ToList()) _impStaticAnchors.Remove(k);
+        }
 
         if (cfgs == null) return;
         foreach (var cfg in cfgs)
         {
             var a = Resolve(cfg.BodyA);
             var b = Resolve(cfg.BodyB);
+            // Record this config's status each frame (world-gravity applied at READ time — see JointStatus): a
+            // deleted body, or both sides static (zero effective mass), or active (null).
+            _jointStatus[cfg] = JointStatusReason(true, a != null, b != null, a?.IsStatic ?? true, b?.IsStatic ?? true);
+
             if (a == null || b == null)
             {
-                WarnJointOnce(cfg, $"Joint '{cfg.Kind}' ({cfg.BodyA}->{cfg.BodyB}) skipped: a referenced body is not a solver body this frame.");
+                WarnJointOnce(cfg, $"Joint '{cfg.Kind}' ({cfg.BodyA}->{cfg.BodyB}) inactive: a referenced body was deleted.");
+                _impJoints.Remove(cfg); _impJointBuiltWith.Remove(cfg);
+                continue;
+            }
+            // BOTH sides static (e.g. platform<->world, light<->light): zero effective mass — nothing to solve,
+            // and a joint between two immovable frames could only inject error. Don't add it (NaN-safe); the
+            // editor status row explains why. Warn once, mirroring the deleted-body case.
+            if (a.IsStatic && b.IsStatic)
+            {
+                WarnJointOnce(cfg, $"Joint '{cfg.Kind}' ({cfg.BodyA}->{cfg.BodyB}) inactive: both sides are static.");
                 _impJoints.Remove(cfg); _impJointBuiltWith.Remove(cfg);
                 continue;
             }
@@ -231,13 +295,138 @@ public partial class PriviewNetworkScene
                 }
                 _impJoints[cfg] = joint;
                 _impJointBuiltWith[cfg] = (a, b);
+                // F3 (Part A): assembly-snap ONCE per joint config (authoring / saved-world load), NEVER on a
+                // later runtime rebuild (gravity toggle, body recreation, retarget, anchor edit) — those converge
+                // dynamically. Add to the set whether or not the snap actually moved anything (so a satisfied
+                // authored joint is still marked evaluated and never snaps later).
+                if (_snapEvaluated.Add(cfg)) SnapJointAssembly(cfg, a, b);
             }
             _impJointsWarned.Remove(cfg);   // successfully added -> reset the warn latch (re-warns only if it breaks again)
+            // F1: if a KINEMATIC anchor (a static side the editor moved this frame) is pinned to a dynamic body,
+            // wake that body — otherwise a settled/sleeping hanging body would ignore the drag (a static anchor
+            // never appears in a contact island, so the sleep system can't wake it).
+            if (a.IsStatic && b.InvMass > 0f && _anchorMoved.Contains(a)) ImpulseWorld.Wake(b);
+            if (b.IsStatic && a.InvMass > 0f && _anchorMoved.Contains(b)) ImpulseWorld.Wake(a);
             w.Joints.Add(joint);
         }
     }
 
     private void WarnJointOnce(JointConfig cfg, string msg) { if (_impJointsWarned.Add(cfg)) Logger.Warning(msg); }
+
+    // F3 (joint-edit liveness): a joint-param edit (anchors / axis / kind / body id) must rebuild the live solver
+    // Joint — its LocalAnchors/axis/kind are COPIED at build time, so mutating the cfg alone doesn't take effect.
+    // Drop it from the persistent build maps so BuildFrameJoints rebuilds it next frame with the fresh cfg — but
+    // NOT from _snapEvaluated, so a runtime edit converges DYNAMICALLY (no re-snap teleport).
+    private void InvalidateBuiltJoint(JointConfig cfg)
+    {
+        _impJoints.Remove(cfg);
+        _impJointBuiltWith.Remove(cfg);
+    }
+
+    private const float JointSnapThreshold = 0.05f;   // F2 (RC2): a fresh joint further off than this is snapped together at build
+
+    // F2 (RC2): when a joint is (re)built across a gap, TELEPORT its movable end ONCE so the constraint starts
+    // SATISFIED (no multi-second "rope contraction" creep). Convention: exactly one dynamic end -> snap it; BOTH
+    // dynamic -> snap B. Never move a static/world end. ballsocket/hinge: coincide the anchors (translation only);
+    // distance (rigid AND spring): move along the current anchor axis so the separation == RestLength. The moved
+    // body's velocities are preserved and it is woken; the normal StepImpulse write-back then carries the move to
+    // the instance (and, on the server, into _physMoved) so clients see the snap.
+    private void SnapJointAssembly(JointConfig cfg, RigidBody a, RigidBody b)
+    {
+        bool aMove = a.InvMass > 0f, bMove = b.InvMass > 0f;
+        if (!aMove && !bMove) return;                                  // both immovable (shouldn't reach here — both-static is filtered)
+        RigidBody mover = bMove ? b : a;                              // both dynamic -> B; else the single dynamic end
+
+        Vector3 wA = a.Position + ImpulseMath.Rotate(a.Orientation, ToVec(cfg.AnchorA));
+        Vector3 wB = b.Position + ImpulseMath.Rotate(b.Orientation, ToVec(cfg.AnchorB));
+        bool isDistance = string.Equals(cfg.Kind?.Trim(), "distance", StringComparison.OrdinalIgnoreCase);
+
+        Vector3 delta;
+        if (isDistance)
+        {
+            Vector3 axis = wB - wA;
+            float dist = axis.Length();
+            float rest = MathF.Max(0f, cfg.RestLength);
+            if (MathF.Abs(dist - rest) <= JointSnapThreshold) return;
+            Vector3 dir = dist > 1e-6f ? axis * (1f / dist) : new Vector3(0f, -1f, 0f);   // A->B; degenerate -> straight down
+            delta = ReferenceEquals(mover, b) ? dir * (rest - dist) : dir * (dist - rest);
+        }
+        else   // ballsocket / hinge: coincide the anchors
+        {
+            Vector3 gap = wB - wA;
+            if (gap.Length() <= JointSnapThreshold) return;
+            delta = ReferenceEquals(mover, b) ? -gap : gap;           // move B to wA (or A to wB); orientation unchanged
+        }
+
+        mover.Position += delta;
+        ImpulseWorld.Wake(mover);   // it was just repositioned — don't leave it asleep at the old spot
+    }
+
+    // F1 fix: the persistent STATIC/KINEMATIC anchor body for a joint side that isn't a live dynamic body. Built
+    // once per instance (immovable — InvMass 0, like _worldAnchor) and cached so its reference is STABLE across
+    // frames (keeps the (a,b)-reuse + warm-start); its POSE is refreshed from the live instance EVERY frame so an
+    // editor move drags the anchor. Placed in the SAME reference frame the bridge's dynamic bodies +
+    // JointAnchorWorld/HingeAxisWorld agree on: an Object3d at its OBB centre oriented by LocalRotate (so a rotated
+    // anchor rotates the hinge axis too — Rotate(Orientation, LocalAxis) matches HingeAxisWorld), a Sphere at its
+    // Position (identity orientation). So the joint's world anchor (Position + R·LocalAnchor) coincides with the
+    // marker's JointAnchorWorld whether the side is dynamic or an anchor.
+    private RigidBody ResolveStaticAnchor(GameObject inst)
+    {
+        Vector3 newPos; Quat newOri;
+        if (inst is Object3d o)
+        {
+            newPos = (o.LocalCenter * o.Scale).Rotate(o.LocalRotate) + o.Position;   // OBB centre, mirrors the dynamic-box place
+            newOri = Quaternions.QuatFromEuler(o.LocalRotate);
+        }
+        else { newPos = inst.Position; newOri = Quat.Identity; }
+
+        if (!_impStaticAnchors.TryGetValue(inst, out var rb))
+        {
+            rb = RigidBody.StaticSphere(Vector3.Zero, 0.001f);   // immovable; pose set below (same construct as _worldAnchor)
+            _impStaticAnchors[inst] = rb;
+        }
+        else if ((rb.Position - newPos).Length() > 1e-5f)
+            _anchorMoved.Add(rb);   // the editor moved the anchor this frame → wake its pinned partner (in the joint loop)
+        rb.Position = newPos;
+        rb.Orientation = newOri;
+        return rb;
+    }
+
+    // F1 fix (PURE + testable): the user-visible reason a joint is INACTIVE, or null when it's ACTIVE. Priority-
+    // ordered so the most fundamental blocker wins: world-gravity is the master switch (the whole physics step is
+    // skipped) so it beats everything; then an unresolved/deleted body; then both-sides-static (zero effective
+    // mass — nothing to move). Free of scene state so it's unit-testable.
+    public static string? JointStatusReason(bool worldGravityOn, bool aResolved, bool bResolved, bool aStatic, bool bStatic)
+    {
+        if (!worldGravityOn) return "world gravity is off";
+        if (!aResolved || !bResolved) return "a referenced body was deleted";
+        if (aStatic && bStatic) return "both sides are static — nothing to move";
+        return null;
+    }
+
+    // F1 fix: the status of a joint config (null = ACTIVE). The world-gravity master is applied HERE, at read
+    // time, because the physics step — and thus the per-config bridge status — doesn't run while gravity is off.
+    private string? JointStatus(JointConfig cfg)
+    {
+        if (!_world.Physics.GravityEnabled) return "world gravity is off";
+        return _jointStatus.TryGetValue(cfg, out var r) ? r : null;
+    }
+
+    // Headless test hooks (F1): the status string of the joint with `jointId` (null = active; a sentinel when
+    // absent), and its two live WORLD anchor points (so a test can assert a pinned body's anchor coincides with
+    // the anchor side and follows it when the anchor object is moved).
+    public string? JointStatusForTest(int jointId)
+    {
+        int idx = _editables.FindIndex(e => e.Joint != null && e.Joint.Id == jointId);
+        return idx < 0 ? "no such joint" : JointStatus(_editables[idx].Joint!);
+    }
+    public (Vector3 a, Vector3 b) JointAnchorsForTest(int jointId)
+    {
+        int idx = _editables.FindIndex(e => e.Joint != null && e.Joint.Id == jointId);
+        if (idx < 0) return (Vector3.Zero, Vector3.Zero);
+        var cfg = _editables[idx].Joint!;
+        return (JointAnchorWorld(cfg.BodyA, cfg.AnchorA), JointAnchorWorld(cfg.BodyB, cfg.AnchorB));
+    }
 
     // C1-4b: the WORLD position of a joint anchor — the placeholder marker + spawn use this to place a joint
     // at the midpoint of its two anchors. A body id of -1 means the anchor is a WORLD point (matching the
@@ -255,6 +444,39 @@ public partial class PriviewNetworkScene
         if (inst is Object3d o)
             return (o.LocalCenter * o.Scale).Rotate(o.LocalRotate) + o.Position + a.Rotate(o.LocalRotate);
         return inst.Position + a;   // a sphere/other: its position is the centre
+    }
+
+    // F2 (RC3): the INVERSE of JointAnchorWorld — express a WORLD point as the local anchor for `bodyId`, so a
+    // retarget can PRESERVE the anchor's world position (the stored anchor number silently changes meaning: a
+    // world point for -1 vs a body-local offset for a real id). -1 / an unresolvable id -> the world point
+    // verbatim (matching JointAnchorWorld's fallback); an Object3d -> OBB-centre-relative, un-rotated; a sphere ->
+    // position-relative. Round-trips: WorldPointToAnchorLocal(id, JointAnchorWorld(id, a)) == a.
+    private Vector3 WorldPointToAnchorLocal(int bodyId, Vector3 worldPoint)
+    {
+        if (bodyId == -1) return worldPoint;
+        int idx = _editables.FindIndex(e => e.Descriptor.Id == bodyId);
+        if (idx < 0) return worldPoint;
+        var inst = _editables[idx].Instance;
+        if (inst is Object3d o)
+        {
+            Vector3 obbCentre = (o.LocalCenter * o.Scale).Rotate(o.LocalRotate) + o.Position;
+            return (worldPoint - obbCentre).RotateInverse(o.LocalRotate);
+        }
+        return worldPoint - inst.Position;
+    }
+
+    // F2 (RC3): retarget one endpoint of a joint to `newId`, PRESERVING the anchor's current WORLD point so the
+    // body doesn't lunge sideways. Capture the world point via JointAnchorWorld(old id, old anchor), change the
+    // id, then rewrite the local anchor via the inverse for the new id. Shared by the N/M step (AdjustField) and
+    // typed entry (SetNumericField). A no-op if the id is unchanged. The same WorldEdit op-4 sync carries it.
+    private void RetargetJointBody(JointConfig cfg, bool isA, int newId)
+    {
+        int oldId = isA ? cfg.BodyA : cfg.BodyB;
+        if (newId == oldId) return;
+        Vector3 worldPoint = JointAnchorWorld(oldId, isA ? cfg.AnchorA : cfg.AnchorB);
+        Vec3Config newAnchor = FromVec(WorldPointToAnchorLocal(newId, worldPoint));
+        if (isA) { cfg.BodyA = newId; cfg.AnchorA = newAnchor; }
+        else     { cfg.BodyB = newId; cfg.AnchorB = newAnchor; }
     }
 
     // The midpoint of a joint's two world anchors (kept for the descriptor's informational Position).

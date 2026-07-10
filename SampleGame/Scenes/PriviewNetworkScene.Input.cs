@@ -148,14 +148,47 @@ public partial class PriviewNetworkScene
         if (!_connToNet.TryGetValue(connId, out int netId)) return;
         _connToNet.Remove(connId);
         _netManager?.ForgetUdpPeer(netId);   // drop this peer's UDP rate-limit bucket (senderId == netId)
+        _playerNames.Remove(netId);          // N2: drop the departed peer's roster entry (no stale nick)
         RemoveRemotePlayer(netId);
         _netManager?.SendPacket(new PlayerLeftPacket { NetId = netId }, _myNetId);
     }
 
-    // Client (and harmless on a server): a peer left — drop its avatar.
+    // Client (and harmless on a server): a peer left — drop its avatar and its roster entry.
     private void OnPlayerLeft(PlayerLeftPacket packet, int senderId)
     {
+        _playerNames.Remove(packet.NetId);   // N2: prune the roster alongside the avatar
         RemoveRemotePlayer(packet.NetId);
+    }
+
+    // N2: a peer announced its nickname. Every peer RECORDS it (keyed by the packet's OWNER NetId, not the
+    // sender — a server re-broadcast preserves the original owner). The server is a HUB: it relays the packet
+    // to all peers (like OnChatReceived) and back-fills a newcomer with everyone already present (incl. its
+    // own nick), so a client joining after others learns all of them. Robust to repeats — the client re-sends
+    // until the world arrives, and re-recording / re-sending the same entry is a harmless idempotent overwrite.
+    private void OnPlayerInfoReceived(PlayerInfoPacket packet, int senderId)
+    {
+        // 1) Sanitize the wire nick (bounds + strips junk — same policy as our own nick).
+        string nick = UserProfiles.SanitizeNick(packet.Nick);
+        // 2) Record by the packet's OWNER netId. Dupe nicks across distinct netIds are fine (not unique).
+        _playerNames[packet.NetId] = nick;
+
+        // 3/4) Server acts as the roster hub.
+        if (_isServer && _netManager != null)
+        {
+            int connId = _netManager.LastSenderConnId;   // capture before any send (SendPacket won't change it, but be safe)
+            // 3) Relay this announcement to all peers; the original sender ignores its own echo (step 5).
+            _netManager.SendPacket(packet, senderId);
+            // 4) Back-fill the NEWCOMER (this requester) with every OTHER known entry — including the server's
+            //    own (_myNetId, _myNick) — so it learns the nicks of the server + peers who joined before it.
+            //    Skip the requester's own entry (it already knows itself). Not for the server's own packets.
+            if (senderId != _myNetId)
+                foreach (var kv in _playerNames.ToArray())   // snapshot: the loop only reads, but be defensive
+                    if (kv.Key != packet.NetId)
+                        _netManager.SendPacketTo(connId, new PlayerInfoPacket { NetId = kv.Key, Nick = kv.Value }, kv.Key);
+        }
+
+        // 5) Our own relayed echo — already recorded locally; nothing more to do.
+        if (senderId == _myNetId) return;
     }
     
     private void HandleChatInput()
@@ -168,7 +201,9 @@ public partial class PriviewNetworkScene
             {
                 if (!string.IsNullOrWhiteSpace(_currentInput))
                 {
-                    string msg = $"Player {_myNetId}: {_currentInput}";
+                    // N2: client-self-signed — bake our OWN nickname into the sent string (same trust model
+                    // as the old "Player {id}:" prefix; the roster is NOT consulted to render chat).
+                    string msg = FormatChatLine(_myNick, _myNetId, _currentInput);
                     _netManager?.SendPacket(new ChatPacket(msg), _myNetId);
 
                     AddChatMessage(msg);
@@ -410,8 +445,9 @@ public partial class PriviewNetworkScene
                 break;
 
             // ---- joint (C1-4b): typed entry sets the LIVE JointConfig field exactly (mirror AdjustField's clamps) ----
-            case Field.JBodyA: if (entry.Joint != null) entry.Joint.BodyA = Math.Max(-1, (int)MathF.Round(v)); break;
-            case Field.JBodyB: if (entry.Joint != null) entry.Joint.BodyB = Math.Max(-1, (int)MathF.Round(v)); break;
+            // F2 (RC3): typed retarget also preserves the anchor's world point.
+            case Field.JBodyA: if (entry.Joint != null) RetargetJointBody(entry.Joint, isA: true,  Math.Max(-1, (int)MathF.Round(v))); break;
+            case Field.JBodyB: if (entry.Joint != null) RetargetJointBody(entry.Joint, isA: false, Math.Max(-1, (int)MathF.Round(v))); break;
             case Field.JAnchorAX: if (entry.Joint != null) entry.Joint.AnchorA.X = v; break;
             case Field.JAnchorAY: if (entry.Joint != null) entry.Joint.AnchorA.Y = v; break;
             case Field.JAnchorAZ: if (entry.Joint != null) entry.Joint.AnchorA.Z = v; break;
@@ -429,6 +465,9 @@ public partial class PriviewNetworkScene
             case Field.JFrequency: if (entry.Joint != null) entry.Joint.Frequency = MathF.Max(0f, v); break;
             case Field.JDamping: if (entry.Joint != null) entry.Joint.DampingRatio = MathF.Max(0f, v); break;
         }
+        // F3: a typed joint-param edit rebuilds the live solver joint next frame (params copied at build) — it
+        // converges DYNAMICALLY to the fresh value (no re-snap; the cfg stays snap-evaluated).
+        if (entry.Joint != null && FieldGroup(f) == "Joint") InvalidateBuiltJoint(entry.Joint);
     }
 
     // Sets one direction component (0=X,1=Y,2=Z) to an absolute value, reusing AdjustDirection's
@@ -471,6 +510,15 @@ public partial class PriviewNetworkScene
         _chatShowTimer = ChatShowFrames;   // keep the contained chat box shown briefly after a new message
         // (Auto-scroll: at the bottom (_chatScroll==0) the box shows the new message; scrolled up, the draw's
         // clamp keeps the offset valid so it doesn't jump to the bottom — see ChatVisibleSlice.)
+    }
+
+    // N2: build a chat line signed with the sender's nickname (client-self-signed). A non-empty (sanitized)
+    // nick prefixes "{nick}: "; an empty nick falls back to the SAME "player #<id>:" wording NameForNetId /
+    // LocalBodyName use. Pure + static so a headless test can assert it directly.
+    public static string FormatChatLine(string nick, int netId, string text)
+    {
+        string clean = UserProfiles.SanitizeNick(nick);
+        return clean.Length > 0 ? $"{clean}: {text}" : $"player #{netId}: {text}";
     }
 
     // Scrolls the chat history: dir > 0 = older (up), dir < 0 = newer (down). Clamped at the bottom (0);

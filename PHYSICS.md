@@ -150,8 +150,55 @@ every hook is a no-op, so a joint-free scene steps **bit-identically**.
   origin; local-frame `AnchorA` / `AnchorB`; hinge `Axis` + limit/motor fields; distance `RestLength` + spring
   fields). The pure `JointBuilder.BuildJoint` translates a config into a live `Joint`. The scene bridge
   (`BuildFrameJoints`) keeps **persistent** live joints (their accumulated-impulse warm-start survives frames),
-  rebuilding one only when a referenced body changes; a joint whose endpoint isn't a solver body this frame is
-  skipped (warned once).
+  rebuilding one only when a referenced body changes.
+- **Anchoring contract (F1)** — a joint side resolves to a solver body by kind: an object with **gravity +
+  collision** is a **dynamic** body; **any other existing object** (a light or camera marker, a static prop, the
+  platform) is a **fixed/kinematic anchor** — an immovable body (zero inverse mass) whose pose is refreshed from
+  the live instance every frame, so **moving the anchor object in the editor drags the pinned body** (it wakes
+  the sleeping partner, since a static anchor never joins a contact island). Id `-1` is a fixed WORLD point at the
+  origin. An anchor uses the same reference frame as the marker (`JointAnchorWorld`) — an `Object3d` at its OBB
+  centre oriented by `LocalRotate`, a sphere at its position — so a rotated anchor also rotates the hinge axis. A
+  joint with **both sides static** (e.g. platform↔world) is **inactive** (zero effective mass — nothing to move,
+  and NaN-safe), and a joint whose side was **deleted** is inactive too. Instead of a silent skip, the bridge
+  records a per-joint status (`JointStatusReason`) the editor shows: **"Joint: active"** or **"Joint: inactive —
+  &lt;reason&gt;"** (world gravity off / a referenced body was deleted / both sides are static).
+- **Joints × sleeping / assembly / collision (F2)** — the solver/bridge integration that makes jointed bodies
+  behave in live play:
+  - **Sleep understands joints.** A `Joint` exposes `PositionError()` (its current violation magnitude). A
+    dynamic body being **dragged by a still-violated joint** (error > `JointSlop` ≈ 0.02) is kept awake (its real
+    velocity is pinned to the anchor's ~0 by the velocity solve, but the split-impulse is still closing the gap —
+    it is NOT at rest), so it no longer falls asleep in mid-air and "loses gravity". Joints also **union their two
+    dynamic ends into one sleep island** (a static end doesn't merge, like a contact), with moving-wakes-sleeping
+    propagation. A **satisfied** hanging pendulum at rest **still sleeps**; a later disturbance (a moved anchor,
+    or the other island member moving) re-wakes it. `JointActive()` wakes a lone sleeping end under a **static**
+    anchor whenever the joint is violated, instead of deactivating it.
+  - **Assembly snap (ONCE per joint, F3).** The movable end is **teleported once** so a joint begins SATISFIED —
+    no multi-second "rope contraction" creep. It fires exactly ONCE per joint config: when it is **authored**, or
+    when a **saved world is loaded** (fresh config identities). It NEVER re-fires on a later runtime rebuild
+    (`_snapEvaluated` guards it) — a **gravity toggle** (which recreates the body), body recreation, a
+    **retarget**, or an **anchor/kind edit** rebuild the joint but converge DYNAMICALLY (the split-impulse rate,
+    kept awake by the sleep integration above) rather than teleporting. This fixed the bug where toggling gravity
+    off→on teleported a jointed body into its anchor. Snap convention: exactly one dynamic end → snap it; **both
+    dynamic → snap B**. ballsocket/hinge coincide the anchors (translation only); distance (rigid AND spring) move
+    along the anchor axis to `RestLength`. Velocities are preserved; the write-back carries it to the instance +
+    `_physMoved`. (A joint-param EDIT also invalidates the built `Joint` — its anchors/axis/kind are copied at
+    build — so it rebuilds next frame with the fresh values; the snap-evaluated mark persists, so no re-snap.)
+  - **Retarget keeps the world point.** Re-pointing `BodyA`/`BodyB` (`RetargetJointBody`) rewrites the local
+    anchor so the anchor's **world position is preserved** (the stored anchor number means a world point for `-1`
+    but a body-local offset for a real id) — no sideways lunge.
+  - **collideConnected — per-joint (F4, default off).** `JointConfig.Collide` (default `false`) controls whether
+    a joint's two bodies also collide with each other, keyed into `ImpulseWorld.NoCollide` by `RigidBody.SceneId`.
+    **Box2D ShouldCollide semantics:** a real-real pair is excluded from contacts if **any** connecting joint has
+    `Collide == false`; a pair whose **every** connecting joint has `Collide == true` collides normally (the
+    refill just adds the pair for each `Collide==false` joint). Refilled every frame, so a live `JCollide` toggle
+    takes effect next frame. A world-side (`-1`) endpoint contributes no collidable pair. Every non-jointed pair
+    is untouched (bit-identical). **Guidance:** enable `Collide` only when the joint's satisfied geometry does NOT
+    force overlap — **surface/edge anchors** (real chain links that should bump instead of folding through each
+    other, a door vs its post). **Centre anchors + `Collide=on` is a contradictory spec** (the satisfied pose
+    overlaps, so the unilateral contact fights the bilateral pin) — leave it off there.
+  - **Hinge axis in A's frame.** `JointBuilder` derives the hinge axis in **body A's frame** (world for `-1`) into
+    one world axis, then expresses it per-body — so differently-oriented bodies share ONE physical axis and the
+    perpendicular locks don't fight. For aligned bodies this is bit-identical to the old verbatim copy.
 - **Editor + sync** — a **`joint`** spawn type places a joint entry: a pickable, non-colliding **line marker**
   spanning the two anchors, coloured by kind (**ball-socket cyan, hinge orange, distance green**), a hinge
   adding an **axis stub**; `Field.JointKind` cycles `ballsocket → hinge → distance` and the inspector shows
@@ -159,6 +206,19 @@ every hook is a no-op, so a joint-free scene steps **bit-identically**.
   join's world sync) and live edits stream as `WorldEditPacket` ops **3 (JointModify) / 4 (JointSpawn) /
   5 (JointDelete)** with in-place mutation. Guarded by `jointtest` (solver behaviour) + `editortest`
   (authoring + the net ops).
+- **By-design (not bugs):**
+  - **Slight overlap is normal.** Resting contacts allow a small `Slop` penetration (the solver removes only
+    *excess* penetration), and during a fast swing a jointed **colliding** pair (`Collide=true`) can transiently
+    overlap a little deeper: the bilateral pin corrects its violation at the full split-impulse rate while the
+    unilateral contact corrects only at the `Beta` rate, so for a frame or two the contact lags. This is standard
+    iterative-solver behaviour and self-corrects within a few substeps — a *persistent* deep overlap would be a
+    bug, transient overlap is not.
+  - **Infeasible distance chains stretch.** An editor-dragged static anchor is **kinematic** — infinitely strong,
+    unaffected by the constraints hanging off it. When a boundary condition makes a distance chain **infeasible**
+    (e.g. two anchors dragged farther apart than the sum of the rods' rest lengths), the constraint can't be
+    satisfied, so the solver **shares the violation** across the rods and they VISIBLY stretch; restoring a
+    feasible geometry restores the lengths. `RestLength` is a *target* length, not a breaking strength — a rod
+    doesn't snap, it stretches (breakable joints are a future idea).
 
 ### C2 — Dynamic convex-hull mesh bodies (`ConvexHull.cs`, `Gjk.cs`, `Contact.cs`)
 

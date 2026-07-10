@@ -22,8 +22,21 @@ public partial class PriviewNetworkScene : Scene
     private readonly bool _isServer;
     private readonly NetworkManager? _netManager;
     private readonly int _myNetId;
+    // The local player's chosen nickname (Stage N1). LOCAL only this stage: it rides no packet, does not
+    // change LocalBodyName / chat / any HUD text — it only decorates the console window title.
+    private readonly string _myNick;
     private readonly Dictionary<int, Object3d> _remotePlayers = new();
     private readonly Dictionary<int, int> _connToNet = new();   // server: connId -> peer netId (for disconnect cleanup)
+    // N2: the nickname roster (netId -> sanitized nick), maintained on EVERY peer. The server is a hub that
+    // relays PlayerInfoPackets + back-fills newcomers; each peer records what it learns (own entry seeded in
+    // Start). Keyed by netId (unique per session) — nicknames are NOT unique, so two peers sharing a nick
+    // coexist as distinct entries. Signs chat now (client-self-signed); the hover label reads it next stage (N3).
+    private readonly Dictionary<int, string> _playerNames = new();
+
+    // The display name for a net id: its recorded (sanitized) nick if known + non-empty, else the same
+    // "player #<id>" system fallback LocalBodyName / FormatChatLine use. Safe on every peer (own entry seeded).
+    public string NameForNetId(int netId) =>
+        _playerNames.TryGetValue(netId, out var nick) && !string.IsNullOrEmpty(nick) ? nick : $"player #{netId}";
 
     // Server: record connId -> peer netId, but ONLY for a real TCP connection (connId >= 0). A
     // UDP-delivered packet has LastSenderConnId == -1 (UdpReadLoop marker) and must NOT clobber this map,
@@ -36,6 +49,14 @@ public partial class PriviewNetworkScene : Scene
     // Headless test hooks (E2 conn-map regression guard) — no sockets.
     public bool ConnMappingForTest(int connId, int senderId) { RecordConnMappingIfTcp(connId, senderId); return true; }
     public bool ConnMapTryGetForTest(int connId, out int netId) => _connToNet.TryGetValue(connId, out netId);
+
+    // ---- N2 roster test hooks (headless — no sockets) ----
+    // Drive OnPlayerInfoReceived's RECORD path (offline: the server hub / back-fill sends are no-ops), and
+    // prune an entry through the real OnPlayerLeft path. NameForNetId is already public for read-back.
+    public void ReceivePlayerInfoForTest(int netId, string nick, int senderId) =>
+        OnPlayerInfoReceived(new NetworkPackets.PlayerInfoPacket { NetId = netId, Nick = nick }, senderId);
+    public void PlayerLeftForTest(int netId) =>
+        OnPlayerLeft(new NetworkPackets.PlayerLeftPacket { NetId = netId }, 0);
 
     // Large-mesh streaming: a big live spawn is split into chunks sent a few per frame so other
     // packets interleave. Small meshes still inline in one WorldEditPacket.
@@ -206,7 +227,7 @@ public partial class PriviewNetworkScene : Scene
                          Texture, TextureScale, TextureFace, TextureFilter, CamKind, FollowTargetId,
                          // ---- joint-only fields (C1-4b; ignored for non-joint entries) ----
                          JointKind, JBodyA, JBodyB, JAnchorAX, JAnchorAY, JAnchorAZ, JAnchorBX, JAnchorBY, JAnchorBZ,
-                         JAxisX, JAxisY, JAxisZ, JLimitEnabled, JLower, JUpper, JMotorEnabled, JMotorSpeed, JMaxTorque,
+                         JCollide, JAxisX, JAxisY, JAxisZ, JLimitEnabled, JLower, JUpper, JMotorEnabled, JMotorSpeed, JMaxTorque,
                          JRestLength, JSpringEnabled, JFrequency, JDamping }
     private int _fieldIndex = 0;
 
@@ -258,7 +279,7 @@ public partial class PriviewNetworkScene : Scene
         {
             var jf = new List<Field> { Field.JointKind, Field.JBodyA, Field.JBodyB,
                 Field.JAnchorAX, Field.JAnchorAY, Field.JAnchorAZ,
-                Field.JAnchorBX, Field.JAnchorBY, Field.JAnchorBZ };
+                Field.JAnchorBX, Field.JAnchorBY, Field.JAnchorBZ, Field.JCollide };
             switch (e.Joint?.Kind?.Trim().ToLowerInvariant())
             {
                 case "hinge":
@@ -278,10 +299,11 @@ public partial class PriviewNetworkScene : Scene
     }
 
 
-    public PriviewNetworkScene(IDisplaysManagerAsync manager, WorldConfig world, bool isServer, string targetIp, int port, bool online = true) : base(manager)
+    public PriviewNetworkScene(IDisplaysManagerAsync manager, WorldConfig world, bool isServer, string targetIp, int port, bool online = true, string nick = "") : base(manager)
     {
         _online = online;
         _isServer = isServer;
+        _myNick = UserProfiles.SanitizeNick(nick);   // defensive: the ctor is also reachable from tests
         Exposure = 0.05f;
         Ambient = 0.1f;
 
@@ -296,10 +318,14 @@ public partial class PriviewNetworkScene : Scene
 
         _myNetId = isServer ? 1 : Random.Shared.Next(2, 10000);
 
+        // Appended to the window title only when a nickname was chosen; an empty nick leaves the titles
+        // byte-identical to before this stage.
+        string nickSuffix = _myNick.Length > 0 ? $" | {_myNick}" : "";
+
         if (!_online)
         {
             Logger.Info("Local (offline) mode - networking disabled");
-            Console.Title = "LOCAL (Offline)";
+            Console.Title = "LOCAL (Offline)" + nickSuffix;
             return;
         }
 
@@ -312,6 +338,7 @@ public partial class PriviewNetworkScene : Scene
         PacketManager.RegisterPacket<WorldEditPacket>();
         PacketManager.RegisterPacket<WorldSettingsPacket>();
         PacketManager.RegisterPacket<PlayerLeftPacket>();
+        PacketManager.RegisterPacket<PlayerInfoPacket>();
         PacketManager.RegisterPacket<MeshChunkPacket>();
         PacketManager.RegisterPacket<TextureChunkPacket>();
         PacketManager.RegisterPacket<PhysicsSyncPacket>();
@@ -321,6 +348,9 @@ public partial class PriviewNetworkScene : Scene
         PacketManager.Subscribe<ChatPacket>(OnChatReceived);
         // Both sides: a client drops left peers; a server (future relayed leaves) is harmless.
         PacketManager.Subscribe<PlayerLeftPacket>(OnPlayerLeft);
+        // N2: the nickname roster is bidirectional — a client announces its own, the server is a hub that
+        // relays + back-fills newcomers, and every peer records what it learns.
+        PacketManager.Subscribe<PlayerInfoPacket>(OnPlayerInfoReceived);
 
         if (isServer)
         {
@@ -329,7 +359,7 @@ public partial class PriviewNetworkScene : Scene
             _netManager.StartServer(port);
             _netManager.OnClientDisconnected += OnClientDisconnectedServer;
             Logger.Info($"Server listening on port {port}");
-            Console.Title = $"SERVER (Port: {port}) | ID: {_myNetId}";
+            Console.Title = $"SERVER (Port: {port}) | ID: {_myNetId}" + nickSuffix;
         }
         else
         {
@@ -345,7 +375,7 @@ public partial class PriviewNetworkScene : Scene
             _awaitingWorld = true;
             _netManager.Connect(targetIp, port);
             Logger.Info($"Connecting to {targetIp}:{port}");
-            Console.Title = $"CLIENT (ID: {_myNetId}) -> {targetIp}:{port}";
+            Console.Title = $"CLIENT (ID: {_myNetId}) -> {targetIp}:{port}" + nickSuffix;
         }
 
 
@@ -353,6 +383,10 @@ public partial class PriviewNetworkScene : Scene
 
     public override void Start()
     {
+        // N2: seed the roster with our OWN entry so every peer always knows itself (harmless offline). The
+        // server's own nick is thereby part of the roster it back-fills to clients.
+        _playerNames[_myNetId] = _myNick;
+
         BuildPlatform();
 
         if (_ownLightEnabled) AddLight(_mainLight);
@@ -599,6 +633,10 @@ public partial class PriviewNetworkScene : Scene
             if (_requestTimer <= 0f)
             {
                 _netManager?.SendPacket(new WorldRequestPacket(), _myNetId);
+                // N2: announce our nick in the SAME reliable-TCP join tick — idempotent on the server (a
+                // re-send just overwrites the same entry), and this loop stops once the world arrives, so it
+                // naturally repeats a few times until the connection is up, then stops (no separate timer).
+                _netManager?.SendPacket(new PlayerInfoPacket { NetId = _myNetId, Nick = _myNick }, _myNetId);
                 _requestTimer = 1f;
             }
         }
@@ -908,6 +946,37 @@ public partial class PriviewNetworkScene : Scene
         int idx = _editables.FindIndex(e => e.Descriptor.Id == id);
         if (idx < 0) return null;
         return _impBodies.TryGetValue(_editables[idx].Instance, out var rb) ? rb.Kind : null;
+    }
+
+    // F3 test hook: the Sleeping state of a dynamic object's solver body (null if it has no body this frame —
+    // e.g. static / gravity-off). Lets a headless test assert a jointed body never sleeps while its joint is violated.
+    public bool? BodySleepingForTest(int id)
+    {
+        int idx = _editables.FindIndex(e => e.Descriptor.Id == id);
+        if (idx < 0) return null;
+        return _impBodies.TryGetValue(_editables[idx].Instance, out var rb) ? rb.Sleeping : null;
+    }
+
+    // F4 test hook: is the (idA,idB) scene pair currently EXCLUDED from contacts (in the live ImpulseWorld's
+    // NoCollide set, refilled each StepImpulse from the joints' Collide flags)? Asserts the ShouldCollide
+    // semantics + that a live Collide toggle takes effect on the next step.
+    public bool NoCollidePairForTest(int idA, int idB)
+        => _impWorld != null && _impWorld.NoCollide.Contains((Math.Min(idA, idB), Math.Max(idA, idB)));
+
+    // F4 test hook: teleport a dynamic object's SOLVER body to a pose (position + Euler rotation) and zero its
+    // velocity, then wake it — used to fold a jointed body into overlap deterministically (moving the instance
+    // can't drive a live solver body, which the solver owns). No-op if the object has no solver body this frame.
+    public void SetBodyPoseForTest(int id, Vector3 pos, Vector3 euler)
+    {
+        int idx = _editables.FindIndex(e => e.Descriptor.Id == id);
+        if (idx < 0) return;
+        if (_impBodies.TryGetValue(_editables[idx].Instance, out var rb))
+        {
+            rb.Position = pos;
+            rb.Orientation = Quaternions.QuatFromEuler(euler);
+            rb.LinVel = Vector3.Zero; rb.AngVel = Vector3.Zero;
+            ImpulseWorld.Wake(rb);
+        }
     }
 
     // C2-5 bridge test hook: the o.Scale a dynamic-mesh hull body was last (re)built with (NaN if none cached) —

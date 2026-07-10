@@ -15,6 +15,10 @@ public sealed class ImpulseWorld
 {
     public readonly List<RigidBody> Bodies = new();
     public readonly List<Joint> Joints = new();    // Plan C1: bilateral joint constraints, solved alongside contacts
+    // F2 (RC4 collideConnected): unordered (min,max) SCENE-id pairs whose contacts are SKIPPED — a jointed pair
+    // must not collide with each other (the bilateral pin would fight the unilateral contact -> penetration).
+    // Refilled by the scene bridge each frame from the world's joints; empty for a joint-free world (bit-identical).
+    public readonly HashSet<(int, int)> NoCollide = new();
     public Vector3 Gravity = new Vector3(0f, -9.8f, 0f);
     public float Restitution = 0f;                 // world default restitution (a body's <0 restitution inherits this)
 
@@ -30,6 +34,7 @@ public sealed class ImpulseWorld
     private const float SleepLin = 0.05f;          // |LinVel| below this (units/s) counts as calm
     private const float SleepAng = 0.05f;          // |AngVel| below this (rad/s) counts as calm
     private const int SleepSteps = 30;             // consecutive calm substeps before a body sleeps
+    private const float JointSlop = 0.02f;         // F2: a joint whose PositionError exceeds this is "violated" — its movable ends stay awake / a lone sleeping end re-wakes; at/below it a satisfied joint may sleep (parallels the contact Slop scale)
     // ---- anti-fling rails (mirror the legacy engine's: nothing may explode even at coarse dt / deep contact) ----
     internal const float MaxBiasSpeed = 4f;        // cap the split-impulse position-correction speed (a deep coarse-dt penetration can't fling); internal so Joint.cs shares it
     private const float MaxLinSpeed = 60f;         // clamp |LinVel| (units/s) — anti-explosion
@@ -199,6 +204,26 @@ public sealed class ImpulseWorld
             if (!a.Sleeping && !a.Calm && b.Sleeping) Wake(b);
             if (!b.Sleeping && !b.Calm && a.Sleeping) Wake(a);
         }
+        // 7b') F2: a JOINT also unions its two DYNAMIC ends (a static end doesn't merge, mirroring contacts), and a
+        //      moving end wakes a sleeping partner — so a rod-linked pair sleeps/wakes as ONE island.
+        foreach (var j in Joints)
+        {
+            RigidBody a = j.A, b = j.B;
+            if (a.IsStatic || b.IsStatic) continue;
+            Union(a, b);
+            if (!a.Sleeping && !a.Calm && b.Sleeping) Wake(b);
+            if (!b.Sleeping && !b.Calm && a.Sleeping) Wake(a);
+        }
+        // 7b'') F2: a movable end of a still-VIOLATED joint is being DRAGGED (its real velocity is pinned to the
+        //      anchor's while the split-impulse closes the gap) — it is NOT at rest, so force it not-calm so its
+        //      island can't sleep mid-flight (the RC1 "gravity disappears" freeze). A SATISFIED joint (error <=
+        //      slop) leaves calm untouched, so a pendulum hanging at rest still sleeps.
+        foreach (var j in Joints)
+        {
+            if (j.PositionError() <= JointSlop) continue;
+            if (!j.A.IsStatic) j.A.Calm = false;
+            if (!j.B.IsStatic) j.B.Calm = false;
+        }
         // 7c) island calm = AND of every member's calm (accumulated on the island root).
         foreach (var b in Bodies) if (!b.IsStatic) Find(b).IslandCalm = true;
         foreach (var b in Bodies) if (!b.IsStatic) { var r = Find(b); r.IslandCalm = r.IslandCalm && b.Calm; }
@@ -241,7 +266,21 @@ public sealed class ImpulseWorld
     {
         bool aFixed = j.A.IsStatic || j.A.Sleeping;
         bool bFixed = j.B.IsStatic || j.B.Sleeping;
-        if (aFixed && bFixed) return false;
+        if (aFixed && bFixed)
+        {
+            // Both ends immovable. F2: if the joint is still VIOLATED (e.g. a sleeping body under a STATIC anchor
+            // that was just raised), WAKE the sleeping DYNAMIC end(s) so the constraint keeps doing work — instead
+            // of deactivating and leaving the body frozen in mid-air. A SATISFIED resting joint (error <= slop)
+            // stays deactivated (a hung pendulum sleeps).
+            if (j.PositionError() > JointSlop)
+            {
+                bool woke = false;
+                if (j.A.Sleeping && !j.A.IsStatic) { Wake(j.A); woke = true; }
+                if (j.B.Sleeping && !j.B.IsStatic) { Wake(j.B); woke = true; }
+                if (woke) return true;
+            }
+            return false;
+        }
         if (j.A.Sleeping && !j.B.IsStatic && !j.B.Sleeping && !j.B.Calm) Wake(j.A);
         else if (j.B.Sleeping && !j.A.IsStatic && !j.A.Sleeping && !j.A.Calm) Wake(j.B);
         return true;
@@ -258,6 +297,7 @@ public sealed class ImpulseWorld
                 foreach (var stat in Bodies)
                 {
                     if (!stat.IsStatic) continue;                                              // vs static only
+                    if (Excluded(dyn, stat)) continue;                                         // F2: jointed pair — no contact
                     Contact? c = stat.Kind switch
                     {
                         ColliderKind.Box    => ContactGen.SphereVsBox(stat, dyn, Slop, out var cb) ? cb : null,
@@ -273,6 +313,7 @@ public sealed class ImpulseWorld
                 foreach (var stat in Bodies)
                 {
                     if (!stat.IsStatic) continue;
+                    if (Excluded(dyn, stat)) continue;                                         // F2: jointed pair — no contact
                     if (stat.Kind == ColliderKind.Sphere) { if (ContactGen.BoxVsStaticSphere(stat, dyn, Margin, out var cs)) _contacts.Add(cs); }
                     else if (stat.Kind == ColliderKind.Mesh) ContactGen.BoxVsMesh(stat, dyn, Margin, _contacts);   // Stage 5: REAL triangles (rests/tumbles on the true slope); high-poly falls back to the OBB box view
                     else if (stat.Kind == ColliderKind.Box) ContactGen.BoxVsBox(stat, dyn, Margin, _contacts);      // a genuine static OBB
@@ -283,6 +324,7 @@ public sealed class ImpulseWorld
                 foreach (var stat in Bodies)
                 {
                     if (!stat.IsStatic) continue;
+                    if (Excluded(dyn, stat)) continue;                                         // F2: jointed pair — no contact
                     if (stat.Kind == ColliderKind.Sphere) { if (ContactGen.HullVsSphere(stat, dyn, Margin, out var cs)) _contacts.Add(cs); }
                     else if (stat.Kind == ColliderKind.Box) ContactGen.HullVsBox(stat, dyn, Margin, _contacts);    // clipped multi-point manifold (flat rest)
                     else if (stat.Kind == ColliderKind.Mesh) ContactGen.HullVsMesh(stat, dyn, Margin, _contacts);  // C2-4: REAL triangles (rests/slides on the true slope); high-poly falls back to the OBB box view
@@ -308,6 +350,7 @@ public sealed class ImpulseWorld
                 var b = Bodies[j];
                 if (b.IsStatic || b.Kind == ColliderKind.Mesh) continue;
                 if (a.Sleeping && b.Sleeping) continue;
+                if (Excluded(a, b)) continue;                                                // F2: jointed pair — no contact
 
                 bool aHull = a.Kind == ColliderKind.Hull, bHull = b.Kind == ColliderKind.Hull;
                 if (aHull || bHull)                                                         // C2-3b: dynamic HULL pairs
@@ -355,6 +398,12 @@ public sealed class ImpulseWorld
     // Relative velocity at the contact along a tangent direction 't'.
     private static float RelVelT(Contact c, Vector3 t)
         => (c.B.VelocityAt(c.Point) - c.A.VelocityAt(c.Point)) * t;
+
+    // F2 (RC4): skip contact generation between a JOINTED pair — both are real scene objects whose (min,max) id
+    // pair is in NoCollide. Short-circuits on an empty set so a joint-free world's contacts are bit-identical.
+    private bool Excluded(RigidBody a, RigidBody b)
+        => NoCollide.Count > 0 && a.SceneId >= 0 && b.SceneId >= 0
+           && NoCollide.Contains((System.Math.Min(a.SceneId, b.SceneId), System.Math.Max(a.SceneId, b.SceneId)));
 
     // A SLEEPING dynamic body acts as an immovable ANCHOR in the solve (effective inverse mass/inertia 0) —
     // an awake box rests on a sleeping one below exactly as it would on the static ground, so a partly-slept

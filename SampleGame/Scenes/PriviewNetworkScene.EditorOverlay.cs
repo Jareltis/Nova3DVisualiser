@@ -148,6 +148,11 @@ public partial class PriviewNetworkScene
                 lines.Add((line, on ? HudAccent : HudHint));
             }
 
+            // F1: a joint entry shows one status row — "Joint: active" (green) or "Joint: inactive — <reason>"
+            // (yellow) — so a silently-inert joint (a deleted/static/gravity-off side) is never a mystery.
+            if (entry.Joint != null)
+                lines.Add((JointStatusLine(entry), JointStatus(entry.Joint) == null ? HudHeader : HudStatus));
+
             // Camera rotation maps to the view's ray convention: X = roll (spins the image), Y = yaw,
             // Z = pitch. Noting it here avoids "RotX doesn't turn the camera" confusion (RotX only rolls).
             if (type == "camera")
@@ -250,6 +255,7 @@ public partial class PriviewNetworkScene
         Field.JBodyA => "Body A", Field.JBodyB => "Body B",
         Field.JAnchorAX => "Anchor A X", Field.JAnchorAY => "Anchor A Y", Field.JAnchorAZ => "Anchor A Z",
         Field.JAnchorBX => "Anchor B X", Field.JAnchorBY => "Anchor B Y", Field.JAnchorBZ => "Anchor B Z",
+        Field.JCollide => "Collide",
         Field.JAxisX => "Axis X", Field.JAxisY => "Axis Y", Field.JAxisZ => "Axis Z",
         Field.JLimitEnabled => "Limit", Field.JLower => "Lower", Field.JUpper => "Upper",
         Field.JMotorEnabled => "Motor", Field.JMotorSpeed => "Speed", Field.JMaxTorque => "Max Torque",
@@ -329,12 +335,13 @@ public partial class PriviewNetworkScene
             Field.JAnchorBX => (entry.Joint?.AnchorB.X ?? 0f).ToString("F2"),
             Field.JAnchorBY => (entry.Joint?.AnchorB.Y ?? 0f).ToString("F2"),
             Field.JAnchorBZ => (entry.Joint?.AnchorB.Z ?? 0f).ToString("F2"),
+            Field.JCollide => (entry.Joint?.Collide ?? false) ? "On" : "Off",
             Field.JAxisX => (entry.Joint?.Axis.X ?? 0f).ToString("F2"),
             Field.JAxisY => (entry.Joint?.Axis.Y ?? 0f).ToString("F2"),
             Field.JAxisZ => (entry.Joint?.Axis.Z ?? 0f).ToString("F2"),
             Field.JLimitEnabled => (entry.Joint?.LimitEnabled ?? false) ? "On" : "Off",
-            Field.JLower => (entry.Joint?.LowerLimit ?? 0f).ToString("F2"),
-            Field.JUpper => (entry.Joint?.UpperLimit ?? 0f).ToString("F2"),
+            Field.JLower => FormatLimitAngle(entry.Joint?.LowerLimit ?? 0f),
+            Field.JUpper => FormatLimitAngle(entry.Joint?.UpperLimit ?? 0f),
             Field.JMotorEnabled => (entry.Joint?.MotorEnabled ?? false) ? "On" : "Off",
             Field.JMotorSpeed => (entry.Joint?.MotorTargetSpeed ?? 0f).ToString("F2"),
             Field.JMaxTorque => (entry.Joint?.MaxMotorTorque ?? 0f).ToString("F2"),
@@ -349,6 +356,18 @@ public partial class PriviewNetworkScene
 
     // Editor display for a joint body id: "world" for -1 (the static world anchor), else "#id".
     private static string JointBodyLabel(int id) => id < 0 ? "world" : $"#{id}";
+
+    // F5: a hinge limit angle shown as "<radians:F2> (<degrees:F0>°)" — e.g. "-1.57 (-90°)". Radians stay
+    // canonical in storage / sync / the editor's 15° increments; this is DISPLAY only. Public + pure so a test
+    // can assert the format. Used by BOTH the overlay properties panel and the docked inspector (via FieldValue).
+    public static string FormatLimitAngle(float radians) => $"{radians:F2} ({radians * 180f / MathF.PI:F0}°)";
+
+    // F1: the joint-status row text — "Joint: active" when it's live in the solver, else the inactive reason.
+    private string JointStatusLine(EditEntry entry)
+    {
+        string? reason = JointStatus(entry.Joint!);
+        return reason == null ? "Joint: active" : $"Joint: inactive — {reason}";
+    }
 
     // Editor display for a TextureFace value: "All" for -1, else the type's face option name (a cube:
     // +X..-Z), or the raw index as a fallback for an out-of-range value from hand-edited JSON.
@@ -572,6 +591,10 @@ public partial class PriviewNetworkScene
                 }
             }
 
+            // F1: joint status row (active green / inactive yellow) — same info as the overlay panel.
+            if (entry.Joint != null)
+                rows.Add(new[] { new Seg(JointStatusLine(entry), JointStatus(entry.Joint) == null ? DockOn : DockSel) });
+
             rows.Add(new[] { new Seg("", DockDim) });
             var (af, onHeader, _) = ActiveInspectorTarget(entry);
             string hint = _entryMode ? "[Enter] confirm  [Esc] cancel"
@@ -657,7 +680,7 @@ public partial class PriviewNetworkScene
         // Joint (C1-4b): its own docked-Inspector section.
         Field.JointKind or Field.JBodyA or Field.JBodyB
             or Field.JAnchorAX or Field.JAnchorAY or Field.JAnchorAZ
-            or Field.JAnchorBX or Field.JAnchorBY or Field.JAnchorBZ
+            or Field.JAnchorBX or Field.JAnchorBY or Field.JAnchorBZ or Field.JCollide
             or Field.JAxisX or Field.JAxisY or Field.JAxisZ
             or Field.JLimitEnabled or Field.JLower or Field.JUpper
             or Field.JMotorEnabled or Field.JMotorSpeed or Field.JMaxTorque

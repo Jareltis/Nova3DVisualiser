@@ -17,6 +17,10 @@ public abstract class Joint
     public abstract void WarmStart();             // re-apply the impulse accumulated the previous substep
     public abstract void SolveVelocity();         // one PGS velocity iteration
     public abstract void SolvePosition(float h);  // one split-impulse positional iteration
+    // F2: the current constraint-VIOLATION magnitude, computed cheaply from the bodies' CURRENT poses (no
+    // scratch state, safe to call any time). 0 = satisfied. The world uses it so a body being dragged by a
+    // still-violated joint doesn't fall asleep mid-flight, and so a sleeping end under a moved anchor re-wakes.
+    public abstract float PositionError();
 }
 
 // Shared joint helpers. A SLEEPING or STATIC body is an immovable anchor: it contributes 0 to any effective mass
@@ -135,6 +139,14 @@ public sealed class BallSocketJoint : Joint
     public override void WarmStart() => _point.WarmStart(A, B);
     public override void SolveVelocity() => _point.SolveVelocity(A, B);
     public override void SolvePosition(float h) => _point.SolvePosition(A, B, h);
+
+    // F2: the anchor-point separation (point-to-point constraint violation).
+    public override float PositionError()
+    {
+        Vector3 pA = A.Position + ImpulseMath.Rotate(A.Orientation, LocalAnchorA);
+        Vector3 pB = B.Position + ImpulseMath.Rotate(B.Orientation, LocalAnchorB);
+        return (pB - pA).Length();
+    }
 }
 
 // A HINGE (revolute) joint: the ball-socket point pin PLUS two angular constraints that lock the bodies' relative
@@ -332,6 +344,17 @@ public sealed class HingeJoint : Joint
         A.PseudoAng -= JointMath.InvInertiaMul(A, l);
         B.PseudoAng += JointMath.InvInertiaMul(B, l);
     }
+
+    // F2: the point-pin separation PLUS the two world axes' misalignment (|aA × aB| ≈ sin of the tilt) — both DOF
+    // groups the hinge locks. Computed from current poses (independent of Prepare's scratch).
+    public override float PositionError()
+    {
+        Vector3 pA = A.Position + ImpulseMath.Rotate(A.Orientation, LocalAnchorA);
+        Vector3 pB = B.Position + ImpulseMath.Rotate(B.Orientation, LocalAnchorB);
+        Vector3 aA = ImpulseMath.Rotate(A.Orientation, LocalAxisA);
+        Vector3 aB = ImpulseMath.Rotate(B.Orientation, LocalAxisB);
+        return (pB - pA).Length() + Vector3.Cross(aA, aB).Length();
+    }
 }
 
 // A DISTANCE joint: constrains the two anchor points to a fixed rest separation along the line between them.
@@ -451,5 +474,15 @@ public sealed class DistanceJoint : Joint
         A.PseudoAng -= JointMath.InvInertiaMul(A, Vector3.Cross(_rA, impulse));
         B.PseudoLin += impulse * JointMath.InvMassOf(B);
         B.PseudoAng += JointMath.InvInertiaMul(B, Vector3.Cross(_rB, impulse));
+    }
+
+    // F2: |dist − RestLength| for a RIGID rod; a SPRING returns 0 (a soft spring at any length is "satisfied" —
+    // it's never blocking sleep, and it's snapped to RestLength once at assembly by the bridge instead).
+    public override float PositionError()
+    {
+        Vector3 pA = A.Position + ImpulseMath.Rotate(A.Orientation, LocalAnchorA);
+        Vector3 pB = B.Position + ImpulseMath.Rotate(B.Orientation, LocalAnchorB);
+        bool spring = SpringEnabled && Frequency > 0f;
+        return spring ? 0f : MathF.Abs((pB - pA).Length() - RestLength);
     }
 }

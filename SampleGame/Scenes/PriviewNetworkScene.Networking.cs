@@ -198,6 +198,7 @@ public partial class PriviewNetworkScene
         dst.Kind = src.Kind;
         dst.BodyA = src.BodyA; dst.BodyB = src.BodyB;
         dst.AnchorA = src.AnchorA; dst.AnchorB = src.AnchorB; dst.Axis = src.Axis;
+        dst.Collide = src.Collide;   // F4: per-joint collideConnected rides a live JointModify
         dst.LimitEnabled = src.LimitEnabled; dst.LowerLimit = src.LowerLimit; dst.UpperLimit = src.UpperLimit;
         dst.MotorEnabled = src.MotorEnabled; dst.MotorTargetSpeed = src.MotorTargetSpeed; dst.MaxMotorTorque = src.MaxMotorTorque;
         dst.RestLength = src.RestLength;
@@ -413,6 +414,8 @@ public partial class PriviewNetworkScene
         _impBodies.Clear(); _hullScale.Clear(); _physMoved.Clear(); _physTargets.Clear();   // drop stale physics/sync state
         // C1-5: drop stale joint bridge + marker state too, so a world swap never carries an old world's joints.
         _impJoints.Clear(); _impJointBuiltWith.Clear(); _impJointsWarned.Clear(); _jointMarkerCache.Clear();
+        _impStaticAnchors.Clear(); _jointStatus.Clear();   // F1: kinematic anchors + status are per-world too
+        _snapEvaluated.Clear();   // F3: a freshly loaded world's joints snap once (new cfg identities)
         _selected = -1;
         _floor = null;   // the floor is an editable entry now; the loop above already removed its display
 
