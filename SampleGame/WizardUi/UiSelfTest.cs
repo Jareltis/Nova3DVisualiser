@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using WStep = SampleGame.WizardUi.NewWizard.WStep;
 using WOutcome = SampleGame.WizardUi.NewWizard.WOutcome;
 
@@ -233,6 +235,17 @@ public static class UiSelfTest
         Check(N(WStep.Network, WOutcome.Back, true, true, true) == WStep.World, "flow: server Network Back->World");
         Check(N(WStep.Network, WOutcome.Back, true, false, true) == WStep.Role, "flow: client Network Back->Role");
 
+        // ---- STAGE N1 — the new Nickname first-screen transitions (and the Mode cancel change) ----
+        Check(N(WStep.Nick, WOutcome.Ok, false, false, true) == WStep.Mode, "flow: Nick Ok->Mode");
+        Check(N(WStep.Nick, WOutcome.Ok, true, true, false) == WStep.Mode, "flow: Nick Ok->Mode (online independent)");
+        Check(N(WStep.Nick, WOutcome.Back, false, false, true) == WStep.Cancelled, "flow: Nick Back->Cancelled (first screen quits)");
+        Check(N(WStep.Nick, WOutcome.Quit, false, false, true) == WStep.Cancelled, "flow: Nick Quit->Cancelled");
+        Check(N(WStep.Mode, WOutcome.Back, false, false, true) == WStep.Nick, "flow: Mode Back->Nick (was quit)");
+        Check(N(WStep.Mode, WOutcome.Quit, false, false, true) == WStep.Cancelled, "flow: Mode Quit->Cancelled (defensive arm)");
+        // Re-assert the Mode Ok branches still route correctly after the cancel change.
+        Check(N(WStep.Mode, WOutcome.Ok, false, false, true) == WStep.World, "flow: Mode Ok (local)->World");
+        Check(N(WStep.Mode, WOutcome.Ok, true, false, true) == WStep.Role, "flow: Mode Ok (online)->Role");
+
         // ---- STAGE 4 — CONFIG assembly parity with ShowCreateDialog (defaults + mappings) ----
         var (v1, c1) = NewWizard.BuildCreateConfig("myworld", true, true, false, false, true, 0, 0, "10", "20", "20", false, true, "5", "0");
         Check(v1 && c1 != null, "config: valid with defaults");
@@ -305,6 +318,56 @@ public static class UiSelfTest
         sCb.Shadows = cbP.Checked;
         var cbP2 = new UiCheckBox("Shadows", sCb.Shadows);
         Check(!cbP2.Checked, "persist(checkbox): unchecked state survives Back/return");
+
+        // ---- STAGE N1 — UserProfiles pure helpers (SanitizeNick / TouchList / ChooseNick) ----
+        Check(UserProfiles.SanitizeNick("  Miraz  ") == "Miraz", "nick: trims surrounding whitespace");
+        Check(UserProfiles.SanitizeNick("a b c") == "abc", "nick: strips inner spaces");
+        Check(UserProfiles.SanitizeNick("Bob#1!?") == "Bob1", "nick: strips punctuation, keeps digits");
+        Check(UserProfiles.SanitizeNick("Игрок") == "", "nick: non-ASCII dropped -> empty");
+        Check(UserProfiles.SanitizeNick("Cool_Guy-7") == "Cool_Guy-7", "nick: keeps _ and - verbatim");
+        Check(UserProfiles.SanitizeNick("Крутой_Bob-9!") == "_Bob-9", "nick: mixed keeps only ASCII-safe chars");
+        Check(UserProfiles.SanitizeNick("MixedCASE") == "MixedCASE", "nick: preserves case");
+        Check(UserProfiles.SanitizeNick("ABCDEFGHIJKLMNOPQRSTUV") == "ABCDEFGHIJKLMNOP", "nick: caps at 16 chars");
+        Check(UserProfiles.SanitizeNick("!!!###") == "", "nick: garbage-only -> empty");
+        Check(UserProfiles.SanitizeNick(null) == "" && UserProfiles.SanitizeNick("") == "", "nick: null/empty -> empty");
+
+        var kn = new List<string> { "Alice", "Bob", "Carol" };
+        var t1 = UserProfiles.TouchList(kn, "Dave");
+        Check(t1[0] == "Dave" && t1.Count == 4 && t1[1] == "Alice", "touchlist: new nick -> front, others follow");
+        var t2 = UserProfiles.TouchList(kn, "bob");   // existing, different case
+        Check(t2[0] == "bob" && t2.Count == 3 && !t2.Contains("Bob"), "touchlist: existing (diff case) -> front once, new casing, no dup");
+        var big = new List<string>();
+        for (int i = 0; i < 25; i++) big.Add("n" + i);
+        var t3 = UserProfiles.TouchList(big, "fresh");
+        Check(t3.Count == 20 && t3[0] == "fresh" && t3[19] == "n18", "touchlist: caps at 20 (oldest dropped)");
+
+        Check(UserProfiles.ChooseNick("Zed", kn, 1) == (true, "Zed"), "choose: typed wins over list");
+        Check(UserProfiles.ChooseNick("", kn, 2) == (true, "Carol"), "choose: empty typed -> list selection");
+        Check(UserProfiles.ChooseNick("###", kn, 0) == (true, "Alice"), "choose: garbage typed -> list selection");
+        Check(UserProfiles.ChooseNick("", new List<string>(), 0) == (false, ""), "choose: nothing available -> invalid");
+        Check(UserProfiles.ChooseNick("", kn, 9) == (false, ""), "choose: out-of-range list sel -> invalid");
+        Check(UserProfiles.ChooseNick(" Neo ", kn, -1) == (true, "Neo"), "choose: typed is sanitized before winning");
+
+        // ---- STAGE N1 — profile round-trip through a TEMP dir (NEVER the real users.json) ----
+        string tempDir = Path.Combine(Path.GetTempPath(), "nova_nicktest_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            string p = Path.Combine(tempDir, "users.json");
+            var toSave = new List<string> { "Neo", "Trinity", "Morpheus" };
+            UserProfiles.Save(p, toSave);
+            var back = UserProfiles.Load(p);
+            Check(back.Count == 3 && back[0] == "Neo" && back[1] == "Trinity" && back[2] == "Morpheus",
+                  "profile: Save->Load preserves content + order");
+            Check(UserProfiles.Load(Path.Combine(tempDir, "missing.json")).Count == 0, "profile: missing file -> empty");
+            string corrupt = Path.Combine(tempDir, "corrupt.json");
+            File.WriteAllText(corrupt, "{ this is not valid json ][");
+            Check(UserProfiles.Load(corrupt).Count == 0, "profile: corrupt non-JSON -> empty (no throw)");
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { /* best-effort cleanup */ }
+        }
 
         Console.WriteLine(ok ? "uitest: PASS" : "uitest: FAIL");
     }

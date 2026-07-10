@@ -24,6 +24,9 @@ SampleGame/worlds/
 # Textures
 SampleGame/textures/
 
+# Local user profiles (remembered nicknames)
+SampleGame/users.json
+
 # Local planning notes (not for the repo)
 BACKLOG.md
 TESTING.md

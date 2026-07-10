@@ -14,13 +14,21 @@ namespace SampleGame.WizardUi;
 // Back and returning restores the user's previous choices instead of resetting to defaults.
 public static class NewWizard
 {
-    public enum WStep { Mode, Role, World, Create, Load, Network, Launch, Cancelled }
+    public enum WStep { Nick, Mode, Role, World, Create, Load, Network, Launch, Cancelled }
     public enum WOutcome { Ok, Back, Quit }
 
     // ---- pure flow state machine (mirrors RunApp's switch; testable) ----
     public static WStep Next(WStep step, WOutcome outcome, bool online, bool isServer, bool create) => step switch
     {
-        WStep.Mode    => outcome == WOutcome.Quit ? WStep.Cancelled : (online ? WStep.Role : WStep.World),
+        // The Nick screen is the FIRST step: Ok proceeds to Mode; Esc/Quit on it (the very first screen) quits.
+        WStep.Nick    => outcome == WOutcome.Ok ? WStep.Mode : WStep.Cancelled,
+        // Mode's cancel is now Back (to Nick) rather than Quit; the Quit arm stays as a defensive fallback.
+        WStep.Mode    => outcome switch
+        {
+            WOutcome.Back => WStep.Nick,
+            WOutcome.Quit => WStep.Cancelled,
+            _             => online ? WStep.Role : WStep.World,
+        },
         WStep.Role    => outcome == WOutcome.Back ? WStep.Mode : (isServer ? WStep.World : WStep.Network),
         WStep.World   => outcome == WOutcome.Back ? (online ? WStep.Role : WStep.Mode) : (create ? WStep.Create : WStep.Load),
         WStep.Create  => outcome == WOutcome.Back ? WStep.World : (online ? WStep.Network : WStep.Launch),
@@ -86,6 +94,7 @@ public static class NewWizard
         public string Ip = "127.0.0.1";
         public int Port = 7777;
         public WorldConfig? World;
+        public string Nick = "";       // the confirmed local nickname (LOCAL only this stage — rides no packet)
     }
 
     // Persisted widget state for EVERY screen, so navigating Back and returning restores the user's previous
@@ -95,6 +104,11 @@ public static class NewWizard
     // byte-identical to before (config parity holds).
     public sealed class WizardState
     {
+        // Nickname (the new first screen)
+        public string Nick = "";            // the CONFIRMED nickname choice
+        public string NickText = "";        // the typed buffer, persisted across Back like every other field
+        public int NickSel;                 // known-nickname list selection persistence
+
         public int ModeSel;                 // 0 = Local, 1 = Online
         public int RoleSel = 1;             // 0 = Server, 1 = Client (default Client, as before)
         public int WorldSel;                // 0 = Create, 1 = Load
@@ -132,12 +146,13 @@ public static class NewWizard
         var st = new WizardState();
 
         WorldConfig? chosenWorld = null;
-        var step = WStep.Mode;
+        var step = WStep.Nick;
         while (step != WStep.Launch && step != WStep.Cancelled)
         {
             WOutcome outcome;
             switch (step)
             {
+                case WStep.Nick:    outcome = RunNickScreen(runner, st); break;
                 case WStep.Mode:    outcome = RunModeScreen(runner, st); break;
                 case WStep.Role:    outcome = RunRoleScreen(runner, st); break;
                 case WStep.World:   outcome = RunWorldMenuScreen(runner, st); break;
@@ -153,23 +168,81 @@ public static class NewWizard
         {
             Quit = step == WStep.Cancelled,
             Online = st.Online, IsServer = st.IsServer, Ip = st.Ip, Port = st.Port, World = chosenWorld,
+            Nick = st.Nick,
         };
     }
 
-    // ================= the six screens =================
+    // ================= the screens =================
 
     private static UiButton Btn(string text) => new UiButton(text);
 
-    private static WOutcome RunModeScreen(UiRunner runner, WizardState st)
+    // The new FIRST screen: who is playing? A previous nickname (from users.json) or a freshly typed one.
+    // Purely local this stage — the chosen nickname does NOT ride any packet, appear in chat, or change any
+    // HUD text; it is only remembered locally and set on the window title.
+    private static WOutcome RunNickScreen(UiRunner runner, WizardState st)
     {
-        var screen = new UiScreen("Click or Tab/arrows to navigate  |  Enter confirm  |  Esc quit");
-        var modes = new UiOptionGroup(new[] { "Local / Offline", "Online" }, st.ModeSel);
+        var known = UserProfiles.Load();     // most-recently-used first (index 0 = last used)
+        var screen = new UiScreen("Up/Down or click to pick  |  type a new one  |  Enter/Ok  |  Esc quit");
+
         var ok = Btn("Ok"); var quit = Btn("Quit");
-        WOutcome outcome = WOutcome.Quit;
-        ok.OnPressed   = () => { outcome = WOutcome.Ok;   runner.Stop(); };
+        UiListView? list = null;
+        var newNick = new UiTextInput(st.NickText, fieldWidth: 18);
+
+        WOutcome outcome = WOutcome.Quit;   // first screen: Esc/Quit exits the app
+        void Confirm(string nick)
+        {
+            st.Nick = nick;
+            UserProfiles.Touch(nick);       // move-to-front in users.json
+            outcome = WOutcome.Ok;
+            runner.Stop();
+        }
+        void DoOk()
+        {
+            // The Ok button: a typed nickname wins over the list (ChooseNick's contract).
+            var (valid, nick) = UserProfiles.ChooseNick(newNick.Text, known, list?.Selected ?? -1);
+            if (!valid) { screen.ErrorText = "Enter a nickname (letters, digits, _ or -)"; return; }
+            Confirm(nick);
+        }
+        ok.OnPressed = DoOk;
         quit.OnPressed = () => { outcome = WOutcome.Quit; runner.Stop(); };
         screen.OnCancel = () => { outcome = WOutcome.Quit; runner.Stop(); };
-        screen.Add(new UiLabel("Session mode", title: true), new UiLabel("Run a local solo session or go online?"), modes, ok, quit);
+
+        screen.Add(new UiLabel("Nickname", title: true),
+                   new UiLabel("Who is playing? Pick a previous nickname or type a new one."));
+        if (known.Count > 0)
+        {
+            int initSel = Math.Clamp(st.NickSel, 0, known.Count - 1);
+            list = new UiListView(known, visibleRows: 6, selected: initSel);
+            // Enter on a row confirms THAT row immediately (bypassing the typed field).
+            list.OnActivate = i =>
+            {
+                var (valid, nick) = UserProfiles.ChooseNick(null, known, i);
+                if (valid) Confirm(nick);
+            };
+            screen.Add(list, new UiLabel("Or type a new nickname:"), newNick, ok, quit);
+        }
+        else
+        {
+            screen.Add(new UiLabel("Type a nickname:"), newNick, ok, quit);
+        }
+
+        runner.Run(screen);
+        // Persist the typed buffer + the list selection so they survive a Back and return.
+        st.NickText = newNick.Text;
+        if (list != null) st.NickSel = list.Selected;
+        return outcome;
+    }
+
+    private static WOutcome RunModeScreen(UiRunner runner, WizardState st)
+    {
+        var screen = new UiScreen("Click or Tab/arrows to navigate  |  Enter confirm  |  Esc back");
+        var modes = new UiOptionGroup(new[] { "Local / Offline", "Online" }, st.ModeSel);
+        var ok = Btn("Ok"); var back = Btn("Back");
+        WOutcome outcome = WOutcome.Back;   // Mode's cancel is now Back to the Nickname screen (was Quit)
+        ok.OnPressed   = () => { outcome = WOutcome.Ok;   runner.Stop(); };
+        back.OnPressed = () => { outcome = WOutcome.Back; runner.Stop(); };
+        screen.OnCancel = () => { outcome = WOutcome.Back; runner.Stop(); };
+        screen.Add(new UiLabel("Session mode", title: true), new UiLabel("Run a local solo session or go online?"), modes, ok, back);
         runner.Run(screen);
         st.ModeSel = modes.Selected;   // persist across navigation
         return outcome;
