@@ -4,19 +4,32 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.1] — 2026-07-10
+## [1.0.1] — 2026-07-11
 
 ### Added
-- A UDP fast-path for real-time multiplayer: player transforms and physics-sync
+- A **UDP fast-path** for real-time multiplayer: player transforms and physics-sync
   batches now travel over an unreliable, sequence-filtered UDP channel on the same
   port, with server-side endpoint learning, automatic fallback to TCP, and
   MTU-aware chunking of large physics batches. Reliable TCP continues to carry
   world sync, meshes, textures, live edits, chat, and the join handshake.
+- **Player nicknames**: the setup wizard opens with a nickname screen — pick a
+  previously used name or type a new one, remembered locally in the git-ignored
+  `SampleGame/users.json` (a nickname never gates or isolates content). A nickname
+  roster (`netId → nick`) propagates to every peer: the server relays each
+  announcement and back-fills a joining client with everyone already present, and
+  chat lines are signed with the sender's nickname (falling back to `player #<id>`).
 - **Joints** connecting objects, solved in the same constraint solver as contacts:
   ball-socket, hinge (with optional angle limits and a torque-limited motor), and
-  distance (a rigid rod or a soft spring). Authored in the editor as a "joint"
-  object with a colour-coded line/axis marker, saved in the world, and synced in
-  multiplayer.
+  distance (a rigid rod or a soft spring), authored in the editor as a "joint" object
+  with a colour-coded line/axis marker, saved in the world, and synced in multiplayer.
+  A joint side can be **any** object — a dynamic body, or a static / non-physical one
+  (a light, camera, prop, or the platform) that acts as a fixed anchor you can drag to
+  move whatever hangs from it. Joints snap together on assembly, integrate with
+  sleeping (no mid-air freezes; a hung body sleeps at rest and wakes when disturbed),
+  accept live parameter edits, keep their world anchor point when retargeted onto
+  another body, and can optionally **collide with each other** (a real chain bumps
+  instead of folding through). The inspector shows each joint's active / inactive
+  status and annotates hinge limits with degrees alongside radians.
 - **Dynamic convex-hull physics for mesh objects**: a custom mesh with gravity +
   collision now falls, tumbles, and stacks as its true convex shape — resting on its
   faces and sliding on the real triangles of sloped meshes — instead of a bounding
@@ -24,6 +37,12 @@ All notable changes to this project are documented in this file. The format is b
 - A **capsule player**: the walking player now has real body height instead of a
   point bubble, so it can't slip under low overhangs or poke its head through a
   head-height bar, and it slides along walls without catching.
+- A **Test Lab generator**: `dotnet run --project SampleGame -- maketestworld` writes
+  a ready-made "TestLab" world (regenerate any time to refresh it) — a joints showroom
+  (pendulum, rigid rod, spring, hinged door, a motor windmill that spins clear of its
+  post, a colliding chain, a two-rod swing, and a trapdoor that flops open to its
+  limit), a physics playground, and a capsule course — a reference to check behaviour
+  against.
 
 ### Security
 - Bounded wire-driven allocations (a maximum framed-packet size and per-packet
@@ -78,4 +97,5 @@ as ASCII art, on .NET 10. It is derived from and extends
   the engine's **own console UI** (keyboard + mouse, reflows on resize / zoom), with no
   external UI dependency.
 
+[1.0.1]: https://github.com/Jareltis/Nova3DVisualiser/releases/tag/v1.0.1
 [1.0.0]: https://github.com/Jareltis/Nova3DVisualiser/releases/tag/v1.0.0

@@ -20,7 +20,8 @@ encrypted**: do not expose a server to the open internet, and do not connect to
 untrusted servers. As defensive measures the server bounds resource use against
 malformed input and floods (allocation, connection, queue, and per-peer rate
 limits), and received meshes and textures are written to a sandboxed folder with
-sanitized filenames. These measures raise the bar against accidental and
+sanitized filenames. Received nicknames are length-capped and character-sanitized
+on receipt. These measures raise the bar against accidental and
 low-effort abuse; they are not a substitute for a trusted network.
 
 ## Reporting a vulnerability
